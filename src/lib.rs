@@ -1,8 +1,10 @@
 pub mod classify;
 pub mod config;
 pub mod db;
+pub mod fmt;
 pub mod scan;
 pub mod search;
+pub mod tui;
 
 use std::path::PathBuf;
 

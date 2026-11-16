@@ -74,6 +74,7 @@ cargo test                              # unit tests (in each module) + tests/cl
 cargo clippy --all-targets && cargo fmt # keep both clean
 cargo build --release
 
+gfiles                                  # interactive TUI; Enter prints the chosen path
 gfiles volume add <path> [--name N] [--ignore PATTERN]...
 gfiles volume list [--json]
 gfiles volume remove <name>             # from the config and the catalog
@@ -94,8 +95,12 @@ scratch directory, when trying the binary out, so experiments never touch the re
   that has been committed; add a new one.
 - `src/scan.rs`: walks a volume and updates its rows (see below). Holds the default ignores.
 - `src/classify.rs`: extension to kind.
-- `src/search.rs`: queries shared by every interface (CLI now; TUI and MCP later). Interfaces
+- `src/search.rs`: queries shared by every interface (CLI and TUI now, MCP later). Interfaces
   stay thin and call into it, so they can't drift apart.
+- `src/fmt.rs`: sizes and dates for display (dates are UTC, computed without a date crate).
+- `src/tui/`: `app.rs` holds state and key handling, `ui.rs` draws it, `mod.rs` runs the loop.
+  Test behavior through `App::handle_key` and layout through ratatui's `TestBackend`, not a
+  real terminal.
 
 ## Implementation notes
 
@@ -109,3 +114,7 @@ scratch directory, when trying the binary out, so experiments never touch the re
 - **Hidden files** (`.*`) are ignored by default; a volume can bring one back with `!.name/`.
 - **PDFs** are documents, not books, until metadata extraction can tell them apart.
 - **Repos** are one `repo` row with size 0. Their size isn't computed yet.
+- **The TUI draws to stderr**, so `$(gfiles)` captures only the path chosen with Enter (like
+  fzf). Keep stdout clean while it runs. It loads at most 1000 rows; titles show the full count.
+- To check the TUI by hand, run it in a detached tmux session (`tmux new-session -d -x 110 -y 26`),
+  drive it with `tmux send-keys` and read it with `tmux capture-pane -p`.

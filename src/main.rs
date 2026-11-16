@@ -7,9 +7,12 @@ use clap::{Parser, Subcommand};
 
 use gfiles::config::{self, Config};
 use gfiles::search::{self, Query};
-use gfiles::{classify, db, scan};
+use gfiles::{classify, db, fmt, scan};
 
 /// Catalog and organize your files across all your machines.
+///
+/// Run with no command for the interactive TUI. Enter prints the selected path, so
+/// `xdg-open "$(gfiles)"` opens the file you pick.
 #[derive(Parser)]
 #[command(version)]
 struct Cli {
@@ -21,8 +24,9 @@ struct Cli {
     #[arg(long, global = true, env = "GFILES_DB")]
     db: Option<PathBuf>,
 
+    /// Leave out to open the interactive TUI
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -87,7 +91,15 @@ fn main() -> Result<()> {
     let config_path = cli.config.unwrap_or_else(gfiles::default_config_path);
     let db_path = cli.db.unwrap_or_else(gfiles::default_db_path);
 
-    match cli.command {
+    let Some(command) = cli.command else {
+        let conn = db::open(&db_path)?;
+        if let Some(path) = gfiles::tui::run(conn)? {
+            println!("{path}");
+        }
+        return Ok(());
+    };
+
+    match command {
         Command::Volume(VolumeCommand::Add { path, name, ignore }) => {
             let v = config::add_volume(&config_path, &path, name, ignore)?;
             println!(
@@ -192,7 +204,7 @@ fn main() -> Result<()> {
                     println!(
                         "{:<9}{:>9}  {}:{}",
                         h.kind,
-                        human_size(h.size),
+                        fmt::size(h.size),
                         h.machine,
                         h.abs_path
                     );
@@ -216,26 +228,11 @@ fn main() -> Result<()> {
                 for v in &stats {
                     println!("{}:{} ({})", v.machine, v.volume, v.root);
                     for k in &v.kinds {
-                        println!("  {:<10}{:>9}{:>11}", k.kind, k.count, human_size(k.size));
+                        println!("  {:<10}{:>9}{:>11}", k.kind, k.count, fmt::size(k.size));
                     }
                 }
             }
         }
     }
     Ok(())
-}
-
-fn human_size(bytes: i64) -> String {
-    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
-    let mut size = bytes as f64;
-    let mut unit = 0;
-    while size >= 1024.0 && unit < UNITS.len() - 1 {
-        size /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{size:.1} {}", UNITS[unit])
-    }
 }

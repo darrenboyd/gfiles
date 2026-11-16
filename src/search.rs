@@ -1,4 +1,4 @@
-//! Queries over the catalog, shared by the CLI, and later the TUI and MCP server.
+//! Queries over the catalog, shared by the CLI and TUI (and later the MCP server).
 
 use anyhow::Result;
 use rusqlite::{Connection, types::Value};
@@ -25,34 +25,54 @@ pub struct Hit {
     pub mtime: i64,
 }
 
-pub fn search(conn: &Connection, q: &Query) -> Result<Vec<Hit>> {
-    let mut sql = String::from(
-        "SELECT v.machine, v.name, v.root, e.path, e.kind, e.size, e.mtime
-         FROM entries e JOIN volumes v ON v.id = e.volume_id",
-    );
-    let mut wheres = Vec::new();
-    let mut args: Vec<Value> = Vec::new();
-    let fts = fts_query(&q.terms);
-    if let Some(fts) = &fts {
-        sql.push_str(" JOIN entries_fts f ON f.rowid = e.id");
-        wheres.push("entries_fts MATCH ?");
-        args.push(fts.clone().into());
-    }
-    for (clause, value) in [
-        ("e.kind = ?", &q.kind),
-        ("v.name = ?", &q.volume),
-        ("v.machine = ?", &q.machine),
-    ] {
-        if let Some(value) = value {
-            wheres.push(clause);
-            args.push(value.clone().into());
+/// The FROM and WHERE clauses for a query, with their bound arguments.
+struct Filter {
+    sql: String,
+    args: Vec<Value>,
+    fts: bool,
+}
+
+impl Filter {
+    fn new(q: &Query, with_kind: bool) -> Filter {
+        let mut sql = String::from(" FROM entries e JOIN volumes v ON v.id = e.volume_id");
+        let mut wheres = Vec::new();
+        let mut args: Vec<Value> = Vec::new();
+        let fts = fts_query(&q.terms);
+        if let Some(fts) = &fts {
+            sql.push_str(" JOIN entries_fts f ON f.rowid = e.id");
+            wheres.push("entries_fts MATCH ?");
+            args.push(fts.clone().into());
+        }
+        let kind = if with_kind { &q.kind } else { &None };
+        for (clause, value) in [
+            ("e.kind = ?", kind),
+            ("v.name = ?", &q.volume),
+            ("v.machine = ?", &q.machine),
+        ] {
+            if let Some(value) = value {
+                wheres.push(clause);
+                args.push(value.clone().into());
+            }
+        }
+        if !wheres.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&wheres.join(" AND "));
+        }
+        Filter {
+            sql,
+            args,
+            fts: fts.is_some(),
         }
     }
-    if !wheres.is_empty() {
-        sql.push_str(" WHERE ");
-        sql.push_str(&wheres.join(" AND "));
-    }
-    sql.push_str(if fts.is_some() {
+}
+
+pub fn search(conn: &Connection, q: &Query) -> Result<Vec<Hit>> {
+    let filter = Filter::new(q, true);
+    let mut sql = format!(
+        "SELECT v.machine, v.name, v.root, e.path, e.kind, e.size, e.mtime{}",
+        filter.sql
+    );
+    sql.push_str(if filter.fts {
         " ORDER BY f.rank"
     } else {
         " ORDER BY v.machine, v.name, e.path"
@@ -63,7 +83,7 @@ pub fn search(conn: &Connection, q: &Query) -> Result<Vec<Hit>> {
 
     let mut stmt = conn.prepare(&sql)?;
     let hits = stmt
-        .query_map(rusqlite::params_from_iter(args), |r| {
+        .query_map(rusqlite::params_from_iter(filter.args), |r| {
             let root: String = r.get(2)?;
             let path: String = r.get(3)?;
             Ok(Hit {
@@ -78,6 +98,19 @@ pub fn search(conn: &Connection, q: &Query) -> Result<Vec<Hit>> {
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(hits)
+}
+
+/// How many entries match the query for each kind, ignoring the query's own kind filter.
+pub fn count_by_kind(conn: &Connection, q: &Query) -> Result<Vec<(String, i64)>> {
+    let filter = Filter::new(q, false);
+    let sql = format!("SELECT e.kind, count(*){} GROUP BY e.kind", filter.sql);
+    let mut stmt = conn.prepare(&sql)?;
+    let counts = stmt
+        .query_map(rusqlite::params_from_iter(filter.args), |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(counts)
 }
 
 #[derive(Debug, Serialize)]
@@ -242,5 +275,18 @@ mod tests {
         assert_eq!(s.len(), 1);
         let books = s[0].kinds.iter().find(|k| k.kind == "book").unwrap();
         assert_eq!(books.count, 2);
+    }
+
+    #[test]
+    fn counts_ignore_the_kind_filter() {
+        let (_tmp, conn) = catalog();
+        let q = Query {
+            terms: vec!["tolkien".into()],
+            kind: Some("book".into()),
+            ..Default::default()
+        };
+        let mut counts = count_by_kind(&conn, &q).unwrap();
+        counts.sort();
+        assert_eq!(counts, vec![("book".into(), 1), ("document".into(), 2)]);
     }
 }
