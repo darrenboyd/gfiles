@@ -41,12 +41,19 @@ machine = "elrond"
 ```
 
 Scan on a schedule with DSM's Task Scheduler: Control Panel → Task Scheduler → Create →
-Scheduled Task → User-defined script. Run it as your user (not root), daily at night, with the
-script:
+Scheduled Task → User-defined script. Run it as your user (not root, so it reads the shares
+with your permissions and writes your catalog), daily at night (say 03:00), with the script:
 
 ```sh
-/var/services/homes/darren/.local/bin/gfiles scan
+export HOME=/var/services/homes/darren
+"$HOME/.local/bin/gfiles" scan
 ```
+
+Scheduled tasks don't always get a login environment, so setting `HOME` makes sure gfiles finds
+`~/.config/gfiles/config.toml` and its catalog. Under Task Settings, ticking *Send run details
+by email* (only when the script terminates abnormally) is the only way you'll hear about a
+failed scan. Test it with **Run**; with Task Scheduler → Settings → *Save output results* turned
+on, Action → View Result shows what the scan printed.
 
 The first scan of a large share takes a while; later ones are faster on a warm cache.
 
