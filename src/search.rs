@@ -1,6 +1,6 @@
-//! Queries over the catalog, shared by the CLI and TUI (and later the MCP server).
+//! Queries over the catalog, shared by the CLI, the TUI and the MCP server.
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use rusqlite::{Connection, types::Value};
 use serde::Serialize;
 
@@ -23,6 +23,27 @@ pub struct Hit {
     pub kind: String,
     pub size: i64,
     pub mtime: i64,
+}
+
+/// Refuses a volume or machine filter that matches nothing in the catalog, listing the known
+/// names, so a mistyped filter (or a model's guess) isn't mistaken for "no such files".
+pub fn check_filters(conn: &Connection, q: &Query) -> Result<()> {
+    for (what, column, value) in [
+        ("volume", "name", &q.volume),
+        ("machine", "machine", &q.machine),
+    ] {
+        let Some(value) = value else { continue };
+        let mut stmt = conn.prepare(&format!(
+            "SELECT DISTINCT {column} FROM volumes ORDER BY {column}"
+        ))?;
+        let known: Vec<String> = stmt
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        if !known.contains(value) {
+            bail!("unknown {what} {value:?}; use one of: {}", known.join(", "));
+        }
+    }
+    Ok(())
 }
 
 /// The FROM and WHERE clauses for a query, with their bound arguments.

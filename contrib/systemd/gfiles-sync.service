@@ -1,0 +1,14 @@
+# Scans this machine's volumes and pushes them to the central catalog.
+# Install: see docs/setup.md.
+[Unit]
+Description=Scan gfiles volumes and push them to the central catalog
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/gfiles sync
+# A backstop: while a run is stuck, the timer starts no new ones. ssh already drops a dead
+# connection within minutes; this covers anything else (a hung mount during a scan).
+TimeoutStartSec=3h
+# Stay out of the way of interactive work.
+Nice=10
+IOSchedulingClass=idle

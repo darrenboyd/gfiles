@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -7,7 +8,7 @@ use clap::{Parser, Subcommand};
 
 use gfiles::config::{self, Config};
 use gfiles::search::{self, Query};
-use gfiles::{classify, db, fmt, scan};
+use gfiles::{classify, db, fmt, scan, store};
 
 /// Catalog and organize your files across all your machines.
 ///
@@ -37,6 +38,20 @@ enum Command {
 
     /// Scan volumes into the catalog (all of them, or the ones named)
     Scan { volumes: Vec<String> },
+
+    /// Send this machine's scanned volumes to the central catalog (see [central] in the config)
+    Push,
+
+    /// Scan every volume, then push if a central catalog is configured. Run this from a timer.
+    Sync,
+
+    /// Receive volumes pushed from another machine on stdin (run by `push` over SSH)
+    Ingest {
+        /// The machine this push may write for; refuses a push claiming any other. Set it in
+        /// the forced command of that machine's key in authorized_keys.
+        #[arg(long)]
+        machine: String,
+    },
 
     /// Find files by name or path words, kind, volume or machine
     Search {
@@ -133,51 +148,49 @@ fn main() -> Result<()> {
         Command::Volume(VolumeCommand::Remove { name }) => {
             let id = config::remove_volume(&config_path, &name)?;
             let conn = db::open(&db_path)?;
-            scan::forget_volume(&conn, &id)?;
+            store::forget_volume(&conn, &id)?;
             println!("Removed volume {name:?}");
         }
         Command::Scan { volumes } => {
             let config = Config::load(&config_path)?;
-            if config.volumes.is_empty() {
-                bail!("no volumes configured; add one with `gfiles volume add <path>`");
-            }
-            for name in &volumes {
-                if config.volume(name).is_none() {
-                    bail!("no volume named {name:?}");
-                }
-            }
-            let machine = config.machine_name();
             let mut conn = db::open(&db_path)?;
-            let mut failed = false;
-            for v in config
-                .volumes
-                .iter()
-                .filter(|v| volumes.is_empty() || volumes.contains(&v.name))
-            {
-                let started = Instant::now();
-                match scan::scan_volume(&mut conn, v, &machine) {
-                    Ok(s) => {
-                        let mut line = format!(
-                            "{}: {} files, {} repos, {} removed",
-                            v.name, s.files, s.repos, s.removed
-                        );
-                        if s.non_utf8 > 0 {
-                            line.push_str(&format!(", {} non-UTF-8 names skipped", s.non_utf8));
-                        }
-                        if s.errors > 0 {
-                            line.push_str(&format!(", {} errors", s.errors));
-                        }
-                        println!("{line} ({:.1}s)", started.elapsed().as_secs_f64());
-                    }
-                    Err(e) => {
-                        eprintln!("error: {e:#}");
-                        failed = true;
-                    }
-                }
-            }
-            if failed {
+            if !scan_volumes(&config, &mut conn, &volumes)? {
                 std::process::exit(1);
             }
+        }
+        Command::Push => {
+            let config = Config::load(&config_path)?;
+            let conn = db::open(&db_path)?;
+            push(&config, &conn)?;
+        }
+        Command::Sync => {
+            let config = Config::load(&config_path)?;
+            let mut conn = db::open(&db_path)?;
+            let scanned = scan_volumes(&config, &mut conn, &[])?;
+            // Push even if some volume failed to scan: the others are still worth sending, and
+            // a failed volume keeps its previous entries.
+            if config.central.is_some() {
+                push(&config, &conn)?;
+            }
+            if !scanned {
+                std::process::exit(1);
+            }
+        }
+        Command::Ingest { machine } => {
+            let config = Config::load(&config_path)?;
+            let mut conn = db::open(&db_path)?;
+            let mut stdout = std::io::stdout().lock();
+            gfiles::sync::ingest(
+                &mut conn,
+                &config.machine_name(),
+                &machine,
+                std::io::stdin().lock(),
+                |report| {
+                    serde_json::to_writer(&mut stdout, report)?;
+                    writeln!(stdout)?;
+                    Ok(stdout.flush()?)
+                },
+            )?;
         }
         Command::Search {
             terms,
@@ -190,18 +203,24 @@ fn main() -> Result<()> {
         } => {
             let conn = db::open(&db_path)?;
             let limit = (!all).then_some(limit);
-            let hits = search::search(
-                &conn,
-                &Query {
-                    terms,
-                    kind,
-                    volume,
-                    machine,
-                    limit,
-                },
-            )?;
+            let query = Query {
+                terms,
+                kind,
+                volume,
+                machine,
+                limit,
+            };
+            search::check_filters(&conn, &query)?;
+            let hits = search::search(&conn, &query)?;
+            let total = if limit == Some(hits.len()) {
+                search::count(&conn, &query)?
+            } else {
+                hits.len() as i64
+            };
             if json {
-                println!("{}", serde_json::to_string_pretty(&hits)?);
+                // The same shape as the MCP search_files tool, so a cut-off list is visible.
+                let out = serde_json::json!({"total_matches": total, "files": hits});
+                println!("{}", serde_json::to_string_pretty(&out)?);
             } else {
                 for h in &hits {
                     println!(
@@ -212,10 +231,10 @@ fn main() -> Result<()> {
                         h.abs_path
                     );
                 }
-                if limit == Some(hits.len()) {
+                if total > hits.len() as i64 {
                     eprintln!(
-                        "(showing the first {limit}; use -n or --all for more)",
-                        limit = hits.len()
+                        "(showing {} of {total}; use -n or --all for more)",
+                        hits.len()
                     );
                 }
             }
@@ -238,6 +257,87 @@ fn main() -> Result<()> {
                         println!("  {:<10}{:>9}{:>11}", k.kind, k.count, fmt::size(k.size));
                     }
                 }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Scans the named volumes, or all of them. Returns false if any failed (after reporting it).
+fn scan_volumes(
+    config: &Config,
+    conn: &mut rusqlite::Connection,
+    names: &[String],
+) -> Result<bool> {
+    if config.volumes.is_empty() {
+        bail!("no volumes configured; add one with `gfiles volume add <path>`");
+    }
+    for name in names {
+        if config.volume(name).is_none() {
+            bail!("no volume named {name:?}");
+        }
+    }
+    let machine = config.machine_name();
+    let mut ok = true;
+    for v in config
+        .volumes
+        .iter()
+        .filter(|v| names.is_empty() || names.contains(&v.name))
+    {
+        let started = Instant::now();
+        match scan::scan_volume(conn, v, &machine) {
+            Ok(s) => {
+                let mut line = format!(
+                    "{}: {} files, {} repos, {} removed",
+                    v.name, s.files, s.repos, s.removed
+                );
+                if s.non_utf8 > 0 {
+                    line.push_str(&format!(", {} non-UTF-8 names skipped", s.non_utf8));
+                }
+                if s.errors > 0 {
+                    line.push_str(&format!(", {} errors", s.errors));
+                }
+                if s.kept > 0 {
+                    line.push_str(&format!(
+                        ", {} unseen entries kept because they couldn't be read",
+                        s.kept
+                    ));
+                }
+                println!("{line} ({:.1}s)", started.elapsed().as_secs_f64());
+            }
+            Err(e) => {
+                eprintln!("error: {e:#}");
+                ok = false;
+            }
+        }
+    }
+    Ok(ok)
+}
+
+fn push(config: &Config, conn: &rusqlite::Connection) -> Result<()> {
+    let Some(central) = &config.central else {
+        bail!("no [central] section in the config, so there's nowhere to push");
+    };
+    let ids: Vec<String> = config.volumes.iter().map(|v| v.id.clone()).collect();
+    let started = Instant::now();
+    let reports = gfiles::sync::push(conn, central, &config.machine_name(), &ids)?;
+    println!(
+        "Pushed to {} ({:.1}s):",
+        central.host,
+        started.elapsed().as_secs_f64()
+    );
+    for r in &reports {
+        match r {
+            gfiles::sync::Report::Volume {
+                name,
+                entries,
+                removed,
+            } => println!("  {name}: {entries} entries, {removed} removed"),
+            gfiles::sync::Report::Forgot { name } => {
+                println!(
+                    "  {name}: no longer configured here, so removed from {}",
+                    central.host
+                )
             }
         }
     }

@@ -219,20 +219,20 @@ fn catalog_overview(conn: &Connection) -> Result<Value> {
 }
 
 fn file_locations(conn: &Connection, args: &Value) -> Result<Value> {
-    let q = query_from(args, FOLDERS_DEFAULT_LIMIT)?;
+    let q = query_from(conn, args, FOLDERS_DEFAULT_LIMIT)?;
     let folders = search::folders(conn, &q)?;
     let total = search::count(conn, &q)?;
     Ok(json!({"total_matches": total, "folders": folders}))
 }
 
 fn search_files(conn: &Connection, args: &Value) -> Result<Value> {
-    let q = query_from(args, SEARCH_DEFAULT_LIMIT)?;
+    let q = query_from(conn, args, SEARCH_DEFAULT_LIMIT)?;
     let files = search::search(conn, &q)?;
     let total = search::count(conn, &q)?;
     Ok(json!({"total_matches": total, "files": files}))
 }
 
-fn query_from(args: &Value, default_limit: usize) -> Result<Query> {
+fn query_from(conn: &Connection, args: &Value, default_limit: usize) -> Result<Query> {
     let text = |key: &str| -> Result<Option<String>> {
         match args.get(key) {
             None | Some(Value::Null) => Ok(None),
@@ -256,13 +256,15 @@ fn query_from(args: &Value, default_limit: usize) -> Result<Query> {
             .ok_or_else(|| anyhow::anyhow!("limit must be a positive integer"))?
             .min(SEARCH_MAX_LIMIT as u64) as usize,
     };
-    Ok(Query {
+    let q = Query {
         terms: text("query")?.into_iter().collect(),
         kind,
         volume: text("volume")?,
         machine: text("machine")?,
         limit: Some(limit),
-    })
+    };
+    search::check_filters(conn, &q)?;
+    Ok(q)
 }
 
 #[cfg(test)]
@@ -396,6 +398,8 @@ mod tests {
                 call(1, "search_files", json!({"kind": "novel"})),
                 call(2, "search_files", json!({"limit": 0})),
                 call(3, "no_such_tool", json!({})),
+                call(4, "file_locations", json!({"machine": "Laptop"})),
+                call(5, "search_files", json!({"volume": "Home"})),
             ],
         );
         assert_eq!(out[0]["result"]["isError"], true);
@@ -403,6 +407,11 @@ mod tests {
         assert!(msg.contains("unknown kind"), "{msg}");
         assert_eq!(out[1]["result"]["isError"], true);
         assert_eq!(out[2]["error"]["code"], INVALID_PARAMS);
+        for (i, hint) in [(3, "use one of: gaffer"), (4, "use one of: home")] {
+            assert_eq!(out[i]["result"]["isError"], true);
+            let msg = out[i]["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(msg.contains(hint), "{msg}");
+        }
     }
 
     #[test]

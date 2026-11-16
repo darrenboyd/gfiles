@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Builds a static (musl) gfiles and installs it as ~/.local/bin/gfiles on each SSH host given.
+# The static build runs on any x86_64 Linux, including Synology DSM's old kernel and libc.
+# Needs musl-tools (`sudo apt install musl-tools`) for rusqlite's bundled SQLite.
+#
+# Usage: bin/deploy bill elrond
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+if [ $# -eq 0 ]; then
+  echo "usage: bin/deploy <ssh-host>..." >&2
+  exit 2
+fi
+
+target=x86_64-unknown-linux-musl
+CC_x86_64_unknown_linux_musl=musl-gcc cargo build --release --target "$target"
+binary="target/$target/release/gfiles"
+
+size=$(wc -c < "$binary" | tr -d ' ')
+
+for host in "$@"; do
+  echo "== $host"
+  # Copy through ssh rather than scp: DSM can have SFTP turned off. Write to a temp name, check
+  # it arrived whole and runs, and only then rename it over the old binary. An interrupted
+  # transfer still ends `cat` cleanly, so the size check is what catches a truncated copy.
+  ssh "$host" "mkdir -p ~/.local/bin &&
+    cat > ~/.local/bin/gfiles.new &&
+    got=\$(wc -c < ~/.local/bin/gfiles.new | tr -d ' ') &&
+    if [ \"\$got\" != $size ]; then
+      echo \"got \$got of $size bytes; leaving the old gfiles in place\" >&2
+      rm -f ~/.local/bin/gfiles.new
+      exit 1
+    fi &&
+    chmod 755 ~/.local/bin/gfiles.new &&
+    ~/.local/bin/gfiles.new --version &&
+    mv ~/.local/bin/gfiles.new ~/.local/bin/gfiles" < "$binary"
+done

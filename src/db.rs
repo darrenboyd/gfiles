@@ -70,6 +70,8 @@ pub fn open_in_memory() -> Result<Connection> {
 
 fn setup(conn: &mut Connection) -> Result<()> {
     conn.pragma_update(None, "foreign_keys", "ON")?;
+    // Scans and ingests are single long transactions; wait for one to finish rather than fail.
+    conn.busy_timeout(std::time::Duration::from_secs(600))?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     let applied: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
     for (i, sql) in MIGRATIONS.iter().enumerate().skip(applied as usize) {

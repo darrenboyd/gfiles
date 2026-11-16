@@ -28,7 +28,7 @@ The repo is public on GitHub, MIT licensed. Changes are committed and pushed str
 - **Storage:** one embedded SQLite database (`rusqlite` with the `bundled` feature, FTS5 for name
   and path search). No external services.
 - **Topology:** one central catalog on `bill`. The same binary runs as an agent on each machine,
-  scans local disks there, and streams the results to `bill` over SSH (`ssh bill gfiles ingest`).
+  scans local disks there, and streams the results to `bill` over SSH (`ssh bill gfiles ingest --machine <name>`).
   No daemon and no open port. A laptop that's away syncs the next time it can reach `bill`.
 - **Interfaces:** a TUI (usable over SSH on `bill`), CLI commands with `--json` output, and an MCP
   server mode (`gfiles mcp`, stdio, so it also works through SSH) with typed tools for AI clients.
@@ -61,6 +61,7 @@ Windows is out of scope for now, but don't make it impossible:
    basic TUI. Single machine.
 2. **MCP server** over the same queries. Done.
 3. **Multi-machine:** agent mode and `ingest` over SSH; agents on the laptop, `bill` and the NAS.
+   Code done (`push`, `sync`, `ingest`); deployment in progress (see `docs/setup.md`).
 4. **Duplicates and backup coverage:** identical files across machines; files that exist in only
    one place.
 5. **Classify and tag:** metadata extraction (EXIF, ID3, EPUB title and author) and Darren's own
@@ -82,6 +83,11 @@ gfiles scan [volume...]                 # all volumes if none named
 gfiles search [words...] [-k KIND] [--volume V] [--machine M] [-n 50 | --all] [--json]
 gfiles stats [--json]
 gfiles mcp                              # MCP server on stdin/stdout
+gfiles push                             # send this machine's volumes to [central]
+gfiles sync                             # scan everything, then push (what timers run)
+gfiles ingest --machine M               # receive M's push on stdin (run by push over ssh)
+
+bin/deploy bill elrond                  # static musl build → ~/.local/bin/gfiles on each host
 
 claude mcp add gfiles -- gfiles mcp               # register locally with Claude Code
 claude mcp add gfiles -- ssh bill gfiles mcp      # or against the central catalog on bill
@@ -97,7 +103,10 @@ scratch directory, when trying the binary out, so experiments never touch the re
   so comments survive.
 - `src/db.rs`: opens SQLite and runs migrations (`PRAGMA user_version`). Never edit a migration
   that has been committed; add a new one.
-- `src/scan.rs`: walks a volume and updates its rows (see below). Holds the default ignores.
+- `src/scan.rs`: walks a volume and writes its rows through `store`. Holds the default ignores.
+- `src/store.rs`: `VolumeWriter`, the one way a volume's entries get written (scans and ingest
+  both use it), plus volume and entry reads.
+- `src/sync.rs`: the push/ingest stream between machines (format in its module doc).
 - `src/classify.rs`: extension to kind.
 - `src/search.rs`: queries shared by every interface (CLI, TUI and MCP). Interfaces
   stay thin and call into it, so they can't drift apart.
@@ -114,7 +123,8 @@ scratch directory, when trying the binary out, so experiments never touch the re
 
 - **Scans:** each scan is one transaction. It bumps the volume's `scan_gen`, stamps every entry it
   sees, then deletes entries with an older stamp. A volume whose root is missing (an unmounted
-  disk or share) is refused instead of being treated as empty.
+  disk or share) or unreadable is refused instead of being treated as empty, and entries under
+  a folder or file the walk couldn't read are kept, not deleted ("couldn't read" isn't "gone").
 - **Search:** FTS5 (external-content table kept in sync by triggers) over name and path. Every
   word is a quoted prefix match, so user input can't inject FTS syntax.
 - **Skipped:** symlinks (not followed or recorded), and names that aren't valid UTF-8 (counted and
@@ -126,6 +136,17 @@ scratch directory, when trying the binary out, so experiments never touch the re
   fzf). Keep stdout clean while it runs. It loads at most 1000 rows; titles show the full count.
 - To check the TUI by hand, run it in a detached tmux session (`tmux new-session -d -x 110 -y 26`),
   drive it with `tmux send-keys` and read it with `tmux capture-pane -p`.
+- **Push/ingest:** each push sends every scanned volume in full (no deltas yet; fine at LAN
+  speeds for ~1M files). Ingest writes one transaction per volume, verifies the entry count, and
+  only after a complete stream forgets the pusher's volumes that left its config. It refuses a
+  push claiming a machine other than `ingest --machine` (set by the forced command on the
+  pusher's key in `authorized_keys`), the central machine's own name, a volume id owned by
+  another machine, and a different `sync::PROTOCOL`. Bump `PROTOCOL` on any incompatible stream
+  change. `store` validates every entry (relative path, no `.`/`..`/empty parts, name matches,
+  known kind) and volume root (absolute), so a pushed path can't point outside its volume.
+- **Deployment:** `docs/setup.md` has the per-machine setup. Binaries are static musl builds so
+  they run on Synology DSM (old kernel and libc). The NAS is `elrond` (DS1019+, DSM 7, home
+  `/var/services/homes/darren`, shares under `/volume1`).
 - **MCP:** stdout carries protocol messages only; never print anything else there in `mcp` mode.
   Bad tool arguments come back as tool results with `isError: true` (so the model can correct
   itself); only unknown methods or tools are JSON-RPC errors. Results carry both a JSON text

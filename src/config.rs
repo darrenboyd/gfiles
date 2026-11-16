@@ -15,8 +15,25 @@ use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, value};
 pub struct Config {
     /// Name this machine reports to the catalog. Defaults to the hostname.
     pub machine: Option<String>,
+    /// The machine holding the central catalog. Leave out on that machine itself.
+    pub central: Option<Central>,
     #[serde(default, rename = "volume")]
     pub volumes: Vec<VolumeConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Central {
+    /// SSH destination, as you'd pass it to `ssh` (a host alias from ~/.ssh/config works).
+    pub host: String,
+    /// The gfiles binary on that host. Non-interactive SSH often lacks ~/.local/bin in PATH,
+    /// so a full path is safest; `~` is expanded by the remote shell.
+    #[serde(default = "default_remote_gfiles")]
+    pub gfiles: String,
+}
+
+fn default_remote_gfiles() -> String {
+    "gfiles".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -33,6 +50,12 @@ pub struct VolumeConfig {
 const NEW_FILE_HEADER: &str = "\
 # gfiles config for this machine.
 # machine = \"name\"   # defaults to the hostname
+#
+# On machines other than the central one, say where to push scans:
+# [central]
+# host = \"bill\"                     # ssh destination
+# gfiles = \"~/.local/bin/gfiles\"    # gfiles on that host
+#
 # Add volumes with `gfiles volume add <path>`.
 ";
 

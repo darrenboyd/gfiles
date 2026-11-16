@@ -5,6 +5,8 @@ pub mod fmt;
 pub mod mcp;
 pub mod scan;
 pub mod search;
+pub mod store;
+pub mod sync;
 pub mod tui;
 
 use std::path::PathBuf;
