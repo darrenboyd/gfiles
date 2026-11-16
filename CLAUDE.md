@@ -12,11 +12,13 @@ Machines in scope:
 
 | Machine  | What it is                                   | OS / arch                 |
 | -------- | -------------------------------------------- | ------------------------- |
-| `gaffer` | Darren's laptop; also the development machine | Pop!_OS, x86_64           |
-| `bill`   | Home-lab server; holds the central catalog   | Ubuntu + Docker, x86_64 (see `~/code/homelab`) |
-| NAS      | Synology DS1019+                             | DSM (Linux), x86_64       |
+| `gaffer` | Darren's laptop: the hub, holds the catalog; also the development machine | Pop!_OS, x86_64 |
+| `elrond` | Synology DS1019+ NAS; a remote that gaffer pulls from | DSM 7 (Linux), x86_64 |
 
-All three are x86_64 Linux, so one static `x86_64-unknown-linux-musl` build runs everywhere.
+`bill`, the home-lab server, is out of scope: its files belong to the apps running there (and
+are backed up where needed), not to Darren.
+
+Both are x86_64 Linux, so one static `x86_64-unknown-linux-musl` build runs everywhere.
 A Windows machine is out of scope for now, but no decision may rule it out (see Windows below).
 
 The repo is public on GitHub, MIT licensed. Changes are committed and pushed straight to `main`
@@ -33,11 +35,12 @@ The repo is public on GitHub, MIT licensed. Changes are committed and pushed str
 - **Language:** Rust, built as a single binary. TUI with `ratatui`.
 - **Storage:** one embedded SQLite database (`rusqlite` with the `bundled` feature, FTS5 for name
   and path search). No external services.
-- **Topology:** one central catalog on `bill`. The same binary runs as an agent on each machine,
-  scans local disks there, and streams the results to `bill` over SSH (`ssh bill gfiles ingest --machine <name>`).
-  No daemon and no open port. A laptop that's away syncs the next time it can reach `bill`.
-- **Interfaces:** a TUI (usable over SSH on `bill`), CLI commands with `--json` output, and an MCP
-  server mode (`gfiles mcp`, stdio, so it also works through SSH) with typed tools for AI clients.
+- **Topology:** gaffer is the hub and holds the catalog. Every machine scans its own disks
+  into a local catalog; the hub pulls each remote's catalog over SSH (`ssh elrond gfiles
+  export`). Remotes only answer, so no daemon, no open port and no sshd on the laptop, and the
+  key lives on the hub. A hub that's away catches up the next time it can reach the remote.
+- **Interfaces:** a TUI, CLI commands with `--json` output, and an MCP
+  server mode (`gfiles mcp`, stdio) with typed tools for AI clients.
 - **Volumes:** a volume is a configured root folder on a named machine, with a stable UUID. Paths
   are stored relative to the volume root, so moving a mount point doesn't orphan the catalog.
 - **What counts as "my files":** built-in ignores (`node_modules`, `.cache`, `target/`,
@@ -66,8 +69,8 @@ Windows is out of scope for now, but don't make it impossible:
    by kind (book, photo, music, video, document, code, ...), and search from the CLI (JSON) and a
    basic TUI. Single machine.
 2. **MCP server** over the same queries. Done.
-3. **Multi-machine:** agent mode and `ingest` over SSH; agents on the laptop, `bill` and the NAS.
-   Code done (`push`, `sync`, `ingest`); deployment in progress (see `docs/setup.md`).
+3. **Multi-machine:** the hub (gaffer) pulls the NAS's catalog over SSH. Code done (`export`,
+   `pull`, `sync`); deployment in progress (see `docs/setup.md`).
 4. **Duplicates and backup coverage:** identical files across machines; files that exist in only
    one place.
 5. **Classify and tag:** metadata extraction (EXIF, ID3, EPUB title and author) and Darren's own
@@ -89,14 +92,13 @@ gfiles scan [volume...]                 # all volumes if none named
 gfiles search [words...] [-k KIND] [--volume V] [--machine M] [-n 50 | --all] [--json]
 gfiles stats [--json]
 gfiles mcp                              # MCP server on stdin/stdout
-gfiles push                             # send this machine's volumes to [central]
-gfiles sync                             # scan everything, then push (what timers run)
-gfiles ingest --machine M               # receive M's push on stdin (run by push over ssh)
+gfiles pull                             # fetch each [[remote]]'s catalog over ssh
+gfiles sync                             # scan everything, then pull (what timers run)
+gfiles export                           # this machine's catalog on stdout (run by pull over ssh)
 
-bin/deploy bill elrond                  # static musl build → ~/.local/bin/gfiles on each host
+bin/deploy elrond                       # static musl build → ~/.local/bin/gfiles on each host
 
-claude mcp add gfiles -- gfiles mcp               # register locally with Claude Code
-claude mcp add gfiles -- ssh bill gfiles mcp      # or against the central catalog on bill
+claude mcp add gfiles -- gfiles mcp     # register with Claude Code (on gaffer)
 ```
 
 `--config` / `GFILES_CONFIG` and `--db` / `GFILES_DB` override the default paths
@@ -110,9 +112,9 @@ scratch directory, when trying the binary out, so experiments never touch the re
 - `src/db.rs`: opens SQLite and runs migrations (`PRAGMA user_version`). Never edit a migration
   that has been committed; add a new one.
 - `src/scan.rs`: walks a volume and writes its rows through `store`. Holds the default ignores.
-- `src/store.rs`: `VolumeWriter`, the one way a volume's entries get written (scans and ingest
+- `src/store.rs`: `VolumeWriter`, the one way a volume's entries get written (scans and pulls
   both use it), plus volume and entry reads.
-- `src/sync.rs`: the push/ingest stream between machines (format in its module doc).
+- `src/sync.rs`: the export/pull stream between machines (format in its module doc).
 - `src/classify.rs`: extension to kind.
 - `src/search.rs`: queries shared by every interface (CLI, TUI and MCP). Interfaces
   stay thin and call into it, so they can't drift apart.
@@ -142,14 +144,16 @@ scratch directory, when trying the binary out, so experiments never touch the re
   fzf). Keep stdout clean while it runs. It loads at most 1000 rows; titles show the full count.
 - To check the TUI by hand, run it in a detached tmux session (`tmux new-session -d -x 110 -y 26`),
   drive it with `tmux send-keys` and read it with `tmux capture-pane -p`.
-- **Push/ingest:** each push sends every scanned volume in full (no deltas yet; fine at LAN
-  speeds for ~1M files). Ingest writes one transaction per volume, verifies the entry count, and
-  only after a complete stream forgets the pusher's volumes that left its config. It refuses a
-  push claiming a machine other than `ingest --machine` (set by the forced command on the
-  pusher's key in `authorized_keys`), the central machine's own name, a volume id owned by
-  another machine, and a different `sync::PROTOCOL`. Bump `PROTOCOL` on any incompatible stream
-  change. `store` validates every entry (relative path, no `.`/`..`/empty parts, name matches,
-  known kind) and volume root (absolute), so a pushed path can't point outside its volume.
+- **Export/pull:** each export sends every scanned volume in full (no deltas yet; fine at LAN
+  speeds for ~1M files). Ingest (the receiving half of `pull`) writes one transaction per
+  volume, verifies the entry count, and only after a complete stream forgets the remote's
+  volumes that left its config. It refuses a stream claiming a machine other than the
+  `[[remote]]` name it was pulled for, the hub's own name, a volume id owned by another
+  machine, and a different `sync::PROTOCOL`. Bump `PROTOCOL` on any incompatible stream change.
+  `store` validates every entry (relative path, no `.`/`..`/empty parts, name matches, known
+  kind) and volume root (absolute), so a pulled path can't point outside its volume. Every
+  `pull`/`sync` forgets the volumes of machines that are neither this one nor a configured
+  remote.
 - **Deployment:** `docs/setup.md` has the per-machine setup. Binaries are static musl builds so
   they run on Synology DSM (old kernel and libc). The NAS is `elrond` (DS1019+, DSM 7, home
   `/var/services/homes/darren`, shares under `/volume1`).

@@ -1,4 +1,3 @@
-use std::io::Write;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -39,19 +38,14 @@ enum Command {
     /// Scan volumes into the catalog (all of them, or the ones named)
     Scan { volumes: Vec<String> },
 
-    /// Send this machine's scanned volumes to the central catalog (see [central] in the config)
-    Push,
+    /// Fetch each remote's catalog over SSH into this one (see [[remote]] in the config)
+    Pull,
 
-    /// Scan every volume, then push if a central catalog is configured. Run this from a timer.
+    /// Scan every volume, then pull from each remote. Run this from a timer.
     Sync,
 
-    /// Receive volumes pushed from another machine on stdin (run by `push` over SSH)
-    Ingest {
-        /// The machine this push may write for; refuses a push claiming any other. Set it in
-        /// the forced command of that machine's key in authorized_keys.
-        #[arg(long)]
-        machine: String,
-    },
+    /// Write this machine's scanned volumes to stdout (run by `pull` over SSH; read-only)
+    Export,
 
     /// Find files by name or path words, kind, volume or machine
     Search {
@@ -158,38 +152,36 @@ fn main() -> Result<()> {
                 std::process::exit(1);
             }
         }
-        Command::Push => {
+        Command::Pull => {
             let config = Config::load(&config_path)?;
-            let conn = db::open(&db_path)?;
-            push(&config, &conn)?;
+            let mut conn = db::open(&db_path)?;
+            if config.remotes.is_empty() {
+                println!("No [[remote]] in the config, so there's nothing to pull.");
+            }
+            if !pull(&config, &mut conn)? {
+                std::process::exit(1);
+            }
         }
         Command::Sync => {
             let config = Config::load(&config_path)?;
             let mut conn = db::open(&db_path)?;
             let scanned = scan_volumes(&config, &mut conn, &[])?;
-            // Push even if some volume failed to scan: the others are still worth sending, and
-            // a failed volume keeps its previous entries.
-            if config.central.is_some() {
-                push(&config, &conn)?;
-            }
-            if !scanned {
+            // Pull even if a local volume failed to scan: it keeps its previous entries, and
+            // the remotes are still worth fetching.
+            let pulled = pull(&config, &mut conn)?;
+            if !(scanned && pulled) {
                 std::process::exit(1);
             }
         }
-        Command::Ingest { machine } => {
+        Command::Export => {
             let config = Config::load(&config_path)?;
-            let mut conn = db::open(&db_path)?;
-            let mut stdout = std::io::stdout().lock();
-            gfiles::sync::ingest(
-                &mut conn,
+            let conn = db::open(&db_path)?;
+            let ids: Vec<String> = config.volumes.iter().map(|v| v.id.clone()).collect();
+            gfiles::sync::export(
+                &conn,
                 &config.machine_name(),
-                &machine,
-                std::io::stdin().lock(),
-                |report| {
-                    serde_json::to_writer(&mut stdout, report)?;
-                    writeln!(stdout)?;
-                    Ok(stdout.flush()?)
-                },
+                &ids,
+                std::io::stdout().lock(),
             )?;
         }
         Command::Search {
@@ -314,32 +306,47 @@ fn scan_volumes(
     Ok(ok)
 }
 
-fn push(config: &Config, conn: &rusqlite::Connection) -> Result<()> {
-    let Some(central) = &config.central else {
-        bail!("no [central] section in the config, so there's nowhere to push");
-    };
-    let ids: Vec<String> = config.volumes.iter().map(|v| v.id.clone()).collect();
-    let started = Instant::now();
-    let reports = gfiles::sync::push(conn, central, &config.machine_name(), &ids)?;
-    println!(
-        "Pushed to {} ({:.1}s):",
-        central.host,
-        started.elapsed().as_secs_f64()
-    );
-    for r in &reports {
-        match r {
-            gfiles::sync::Report::Volume {
-                name,
-                entries,
-                removed,
-            } => println!("  {name}: {entries} entries, {removed} removed"),
-            gfiles::sync::Report::Forgot { name } => {
+/// Pulls every remote, then forgets the volumes of machines that are neither this one nor a
+/// configured remote (a remote taken out of the config). Returns false if any remote failed
+/// (after reporting it); the others are still applied.
+fn pull(config: &Config, conn: &mut rusqlite::Connection) -> Result<bool> {
+    let machine = config.machine_name();
+    let mut ok = true;
+    for remote in &config.remotes {
+        let started = Instant::now();
+        match gfiles::sync::pull(conn, &machine, remote) {
+            Ok(reports) => {
                 println!(
-                    "  {name}: no longer configured here, so removed from {}",
-                    central.host
-                )
+                    "Pulled {} ({:.1}s):",
+                    remote.name,
+                    started.elapsed().as_secs_f64()
+                );
+                for r in &reports {
+                    match r {
+                        gfiles::sync::Report::Volume {
+                            name,
+                            entries,
+                            removed,
+                        } => println!("  {name}: {entries} entries, {removed} removed"),
+                        gfiles::sync::Report::Forgot { name } => {
+                            println!(
+                                "  {name}: no longer configured on {}, so removed",
+                                remote.name
+                            )
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("error: {e:#}");
+                ok = false;
             }
         }
     }
-    Ok(())
+    let mut known: Vec<String> = config.remotes.iter().map(|r| r.name.clone()).collect();
+    known.push(machine);
+    for (machine, name) in store::forget_machines_except(conn, &known)? {
+        println!("{machine}:{name}: {machine} is no longer a remote, so removed");
+    }
+    Ok(ok)
 }

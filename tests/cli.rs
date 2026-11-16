@@ -67,17 +67,20 @@ fn add_scan_search() {
     assert_eq!(String::from_utf8(out.stdout).unwrap().trim(), "[]");
 }
 
-/// `sync` on one machine pushes through `ssh` into another catalog. A fake `ssh` on PATH runs
-/// the remote command locally, so the real CLI paths run end to end.
+/// `sync` on the hub scans locally, then pulls a remote's catalog through `ssh`. A fake `ssh`
+/// on PATH runs the remote command locally, so the real CLI paths run end to end.
 #[cfg(unix)]
 #[test]
-fn sync_pushes_to_central() {
+fn sync_pulls_from_a_remote() {
     use std::os::unix::fs::PermissionsExt;
 
     let tmp = tempfile::tempdir().unwrap();
     let books = tmp.path().join("Books");
     fs::create_dir_all(&books).unwrap();
     fs::write(books.join("Dune.epub"), "x").unwrap();
+    let notes = tmp.path().join("Notes");
+    fs::create_dir_all(&notes).unwrap();
+    fs::write(notes.join("todo.txt"), "x").unwrap();
 
     let bin = tmp.path().join("bin");
     fs::create_dir_all(&bin).unwrap();
@@ -90,50 +93,80 @@ fn sync_pushes_to_central() {
     fs::set_permissions(bin.join("ssh"), fs::Permissions::from_mode(0o755)).unwrap();
 
     let gfiles_bin = assert_cmd::cargo::cargo_bin("gfiles");
-    let central_cmd = format!(
+    let nas = |args: &[&str]| {
+        let mut cmd = Command::cargo_bin("gfiles").unwrap();
+        cmd.env("GFILES_CONFIG", tmp.path().join("nas.toml"))
+            .env("GFILES_DB", tmp.path().join("nas.db"))
+            .args(args);
+        cmd
+    };
+    fs::write(tmp.path().join("nas.toml"), "machine = \"elrond\"\n").unwrap();
+    nas(&["volume", "add"]).arg(&books).assert().success();
+    nas(&["scan"]).assert().success();
+
+    let nas_cmd = format!(
         "{} --db {} --config {}",
         gfiles_bin.display(),
-        tmp.path().join("central.db").display(),
-        tmp.path().join("central.toml").display()
+        tmp.path().join("nas.db").display(),
+        tmp.path().join("nas.toml").display()
     );
     fs::write(
-        tmp.path().join("agent.toml"),
-        format!("machine = \"gaffer\"\n[central]\nhost = \"bill\"\ngfiles = \"{central_cmd}\"\n"),
+        tmp.path().join("hub.toml"),
+        format!("machine = \"gaffer\"\n[[remote]]\nname = \"elrond\"\ngfiles = \"{nas_cmd}\"\n"),
     )
     .unwrap();
-    fs::write(tmp.path().join("central.toml"), "machine = \"bill\"\n").unwrap();
-
     let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
-    let agent = || {
+    let hub = || {
         let mut cmd = Command::cargo_bin("gfiles").unwrap();
-        cmd.env("GFILES_CONFIG", tmp.path().join("agent.toml"))
-            .env("GFILES_DB", tmp.path().join("agent.db"))
+        cmd.env("GFILES_CONFIG", tmp.path().join("hub.toml"))
+            .env("GFILES_DB", tmp.path().join("hub.db"))
             .env("PATH", &path);
         cmd
     };
-    agent()
-        .args(["volume", "add"])
-        .arg(&books)
-        .assert()
-        .success();
-    let out = agent().arg("sync").output().unwrap();
+    hub().args(["volume", "add"]).arg(&notes).assert().success();
+    let out = hub().arg("sync").output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         out.status.success(),
         "{stdout}\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(stdout.contains("Pushed to bill"), "{stdout}");
+    assert!(stdout.contains("Notes: 1 files"), "{stdout}");
+    assert!(stdout.contains("Pulled elrond"), "{stdout}");
     assert!(stdout.contains("Books: 1 entries, 0 removed"), "{stdout}");
 
-    let out = Command::cargo_bin("gfiles")
+    let out = hub().args(["search", "--json"]).output().unwrap();
+    let found: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let mut seen: Vec<String> = found["files"]
+        .as_array()
         .unwrap()
-        .args(["--db"])
-        .arg(tmp.path().join("central.db"))
-        .args(["search", "dune", "--json"])
-        .output()
-        .unwrap();
-    let hits: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(hits["files"][0]["machine"], "gaffer");
-    assert_eq!(hits["files"][0]["path"], "Dune.epub");
+        .iter()
+        .map(|h| {
+            format!(
+                "{}:{}",
+                h["machine"].as_str().unwrap(),
+                h["path"].as_str().unwrap()
+            )
+        })
+        .collect();
+    seen.sort();
+    assert_eq!(seen, vec!["elrond:Dune.epub", "gaffer:todo.txt"]);
+
+    // Taking the remote out of the config forgets its volumes; the hub's own stay.
+    let config = fs::read_to_string(tmp.path().join("hub.toml")).unwrap();
+    let start = config.find("[[remote]]").unwrap();
+    let end = start + config[start..].find("\n\n").unwrap_or(config.len() - start);
+    fs::write(
+        tmp.path().join("hub.toml"),
+        format!("{}{}", &config[..start], &config[end..]),
+    )
+    .unwrap();
+    let out = hub().arg("pull").output().unwrap();
+    assert!(out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("elrond:Books: elrond is no longer a remote")
+    );
+    let out = hub().args(["search", "--json"]).output().unwrap();
+    let found: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(found["total_matches"], 1);
 }

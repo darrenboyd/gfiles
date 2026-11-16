@@ -1,10 +1,11 @@
-//! Moving catalogs between machines: `push` sends this machine's volumes to the central
-//! catalog, where `ingest` receives them.
+//! Moving catalogs between machines. The hub (gaffer) runs `pull`, which runs `gfiles export`
+//! on each remote over SSH and applies the stream with `ingest`. Remotes only answer; nothing
+//! connects to the hub.
 //!
 //! The stream is newline-delimited JSON, one message per line:
 //!
 //! ```text
-//! {"t":"hello","protocol":1,"machine":"gaffer","volumes":["<id>", ...]}   every configured volume
+//! {"t":"hello","protocol":1,"machine":"elrond","volumes":["<id>", ...]}   every configured volume
 //! {"t":"volume","id":..,"name":..,"machine":..,"root":..,"last_scan_at":..}
 //! {"t":"entry","path":..,"name":..,"ext":..,"kind":..,"size":..,"mtime":..}   × N
 //! {"t":"end","entries":N}
@@ -12,23 +13,24 @@
 //! {"t":"done"}
 //! ```
 //!
-//! Every push sends each scanned volume in full; ingest applies it with the same `VolumeWriter`
-//! a local scan uses, one transaction per volume, so a cut-off stream never leaves a volume half
-//! written. After `done`, ingest forgets this machine's volumes that are no longer in `hello`.
+//! Every export sends each scanned volume in full; ingest applies it with the same
+//! `VolumeWriter` a local scan uses, one transaction per volume, so a cut-off stream never
+//! leaves a volume half written. After `done`, ingest forgets the remote's volumes that are no
+//! longer in `hello`.
 //!
-//! Push runs `gfiles ingest --machine <its name>`. On the central machine each pusher's SSH key
-//! should be locked to that command (`restrict,command="..."` in `authorized_keys`, see
-//! docs/setup.md), so the name comes from the key, not from the stream: ingest refuses a `hello`
-//! naming any other machine, and store refuses entry paths that leave their volume.
+//! The stream is untrusted: the remote's machine name comes from the hub's config, not from
+//! the stream (ingest refuses a `hello` naming any other machine), and store refuses entry
+//! paths that leave their volume. On the remote, the hub's key should be locked to
+//! `gfiles export` with a forced command in `authorized_keys` (see docs/setup.md).
 
-use std::io::{BufRead, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
-use crate::config::Central;
+use crate::config::Remote;
 use crate::scan::unix_secs;
 use crate::store::{self, Entry, Volume, VolumeWriter};
 
@@ -52,7 +54,7 @@ enum Message {
     Done,
 }
 
-/// What ingest did, sent back to the pushing machine as one JSON line per item.
+/// What ingest did, one item per volume written or forgotten.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum Report {
@@ -66,9 +68,9 @@ pub enum Report {
     },
 }
 
-/// Writes the push stream for `machine`'s volumes in the local catalog. `volume_ids` is every
+/// Writes the stream for `machine`'s volumes in the local catalog. `volume_ids` is every
 /// volume in this machine's config; those never scanned are listed in `hello` but not sent.
-pub fn write_push(
+pub fn export(
     conn: &Connection,
     machine: &str,
     volume_ids: &[String],
@@ -112,14 +114,14 @@ pub fn write_push(
     Ok(())
 }
 
-/// Applies a push stream to this catalog. `local_machine` is this machine's own name: a push
-/// claiming it is refused, since it would replace this machine's own volumes. `pusher` is the
-/// machine this push is allowed to write for (from `ingest --machine`); a stream claiming any
-/// other is refused.
+/// Applies a stream to this catalog. `local_machine` is this machine's own name: a stream
+/// claiming it is refused, since it would replace this machine's own volumes. `remote` is the
+/// machine this stream is allowed to write for (from the config); a stream claiming any other
+/// is refused.
 pub fn ingest(
     conn: &mut Connection,
     local_machine: &str,
-    pusher: &str,
+    remote: &str,
     input: impl BufRead,
     mut on_report: impl FnMut(&Report) -> Result<()>,
 ) -> Result<()> {
@@ -127,7 +129,7 @@ pub fn ingest(
     let mut next = move || -> Result<Message> {
         let line = lines
             .next()
-            .context("the push stream ended early (connection lost?)")??;
+            .context("the stream ended early (connection lost?)")??;
         serde_json::from_str(&line).with_context(|| format!("bad message: {line:.200}"))
     };
 
@@ -137,23 +139,24 @@ pub fn ingest(
         volumes: listed,
     } = next()?
     else {
-        bail!("the push stream must start with hello");
+        bail!("the stream must start with hello");
     };
     if protocol != PROTOCOL {
         bail!(
-            "the pushing gfiles speaks protocol {protocol}, this one speaks {PROTOCOL}; \
+            "the remote gfiles speaks protocol {protocol}, this one speaks {PROTOCOL}; \
              install the same gfiles version on both machines"
-        );
-    }
-    if machine != pusher {
-        bail!(
-            "refusing a push claiming machine {machine:?}; this connection may only push for {pusher:?}"
         );
     }
     if machine == local_machine {
         bail!(
-            "refusing a push from machine {machine:?}, which is this machine's own name; \
-             give the pushing machine its own name with `machine = \"...\"` in its config"
+            "refusing a catalog from machine {machine:?}, which is this machine's own name; \
+             give the remote its own name with `machine = \"...\"` in its config"
+        );
+    }
+    if machine != remote {
+        bail!(
+            "remote {remote:?} sent a catalog for machine {machine:?}; \
+             set `machine = \"{remote}\"` in its config, or rename the remote here"
         );
     }
 
@@ -162,7 +165,7 @@ pub fn ingest(
             Message::Volume(volume) => {
                 if volume.machine != machine {
                     bail!(
-                        "volume {:?} claims machine {:?} in a push from {machine:?}",
+                        "volume {:?} claims machine {:?} in a catalog from {machine:?}",
                         volume.name,
                         volume.machine
                     );
@@ -226,16 +229,11 @@ pub fn ingest(
     Ok(())
 }
 
-/// Pushes this machine's volumes to the central catalog over SSH, returning ingest's reports.
-pub fn push(
-    conn: &Connection,
-    central: &Central,
-    machine: &str,
-    volume_ids: &[String],
-) -> Result<Vec<Report>> {
-    // Pushes usually run from timers, with nobody to notice a hang. BatchMode fails instead of
-    // waiting for a password; ConnectTimeout bounds an unreachable host; ServerAlive* drops a
-    // connection that stops answering (a sleeping laptop, a dropped link) after about 2 minutes.
+/// Pulls `remote`'s catalog over SSH into this one, returning what ingest did.
+pub fn pull(conn: &mut Connection, local_machine: &str, remote: &Remote) -> Result<Vec<Report>> {
+    // Pulls usually run from timers, with nobody to notice a hang. BatchMode fails instead of
+    // waiting for a password; ConnectTimeout bounds an unreachable host (the laptop away from
+    // home); ServerAlive* drops a connection that stops answering after about 2 minutes.
     let mut child = Command::new("ssh")
         .args([
             "-o",
@@ -246,39 +244,36 @@ pub fn push(
             "ServerAliveInterval=30",
             "-o",
             "ServerAliveCountMax=4",
-            &central.host,
+            remote.host(),
         ])
-        .arg(format!(
-            "{} ingest --machine {}",
-            central.gfiles,
-            shell_quote(machine)
-        ))
-        .stdin(Stdio::piped())
+        .arg(format!("{} export", remote.gfiles))
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .spawn()
         .context("running ssh")?;
-    let stdin = child.stdin.take().expect("piped stdin");
-    let sent = write_push(conn, machine, volume_ids, stdin);
-    // If the remote side failed, writing usually fails too (broken pipe); its exit status and
-    // stderr (passed straight through) say why, so check that first.
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
-        bail!(
-            "ingest on {} failed ({}); its error is above",
-            central.host,
-            output.status
-        );
+    let stdout = child.stdout.take().expect("piped stdout");
+    let mut reports = Vec::new();
+    // Ingest drops the pipe when it returns, so a remote still writing after a refusal stops.
+    let ingested = ingest(
+        conn,
+        local_machine,
+        &remote.name,
+        BufReader::new(stdout),
+        |r| {
+            reports.push(r.clone());
+            Ok(())
+        },
+    );
+    let status = child.wait()?;
+    match ingested {
+        Ok(()) => Ok(reports),
+        // ssh or the remote export failed; its stderr (passed straight through) says why.
+        Err(e) if !status.success() => Err(e.context(format!(
+            "pulling from {} failed (ssh exited with {status}; any remote error is above)",
+            remote.host()
+        ))),
+        Err(e) => Err(e.context(format!("pulling from {}", remote.host()))),
     }
-    sent?;
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(|l| serde_json::from_str(l).with_context(|| format!("bad report: {l}")))
-        .collect()
-}
-
-/// Quotes `s` for the POSIX shell that runs the remote command.
-fn shell_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', r"'\''"))
 }
 
 #[cfg(test)]
@@ -305,26 +300,27 @@ mod tests {
         }
     }
 
-    /// Pushes `machine`'s volumes from `agent` into `central` (whose own machine is "bill").
-    fn push_into(
-        agent: &Connection,
+    /// Exports `machine`'s volumes from `remote_db` and ingests them into `hub` (whose own
+    /// machine is "elrond"), as a pull from a remote named `machine` would.
+    fn transfer(
+        remote_db: &Connection,
         machine: &str,
         ids: &[&str],
-        central: &mut Connection,
+        hub: &mut Connection,
     ) -> Result<Vec<Report>> {
         let ids: Vec<String> = ids.iter().map(|s| s.to_string()).collect();
         let mut stream = Vec::new();
-        write_push(agent, machine, &ids, &mut stream).unwrap();
+        export(remote_db, machine, &ids, &mut stream).unwrap();
         let mut reports = Vec::new();
-        ingest(central, "bill", machine, stream.as_slice(), |r| {
+        ingest(hub, "gaffer", machine, stream.as_slice(), |r| {
             reports.push(r.clone());
             Ok(())
         })?;
         Ok(reports)
     }
 
-    fn central_paths(central: &Connection) -> Vec<String> {
-        let mut hits = search::search(central, &Query::default()).unwrap();
+    fn hub_paths(hub: &Connection) -> Vec<String> {
+        let mut hits = search::search(hub, &Query::default()).unwrap();
         hits.sort_by(|a, b| a.path.cmp(&b.path));
         hits.into_iter()
             .map(|h| format!("{}:{}", h.machine, h.path))
@@ -332,24 +328,24 @@ mod tests {
     }
 
     #[test]
-    fn push_updates_and_forgets() {
+    fn pull_updates_and_forgets() {
         let tmp = tempfile::tempdir().unwrap();
         let (books, music) = (tmp.path().join("books"), tmp.path().join("music"));
         touch(&books, "Tolkien/The Hobbit.epub");
         touch(&books, "Dune.epub");
         touch(&music, "song.flac");
 
-        let mut agent = db::open_in_memory().unwrap();
-        let mut central = db::open_in_memory().unwrap();
-        // The central machine's own volume must survive pushes from others.
+        let mut remote_db = db::open_in_memory().unwrap();
+        let mut hub = db::open_in_memory().unwrap();
+        // The hub machine's own volume must survive pulls from others.
         let own = tmp.path().join("own");
-        touch(&own, "bill.txt");
-        scan::scan_volume(&mut central, &vol("c", &own), "bill").unwrap();
+        touch(&own, "own.txt");
+        scan::scan_volume(&mut hub, &vol("c", &own), "gaffer").unwrap();
 
-        scan::scan_volume(&mut agent, &vol("b", &books), "gaffer").unwrap();
-        scan::scan_volume(&mut agent, &vol("m", &music), "gaffer").unwrap();
+        scan::scan_volume(&mut remote_db, &vol("b", &books), "elrond").unwrap();
+        scan::scan_volume(&mut remote_db, &vol("m", &music), "elrond").unwrap();
         let reports =
-            push_into(&agent, "gaffer", &["b", "m", "never-scanned"], &mut central).unwrap();
+            transfer(&remote_db, "elrond", &["b", "m", "never-scanned"], &mut hub).unwrap();
         assert_eq!(
             reports,
             vec![
@@ -366,19 +362,19 @@ mod tests {
             ]
         );
         assert_eq!(
-            central_paths(&central),
+            hub_paths(&hub),
             vec![
-                "gaffer:Dune.epub",
-                "gaffer:Tolkien/The Hobbit.epub",
-                "bill:bill.txt",
-                "gaffer:song.flac"
+                "elrond:Dune.epub",
+                "elrond:Tolkien/The Hobbit.epub",
+                "gaffer:own.txt",
+                "elrond:song.flac"
             ]
         );
 
-        // A deleted file disappears on the next push; a volume dropped from the config is forgotten.
+        // A deleted file disappears on the next pull; a volume dropped from the config is forgotten.
         fs::remove_file(books.join("Dune.epub")).unwrap();
-        scan::scan_volume(&mut agent, &vol("b", &books), "gaffer").unwrap();
-        let reports = push_into(&agent, "gaffer", &["b"], &mut central).unwrap();
+        scan::scan_volume(&mut remote_db, &vol("b", &books), "elrond").unwrap();
+        let reports = transfer(&remote_db, "elrond", &["b"], &mut hub).unwrap();
         assert_eq!(
             reports,
             vec![
@@ -393,8 +389,8 @@ mod tests {
             ]
         );
         assert_eq!(
-            central_paths(&central),
-            vec!["gaffer:Tolkien/The Hobbit.epub", "bill:bill.txt"]
+            hub_paths(&hub),
+            vec!["elrond:Tolkien/The Hobbit.epub", "gaffer:own.txt"]
         );
     }
 
@@ -403,84 +399,84 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         touch(tmp.path(), "a.txt");
         touch(tmp.path(), "b.txt");
-        let mut agent = db::open_in_memory().unwrap();
-        let mut central = db::open_in_memory().unwrap();
-        scan::scan_volume(&mut agent, &vol("v", tmp.path()), "gaffer").unwrap();
-        push_into(&agent, "gaffer", &["v"], &mut central).unwrap();
+        let mut remote_db = db::open_in_memory().unwrap();
+        let mut hub = db::open_in_memory().unwrap();
+        scan::scan_volume(&mut remote_db, &vol("v", tmp.path()), "elrond").unwrap();
+        transfer(&remote_db, "elrond", &["v"], &mut hub).unwrap();
 
         fs::remove_file(tmp.path().join("b.txt")).unwrap();
-        scan::scan_volume(&mut agent, &vol("v", tmp.path()), "gaffer").unwrap();
+        scan::scan_volume(&mut remote_db, &vol("v", tmp.path()), "elrond").unwrap();
         let mut stream = Vec::new();
-        write_push(&agent, "gaffer", &["v".into()], &mut stream).unwrap();
+        export(&remote_db, "elrond", &["v".into()], &mut stream).unwrap();
         let text = String::from_utf8(stream).unwrap();
         let cut: String = text.lines().take(3).map(|l| format!("{l}\n")).collect(); // no "end"
-        let err = ingest(&mut central, "bill", "gaffer", cut.as_bytes(), |_| Ok(())).unwrap_err();
+        let err = ingest(&mut hub, "gaffer", "elrond", cut.as_bytes(), |_| Ok(())).unwrap_err();
         assert!(err.to_string().contains("ended early"), "{err}");
-        assert_eq!(
-            central_paths(&central),
-            vec!["gaffer:a.txt", "gaffer:b.txt"]
-        );
+        assert_eq!(hub_paths(&hub), vec!["elrond:a.txt", "elrond:b.txt"]);
     }
 
     #[test]
     fn refusals() {
         let tmp = tempfile::tempdir().unwrap();
         touch(tmp.path(), "a.txt");
-        let mut agent = db::open_in_memory().unwrap();
-        let mut central = db::open_in_memory().unwrap();
-        scan::scan_volume(&mut agent, &vol("v", tmp.path()), "gaffer").unwrap();
+        let mut remote_db = db::open_in_memory().unwrap();
+        let mut hub = db::open_in_memory().unwrap();
+        scan::scan_volume(&mut remote_db, &vol("v", tmp.path()), "elrond").unwrap();
 
-        let err = push_into(&agent, "bill", &[], &mut central).unwrap_err();
+        let err = transfer(&remote_db, "gaffer", &[], &mut hub).unwrap_err();
         assert!(err.to_string().contains("this machine's own name"), "{err}");
 
-        let hello = r#"{"t":"hello","protocol":99,"machine":"gaffer","volumes":[]}"#;
-        let err = ingest(&mut central, "bill", "gaffer", hello.as_bytes(), |_| Ok(())).unwrap_err();
+        let hello = r#"{"t":"hello","protocol":99,"machine":"elrond","volumes":[]}"#;
+        let err = ingest(&mut hub, "gaffer", "elrond", hello.as_bytes(), |_| Ok(())).unwrap_err();
         assert!(err.to_string().contains("protocol 99"), "{err}");
 
-        // The same volume id pushed by a different machine.
-        push_into(&agent, "gaffer", &["v"], &mut central).unwrap();
+        // The same volume id sent by a different machine.
+        transfer(&remote_db, "elrond", &["v"], &mut hub).unwrap();
         let mut other = db::open_in_memory().unwrap();
-        scan::scan_volume(&mut other, &vol("v", tmp.path()), "elrond").unwrap();
-        let err = push_into(&other, "elrond", &["v"], &mut central).unwrap_err();
+        scan::scan_volume(&mut other, &vol("v", tmp.path()), "nas2").unwrap();
+        let err = transfer(&other, "nas2", &["v"], &mut hub).unwrap_err();
         assert!(err.to_string().contains("belongs to machine"), "{err}");
     }
 
-    /// Ingests a hand-written stream for `machine`, pushed by `pusher`.
-    fn ingest_lines(central: &mut Connection, pusher: &str, lines: &[&str]) -> Result<()> {
+    /// Ingests a hand-written stream as if pulled from `remote`.
+    fn ingest_lines(hub: &mut Connection, remote: &str, lines: &[&str]) -> Result<()> {
         let input: String = lines.iter().map(|l| format!("{l}\n")).collect();
-        ingest(central, "bill", pusher, input.as_bytes(), |_| Ok(()))
+        ingest(hub, "gaffer", remote, input.as_bytes(), |_| Ok(()))
     }
 
     #[test]
-    fn a_pusher_can_only_push_for_itself() {
+    fn a_remote_can_only_send_its_own_catalog() {
         let tmp = tempfile::tempdir().unwrap();
         touch(tmp.path(), "a.txt");
-        let mut agent = db::open_in_memory().unwrap();
-        let mut central = db::open_in_memory().unwrap();
-        scan::scan_volume(&mut agent, &vol("v", tmp.path()), "gaffer").unwrap();
-        push_into(&agent, "gaffer", &["v"], &mut central).unwrap();
+        let mut remote_db = db::open_in_memory().unwrap();
+        let mut hub = db::open_in_memory().unwrap();
+        scan::scan_volume(&mut remote_db, &vol("v", tmp.path()), "elrond").unwrap();
+        transfer(&remote_db, "elrond", &["v"], &mut hub).unwrap();
 
-        // elrond's key claiming to be gaffer, with no volumes: would forget all of gaffer's.
+        // nas2 claiming to be elrond, with no volumes: would forget all of elrond's.
         let err = ingest_lines(
-            &mut central,
-            "elrond",
+            &mut hub,
+            "nas2",
             &[
-                r#"{"t":"hello","protocol":1,"machine":"gaffer","volumes":[]}"#,
+                r#"{"t":"hello","protocol":1,"machine":"elrond","volumes":[]}"#,
                 r#"{"t":"done"}"#,
             ],
         )
         .unwrap_err();
-        assert!(err.to_string().contains("may only push for"), "{err}");
-        assert_eq!(central_paths(&central), vec!["gaffer:a.txt"]);
+        assert!(
+            err.to_string().contains("sent a catalog for machine"),
+            "{err}"
+        );
+        assert_eq!(hub_paths(&hub), vec!["elrond:a.txt"]);
     }
 
     #[test]
     fn entries_that_leave_their_volume_are_refused() {
-        let mut central = db::open_in_memory().unwrap();
-        let hello = r#"{"t":"hello","protocol":1,"machine":"elrond","volumes":["v"]}"#;
+        let mut hub = db::open_in_memory().unwrap();
+        let hello = r#"{"t":"hello","protocol":1,"machine":"nas2","volumes":["v"]}"#;
         let volume = |root: &str| {
             format!(
-                r#"{{"t":"volume","id":"v","name":"x","machine":"elrond","root":"{root}","last_scan_at":null}}"#
+                r#"{{"t":"volume","id":"v","name":"x","machine":"nas2","root":"{root}","last_scan_at":null}}"#
             )
         };
         let entry = |path: &str, name: &str| {
@@ -504,12 +500,12 @@ mod tests {
             ];
             let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
             assert!(
-                ingest_lines(&mut central, "elrond", &lines).is_err(),
+                ingest_lines(&mut hub, "nas2", &lines).is_err(),
                 "{root} {path} accepted"
             );
         }
-        assert!(central_paths(&central).is_empty());
-        let volumes: i64 = central
+        assert!(hub_paths(&hub).is_empty());
+        let volumes: i64 = hub
             .query_row("SELECT count(*) FROM volumes", [], |r| r.get(0))
             .unwrap();
         assert_eq!(volumes, 0, "a refused volume rolls back entirely");

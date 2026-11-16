@@ -1,7 +1,7 @@
-# Scans this machine's volumes and pushes them to the central catalog.
+# Scans this machine's volumes, then pulls each remote's catalog (on the hub).
 # Install: see docs/setup.md.
 [Unit]
-Description=Scan gfiles volumes and push them to the central catalog
+Description=Scan gfiles volumes and pull remote catalogs
 
 [Service]
 Type=oneshot

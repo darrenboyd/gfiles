@@ -1,5 +1,5 @@
 //! `gfiles mcp`: a Model Context Protocol server on stdin/stdout, so AI tools can query the
-//! catalog. Works over SSH too: `ssh bill gfiles mcp`.
+//! catalog. Works over SSH too: `ssh <host> gfiles mcp`.
 //!
 //! The protocol layer is written by hand: newline-delimited JSON-RPC 2.0 with just the methods
 //! a tools-only server needs (`initialize`, `ping`, `tools/list`, `tools/call`). That keeps the

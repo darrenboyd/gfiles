@@ -3,7 +3,7 @@
 # The static build runs on any x86_64 Linux, including Synology DSM's old kernel and libc.
 # Needs musl-tools (`sudo apt install musl-tools`) for rusqlite's bundled SQLite.
 #
-# Usage: bin/deploy bill elrond
+# Usage: bin/deploy elrond
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

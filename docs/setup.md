@@ -1,96 +1,112 @@
 # Setting up gfiles across machines
 
-One machine holds the central catalog (here `bill`). Every other machine scans its own volumes
-into a local catalog and pushes them to the central one over SSH with `gfiles sync`.
+`gaffer` (the laptop) is the hub: it holds the catalog of everything. The NAS (`elrond`) scans
+its own shares into a local catalog, and the hub pulls that catalog over SSH. The NAS only
+answers; nothing connects to the laptop.
 
 ```text
-gaffer (laptop) ──┐
-                  ├─ ssh bill gfiles ingest --machine <name> ──▶ bill: central catalog
-elrond (NAS)   ───┘                                              (TUI, MCP, search over everything)
+elrond (NAS)                                  gaffer (laptop, the hub)
+  nightly: gfiles scan  ◀── ssh elrond gfiles export ──  hourly: gfiles sync
+  (its own catalog)                                      (scan local + pull: TUI, MCP, search)
 ```
 
 ## 1. Install the binary
 
-From a checkout on the development machine:
+From a checkout on gaffer:
 
 ```bash
 sudo apt install musl-tools   # once: a C compiler for the static build
-bin/deploy bill elrond        # static build, copied to ~/.local/bin/gfiles on each host
-cargo install --path .        # on the development machine itself
+bin/deploy elrond             # static build, copied to ~/.local/bin/gfiles on the NAS
+cargo install --path .        # on gaffer itself
 ```
 
-The static build runs on any x86_64 Linux, including Synology DSM. The pushing and the
-central machine must run the same gfiles version: `ingest` refuses a different protocol.
+The static build runs on Synology DSM's old kernel and libc. Both machines must run the same
+gfiles version: a pull refuses a different protocol.
 
-## 2. The central machine
+## 2. The NAS
 
-Nothing to configure unless it has volumes of its own, in which case add them and scan with a
-timer as below (`gfiles sync` without a `[central]` section just scans). Its catalog lives at
-`~/.local/share/gfiles/catalog.db`.
+On `elrond`, name the machine and add the shares to catalog:
 
-## 3. Each other machine
+```bash
+~/.local/bin/gfiles volume add /volume1/Media
+~/.local/bin/gfiles volume add /volume1/photo
+```
+
+and in `~/.config/gfiles/config.toml`:
+
+```toml
+machine = "elrond"
+```
+
+Scan on a schedule with DSM's Task Scheduler: Control Panel → Task Scheduler → Create →
+Scheduled Task → User-defined script. Run it as your user (not root), daily at night, with the
+script:
+
+```sh
+/var/services/homes/darren/.local/bin/gfiles scan
+```
+
+The first scan of a large share takes a while; later ones are faster on a warm cache.
+
+## 3. The hub
+
+On `gaffer`, add local folders:
 
 ```bash
 gfiles volume add ~/Documents
 gfiles volume add ~/Downloads --ignore 'go/pkg/'
 ```
 
-Then add the central machine to `~/.config/gfiles/config.toml`:
+and the NAS as a remote, in `~/.config/gfiles/config.toml`:
 
 ```toml
-machine = "gaffer"                 # optional; defaults to the hostname
+machine = "gaffer"
 
-[central]
-host = "bill"                      # ssh destination
-gfiles = "~/.local/bin/gfiles"     # non-interactive ssh doesn't put ~/.local/bin on PATH
+[[remote]]
+name = "elrond"            # must match `machine` in the NAS's config
+host = "elrond-gfiles"     # ssh destination (the alias below); defaults to name
 ```
 
-Check it by hand: `gfiles sync`.
+### A pull-only key
 
-### A push-only key
+The hourly timer runs `ssh -o BatchMode=yes`, so the hub needs a key the NAS accepts *without a
+prompt*, which means a key without a passphrase. Give it its own key and lock that key on the
+NAS to the one command a pull needs, so whoever gets hold of it can only read the NAS's
+catalog: no shell, and no way to change anything.
 
-Pushes run from a timer with `ssh -o BatchMode=yes`, so the machine needs a key that `bill`
-accepts *without a prompt*, which means a key without a passphrase. Give each pushing machine
-its own key and lock it on `bill` to the one command a push needs, so whoever gets hold of it
-(say, on a compromised NAS) can only push that machine's catalog: no shell on `bill`, and no
-writing as any other machine.
-
-On the pushing machine (here `elrond`):
+On `gaffer`:
 
 ```bash
-ssh-keygen -t ed25519 -N '' -C gfiles-push@elrond -f ~/.ssh/gfiles_push
-cat ~/.ssh/gfiles_push.pub
+ssh-keygen -t ed25519 -N '' -C gfiles-pull@gaffer -f ~/.ssh/gfiles_pull
+cat ~/.ssh/gfiles_pull.pub
 ```
 
 Add a host alias that uses only that key, in `~/.ssh/config`:
 
 ```text
-Host bill-gfiles
-    HostName bill
-    IdentityFile ~/.ssh/gfiles_push
+Host elrond-gfiles
+    HostName elrond
+    IdentityFile ~/.ssh/gfiles_pull
     IdentitiesOnly yes
 ```
 
-and use it as the `host` in the `[central]` section above (`host = "bill-gfiles"`).
-
-On `bill`, add the public key to `~/.ssh/authorized_keys` with a forced command naming the
-machine (it must match the pushing machine's `machine` name):
+On `elrond`, add the public key to `~/.ssh/authorized_keys` with a forced command:
 
 ```text
-restrict,command="~/.local/bin/gfiles ingest --machine elrond" ssh-ed25519 AAAA... gfiles-push@elrond
+restrict,command="/var/services/homes/darren/.local/bin/gfiles export" ssh-ed25519 AAAA... gfiles-pull@gaffer
 ```
 
 `restrict` turns off port forwarding, agent forwarding and a terminal, and `command=` runs
-`gfiles ingest --machine elrond` whatever the client asked for, so ingest refuses a push that
-claims any other machine. Check it with `gfiles sync` on `elrond`, and see that
-`ssh bill-gfiles` gives no shell.
+`gfiles export` whatever the client asked for. DSM's sshd only reads `authorized_keys` when the
+home folder isn't group-writable: `chmod 755 ~`, `chmod 700 ~/.ssh`,
+`chmod 600 ~/.ssh/authorized_keys`.
 
-On a machine you log in from anyway (the laptop), a passphrase-protected key works for the
-timer only if the timer can reach a running ssh-agent; the dedicated restricted key is simpler.
+Check it from `gaffer`: `gfiles pull` lists the NAS's volumes, and `ssh elrond-gfiles` gives no
+shell.
 
 ## 4. Run it on a schedule
 
-**Linux (systemd user timer):**
+On `gaffer`, a systemd user timer runs `gfiles sync` hourly (scan local volumes, then pull):
 
 ```bash
 mkdir -p ~/.config/systemd/user
@@ -100,20 +116,17 @@ systemctl --user enable --now gfiles-sync.timer
 journalctl --user -u gfiles-sync      # results
 ```
 
-On a server with nobody logged in, also run `sudo loginctl enable-linger $USER` so user timers
-keep running.
+Away from home, the pull fails within 30 seconds and the local scan still runs; the catalog
+keeps the NAS's last pulled state (with its scan time) until the next pull succeeds.
 
-**Synology DSM (Task Scheduler):** Control Panel → Task Scheduler → Create → Scheduled Task →
-User-defined script. Run as your user (not root, so it uses your SSH key and config), daily or
-hourly, with the script:
+## Using the catalog
 
-```sh
-/var/services/homes/darren/.local/bin/gfiles sync
-```
-
-## Using the central catalog
+On `gaffer`:
 
 ```bash
-ssh -t bill ~/.local/bin/gfiles                         # the TUI, over everything
-claude mcp add gfiles -- ssh bill ~/.local/bin/gfiles mcp # AI tools, over everything
+gfiles                                 # the TUI, over everything
+claude mcp add gfiles -- gfiles mcp    # AI tools, over everything
 ```
+
+Taking a remote out of the config removes its volumes from the catalog on the next `pull` or
+`sync`.

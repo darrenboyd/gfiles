@@ -1,4 +1,5 @@
-//! The per-machine config file: which machine this is and which volumes it scans.
+//! The per-machine config file: which machine this is, which volumes it scans, and (on the
+//! hub) which remote machines it pulls catalogs from.
 //!
 //! Volumes are added with `gfiles volume add`, which edits the file in place (keeping
 //! comments) and gives each volume a UUID that stays fixed if it's renamed or moved.
@@ -15,25 +16,36 @@ use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, value};
 pub struct Config {
     /// Name this machine reports to the catalog. Defaults to the hostname.
     pub machine: Option<String>,
-    /// The machine holding the central catalog. Leave out on that machine itself.
-    pub central: Option<Central>,
     #[serde(default, rename = "volume")]
     pub volumes: Vec<VolumeConfig>,
+    /// Machines whose catalogs `pull` fetches into this one (only on the hub).
+    #[serde(default, rename = "remote")]
+    pub remotes: Vec<Remote>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Central {
+pub struct Remote {
+    /// The remote's machine name (its `machine` setting). Its volumes are stored under this
+    /// name, and a stream claiming any other is refused.
+    pub name: String,
     /// SSH destination, as you'd pass it to `ssh` (a host alias from ~/.ssh/config works).
-    pub host: String,
+    /// Defaults to `name`.
+    pub host: Option<String>,
     /// The gfiles binary on that host. Non-interactive SSH often lacks ~/.local/bin in PATH,
     /// so a full path is safest; `~` is expanded by the remote shell.
     #[serde(default = "default_remote_gfiles")]
     pub gfiles: String,
 }
 
+impl Remote {
+    pub fn host(&self) -> &str {
+        self.host.as_deref().unwrap_or(&self.name)
+    }
+}
+
 fn default_remote_gfiles() -> String {
-    "gfiles".to_string()
+    "~/.local/bin/gfiles".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -51,10 +63,11 @@ const NEW_FILE_HEADER: &str = "\
 # gfiles config for this machine.
 # machine = \"name\"   # defaults to the hostname
 #
-# On machines other than the central one, say where to push scans:
-# [central]
-# host = \"bill\"                     # ssh destination
-# gfiles = \"~/.local/bin/gfiles\"    # gfiles on that host
+# On the hub, list the machines to pull catalogs from:
+# [[remote]]
+# name = \"elrond\"                   # that machine's name
+# host = \"elrond\"                   # ssh destination; defaults to name
+# gfiles = \"~/.local/bin/gfiles\"    # gfiles on that host (the default)
 #
 # Add volumes with `gfiles volume add <path>`.
 ";

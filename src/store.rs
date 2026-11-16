@@ -174,7 +174,7 @@ fn is_within(path: &str, dir: &str) -> bool {
 }
 
 /// An absolute path on any platform a volume can live on: `/...` on Unix, `C:\...` or
-/// `\\server\...` on Windows. Checked on the text, since a pushed root comes from another
+/// `\\server\...` on Windows. Checked on the text, since a pulled root comes from another
 /// machine and may not be absolute by this platform's rules.
 fn is_absolute(root: &str) -> bool {
     let b = root.as_bytes();
@@ -222,6 +222,27 @@ pub fn for_each_entry(
         })?;
     }
     Ok(())
+}
+
+/// Removes the volumes (and entries) of every machine not in `machines`, returning each
+/// removed volume as (machine, name). The hub uses it to drop remotes taken out of its config.
+pub fn forget_machines_except(
+    conn: &Connection,
+    machines: &[String],
+) -> Result<Vec<(String, String)>> {
+    let mut stmt = conn.prepare("SELECT id, machine, name FROM volumes ORDER BY machine, name")?;
+    let gone: Vec<(String, String, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|(_, machine, _)| !machines.contains(machine))
+        .collect();
+    let mut forgotten = Vec::new();
+    for (id, machine, name) in gone {
+        forget_volume(conn, &id)?;
+        forgotten.push((machine, name));
+    }
+    Ok(forgotten)
 }
 
 /// Removes a volume and all its entries.
