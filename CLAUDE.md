@@ -56,10 +56,10 @@ Windows is out of scope for now, but don't make it impossible:
 
 ## Roadmap
 
-1. **Scan + search (v1):** configure volumes, scan them incrementally into SQLite, classify files
+1. **Scan + search (v1):** done. configure volumes, scan them incrementally into SQLite, classify files
    by kind (book, photo, music, video, document, code, ...), and search from the CLI (JSON) and a
    basic TUI. Single machine.
-2. **MCP server** over the same queries.
+2. **MCP server** over the same queries. Done.
 3. **Multi-machine:** agent mode and `ingest` over SSH; agents on the laptop, `bill` and the NAS.
 4. **Duplicates and backup coverage:** identical files across machines; files that exist in only
    one place.
@@ -81,6 +81,10 @@ gfiles volume remove <name>             # from the config and the catalog
 gfiles scan [volume...]                 # all volumes if none named
 gfiles search [words...] [-k KIND] [--volume V] [--machine M] [-n 50 | --all] [--json]
 gfiles stats [--json]
+gfiles mcp                              # MCP server on stdin/stdout
+
+claude mcp add gfiles -- gfiles mcp               # register locally with Claude Code
+claude mcp add gfiles -- ssh bill gfiles mcp      # or against the central catalog on bill
 ```
 
 `--config` / `GFILES_CONFIG` and `--db` / `GFILES_DB` override the default paths
@@ -95,12 +99,16 @@ scratch directory, when trying the binary out, so experiments never touch the re
   that has been committed; add a new one.
 - `src/scan.rs`: walks a volume and updates its rows (see below). Holds the default ignores.
 - `src/classify.rs`: extension to kind.
-- `src/search.rs`: queries shared by every interface (CLI and TUI now, MCP later). Interfaces
+- `src/search.rs`: queries shared by every interface (CLI, TUI and MCP). Interfaces
   stay thin and call into it, so they can't drift apart.
 - `src/fmt.rs`: sizes and dates for display (dates are UTC, computed without a date crate).
 - `src/tui/`: `app.rs` holds state and key handling, `ui.rs` draws it, `mod.rs` runs the loop.
   Test behavior through `App::handle_key` and layout through ratatui's `TestBackend`, not a
   real terminal.
+- `src/mcp.rs`: the MCP server. The JSON-RPC layer is hand-written (newline-delimited, no async
+  runtime) because a tools-only server needs just `initialize`, `ping`, `tools/list` and
+  `tools/call`. Tools: `catalog_overview`, `file_locations` (matches grouped by folder, for
+  "where are my X?"), `search_files`. All read-only.
 
 ## Implementation notes
 
@@ -118,3 +126,8 @@ scratch directory, when trying the binary out, so experiments never touch the re
   fzf). Keep stdout clean while it runs. It loads at most 1000 rows; titles show the full count.
 - To check the TUI by hand, run it in a detached tmux session (`tmux new-session -d -x 110 -y 26`),
   drive it with `tmux send-keys` and read it with `tmux capture-pane -p`.
+- **MCP:** stdout carries protocol messages only; never print anything else there in `mcp` mode.
+  Bad tool arguments come back as tool results with `isError: true` (so the model can correct
+  itself); only unknown methods or tools are JSON-RPC errors. Results carry both a JSON text
+  block and `structuredContent`. To check it with a real client, point `claude -p` at a scratch
+  catalog with `--strict-mcp-config --mcp-config <file>` and ask it a question.

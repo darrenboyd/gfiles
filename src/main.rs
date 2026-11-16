@@ -58,6 +58,9 @@ enum Command {
         json: bool,
     },
 
+    /// Serve the catalog to AI tools over MCP (stdin/stdout)
+    Mcp,
+
     /// Counts and sizes per kind for each volume
     Stats {
         #[arg(long)]
@@ -216,6 +219,10 @@ fn main() -> Result<()> {
                     );
                 }
             }
+        }
+        Command::Mcp => {
+            let conn = db::open(&db_path)?;
+            gfiles::mcp::serve(&conn, std::io::stdin().lock(), std::io::stdout().lock())?;
         }
         Command::Stats { json } => {
             let conn = db::open(&db_path)?;

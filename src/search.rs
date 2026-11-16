@@ -100,6 +100,57 @@ pub fn search(conn: &Connection, q: &Query) -> Result<Vec<Hit>> {
     Ok(hits)
 }
 
+/// How many entries match the query (ignoring its limit).
+pub fn count(conn: &Connection, q: &Query) -> Result<i64> {
+    let filter = Filter::new(q, true);
+    let sql = format!("SELECT count(*){}", filter.sql);
+    Ok(conn.query_row(&sql, rusqlite::params_from_iter(filter.args), |r| r.get(0))?)
+}
+
+#[derive(Debug, Serialize)]
+pub struct Folder {
+    pub machine: String,
+    pub volume: String,
+    /// Relative to the volume root, `/`-separated; empty for the root itself.
+    pub folder: String,
+    pub abs_folder: String,
+    pub count: i64,
+    pub size: i64,
+}
+
+/// The folders holding the matching entries, with how many each holds, most first. Answers
+/// "where are my books?" without listing every book.
+pub fn folders(conn: &Connection, q: &Query) -> Result<Vec<Folder>> {
+    let filter = Filter::new(q, true);
+    // rtrim(path, <path without its slashes>) strips the last component, keeping the slash.
+    let mut sql = format!(
+        "SELECT v.machine, v.name, v.root, rtrim(e.path, replace(e.path, '/', '')) AS dir,
+                count(*), sum(e.size){}
+         GROUP BY v.id, dir ORDER BY count(*) DESC, v.machine, v.name, dir",
+        filter.sql
+    );
+    if let Some(limit) = q.limit {
+        sql.push_str(&format!(" LIMIT {limit}"));
+    }
+    let mut stmt = conn.prepare(&sql)?;
+    let folders = stmt
+        .query_map(rusqlite::params_from_iter(filter.args), |r| {
+            let root: String = r.get(2)?;
+            let dir: String = r.get(3)?;
+            let folder = dir.trim_end_matches('/').to_string();
+            Ok(Folder {
+                machine: r.get(0)?,
+                volume: r.get(1)?,
+                abs_folder: join_root(&root, &folder),
+                folder,
+                count: r.get(4)?,
+                size: r.get(5)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(folders)
+}
+
 /// How many entries match the query for each kind, ignoring the query's own kind filter.
 pub fn count_by_kind(conn: &Connection, q: &Query) -> Result<Vec<(String, i64)>> {
     let filter = Filter::new(q, false);
@@ -288,5 +339,25 @@ mod tests {
         let mut counts = count_by_kind(&conn, &q).unwrap();
         counts.sort();
         assert_eq!(counts, vec![("book".into(), 1), ("document".into(), 2)]);
+    }
+
+    #[test]
+    fn folders_group_matches_by_parent() {
+        let (_tmp, conn) = catalog();
+        let q = Query {
+            terms: vec!["tolkien".into()],
+            ..Default::default()
+        };
+        assert_eq!(count(&conn, &q).unwrap(), 3);
+        let f = folders(&conn, &q).unwrap();
+        let got: Vec<(&str, i64)> = f.iter().map(|f| (f.folder.as_str(), f.count)).collect();
+        assert_eq!(got, vec![("Books/Tolkien", 2), ("Docs", 1)]);
+        assert!(f[0].abs_folder.ends_with("Books/Tolkien"));
+
+        let photos = Query {
+            kind: Some("photo".into()),
+            ..Default::default()
+        };
+        assert_eq!(folders(&conn, &photos).unwrap()[0].folder, "Photos");
     }
 }
