@@ -97,6 +97,7 @@ gfiles sync                             # scan everything, then pull (what timer
 gfiles export                           # this machine's catalog on stdout (run by pull over ssh)
 
 bin/deploy elrond                       # static musl build → ~/.local/bin/gfiles on each host
+cargo install --path . --root ~/.local  # install on gaffer (where the systemd unit expects it)
 
 claude mcp add gfiles -- gfiles mcp     # register with Claude Code (on gaffer)
 ```

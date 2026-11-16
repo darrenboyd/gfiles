@@ -15,10 +15,12 @@ elrond (NAS)                                  gaffer (laptop, the hub)
 From a checkout on gaffer:
 
 ```bash
-sudo apt install musl-tools   # once: a C compiler for the static build
-bin/deploy elrond             # static build, copied to ~/.local/bin/gfiles on the NAS
-cargo install --path .        # on gaffer itself
+sudo apt install musl-tools               # once: a C compiler for the static build
+bin/deploy elrond                         # static build, copied to ~/.local/bin/gfiles on the NAS
+cargo install --path . --root ~/.local    # on gaffer itself: ~/.local/bin/gfiles
 ```
+
+Re-run both after pulling new code: the installed binaries don't update with the checkout.
 
 The static build runs on Synology DSM's old kernel and libc. Both machines must run the same
 gfiles version: a pull refuses a different protocol.
@@ -85,7 +87,7 @@ Add a host alias that uses only that key, in `~/.ssh/config`:
 
 ```text
 Host elrond-gfiles
-    HostName elrond
+    HostName elrond          # copy HostName and Port from your existing entry for the NAS
     IdentityFile ~/.ssh/gfiles_pull
     IdentitiesOnly yes
 ```
@@ -101,8 +103,8 @@ restrict,command="/var/services/homes/darren/.local/bin/gfiles export" ssh-ed255
 home folder isn't group-writable: `chmod 755 ~`, `chmod 700 ~/.ssh`,
 `chmod 600 ~/.ssh/authorized_keys`.
 
-Check it from `gaffer`: `gfiles pull` lists the NAS's volumes, and `ssh elrond-gfiles` gives no
-shell.
+Check it from `gaffer`: `gfiles pull` lists the NAS's volumes, `ssh elrond-gfiles id` prints
+the catalog stream instead of running `id`, and `ssh -t elrond-gfiles` gets no terminal.
 
 ## 4. Run it on a schedule
 
