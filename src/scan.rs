@@ -22,9 +22,12 @@ const DEFAULT_IGNORES: &[&str] = &[
     ".*", // dotfiles and dot-folders: app state, caches, .DS_Store
     "node_modules/",
     "__pycache__/",
-    "target/",
-    "@eaDir/",     // Synology thumbnails and metadata
-    "\\#recycle/", // Synology recycle bin
+    "target/",        // Rust build output
+    "_build/",        // Elixir (mix) build output
+    "*.o",            // C object files
+    "**/go/pkg/mod/", // Go's module cache
+    "@eaDir/",        // Synology thumbnails and metadata
+    "\\#recycle/",    // Synology recycle bin
     "\\#snapshot/",
     "$RECYCLE.BIN/",
     "System Volume Information/",
@@ -253,6 +256,9 @@ mod tests {
         touch(root, "code/proj/.git/HEAD");
         touch(root, "code/proj/src/main.rs");
         touch(root, "code/proj/node_modules/x/index.js");
+        touch(root, "code/app/_build/dev/app.beam");
+        touch(root, "src/tool/main.o");
+        touch(root, "code/go/pkg/mod/github.com/x/y@v1/y.go");
 
         let mut conn = db::open_in_memory().unwrap();
         let vol = volume(root, vec!["*.part".into(), "!.keep/".into()]);

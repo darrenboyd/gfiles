@@ -57,7 +57,8 @@ const KINDS: &[(&str, &[&str])] = &[
         &[
             "rs", "rb", "py", "js", "ts", "go", "c", "h", "cpp", "hpp", "java", "kt", "swift",
             "lua", "sh", "ex", "exs", "erb", "html", "css", "scss", "sql", "json", "yml", "yaml",
-            "toml",
+            "toml", "tsx", "jsx", "mjs", "jbuilder", "rake", "ru", "pl", "pm", "erl", "hrl",
+            "bash", "zsh", "bats",
         ],
     ),
 ];
@@ -87,6 +88,7 @@ mod tests {
         assert_eq!(kind_for_ext(Some("nef")), "photo");
         assert_eq!(kind_for_ext(Some("flac")), "music");
         assert_eq!(kind_for_ext(Some("xmp")), "sidecar");
+        assert_eq!(kind_for_ext(Some("jbuilder")), "code");
         assert_eq!(kind_for_ext(Some("weird")), "other");
         assert_eq!(kind_for_ext(None), "other");
         assert!(all_kinds().any(|k| k == "repo"));

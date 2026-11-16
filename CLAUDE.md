@@ -44,8 +44,9 @@ The repo is public on GitHub, MIT licensed. Changes are committed and pushed str
 - **Volumes:** a volume is a configured root folder on a named machine, with a stable UUID. Paths
   are stored relative to the volume root, so moving a mount point doesn't orphan the catalog.
 - **What counts as "my files":** built-in ignores (`node_modules`, `.cache`, `target/`,
-  `__pycache__`, Synology `@eaDir` and `#recycle`, `Thumbs.db`, `.DS_Store`, ...) plus per-volume
-  gitignore-style patterns. A git repository is cataloged as one item, not file by file.
+  `__pycache__`, `_build/`, `*.o`, Go's module cache, Synology `@eaDir` and `#recycle`,
+  `Thumbs.db`, `.DS_Store`, ...) plus per-volume gitignore-style patterns. A git repository is
+  cataloged as one item, not file by file.
 - **Scale target:** 1-10 TB and around 1M files. Rescans are incremental (unchanged size and mtime
   means skip). Hashing is lazy: size plus a partial hash first, and a full content hash only when
   sizes collide or on request.
