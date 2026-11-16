@@ -3,8 +3,9 @@
 //! PDFs count as documents, not books: most PDFs aren't books, and telling them apart needs
 //! the file's metadata, which comes in a later milestone.
 //!
-//! Sidecars are the metadata and edit files photo tools keep next to a photo (`ek_1.jpg.xmp`).
-//! They're their own kind so they neither count as photos nor bury the `other` files.
+//! Sidecars are the companion files kept next to a photo or video: edits and metadata
+//! (`ek_1.jpg.xmp`, a movie's `.nfo`) and subtitles. They're their own kind so they neither
+//! count as the media itself nor bury the `other` files.
 
 pub const REPO: &str = "repo";
 pub const OTHER: &str = "other";
@@ -23,8 +24,14 @@ const KINDS: &[(&str, &[&str])] = &[
             "dng", "cr2", "cr3", "nef", "arw", "orf", "rw2", "raf", "srw", "pef",
         ],
     ),
-    // XMP (Lightroom, darktable, digiKam), Apple Photos edits, RawTherapee, DxO.
-    ("sidecar", &["xmp", "aae", "pp3", "dop"]),
+    // Photos: XMP (Lightroom, darktable, digiKam), Apple Photos edits, RawTherapee, DxO.
+    // Videos: Kodi/Plex .nfo metadata, and subtitles (VobSub is .sub with its .idx).
+    (
+        "sidecar",
+        &[
+            "xmp", "aae", "pp3", "dop", "nfo", "srt", "ass", "ssa", "sub", "idx", "vtt",
+        ],
+    ),
     (
         "music",
         &[
@@ -88,6 +95,7 @@ mod tests {
         assert_eq!(kind_for_ext(Some("nef")), "photo");
         assert_eq!(kind_for_ext(Some("flac")), "music");
         assert_eq!(kind_for_ext(Some("xmp")), "sidecar");
+        assert_eq!(kind_for_ext(Some("srt")), "sidecar");
         assert_eq!(kind_for_ext(Some("jbuilder")), "code");
         assert_eq!(kind_for_ext(Some("weird")), "other");
         assert_eq!(kind_for_ext(None), "other");
