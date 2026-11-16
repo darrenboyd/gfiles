@@ -69,4 +69,43 @@ Windows is out of scope for now, but don't make it impossible:
 
 ## Commands
 
-None yet. Record build, test and run commands here as they are added.
+```bash
+cargo test                              # unit tests (in each module) + tests/cli.rs end-to-end
+cargo clippy --all-targets && cargo fmt # keep both clean
+cargo build --release
+
+gfiles volume add <path> [--name N] [--ignore PATTERN]...
+gfiles volume list [--json]
+gfiles volume remove <name>             # from the config and the catalog
+gfiles scan [volume...]                 # all volumes if none named
+gfiles search [words...] [-k KIND] [--volume V] [--machine M] [-n 50 | --all] [--json]
+gfiles stats [--json]
+```
+
+`--config` / `GFILES_CONFIG` and `--db` / `GFILES_DB` override the default paths
+(`~/.config/gfiles/config.toml`, `~/.local/share/gfiles/catalog.db`). Use them, pointed at a
+scratch directory, when trying the binary out, so experiments never touch the real catalog.
+
+## Code layout
+
+- `src/config.rs`: the per-machine TOML config. `volume add`/`remove` edit it with `toml_edit`
+  so comments survive.
+- `src/db.rs`: opens SQLite and runs migrations (`PRAGMA user_version`). Never edit a migration
+  that has been committed; add a new one.
+- `src/scan.rs`: walks a volume and updates its rows (see below). Holds the default ignores.
+- `src/classify.rs`: extension to kind.
+- `src/search.rs`: queries shared by every interface (CLI now; TUI and MCP later). Interfaces
+  stay thin and call into it, so they can't drift apart.
+
+## Implementation notes
+
+- **Scans:** each scan is one transaction. It bumps the volume's `scan_gen`, stamps every entry it
+  sees, then deletes entries with an older stamp. A volume whose root is missing (an unmounted
+  disk or share) is refused instead of being treated as empty.
+- **Search:** FTS5 (external-content table kept in sync by triggers) over name and path. Every
+  word is a quoted prefix match, so user input can't inject FTS syntax.
+- **Skipped:** symlinks (not followed or recorded), and names that aren't valid UTF-8 (counted and
+  reported, since the catalog stores text paths).
+- **Hidden files** (`.*`) are ignored by default; a volume can bring one back with `!.name/`.
+- **PDFs** are documents, not books, until metadata extraction can tell them apart.
+- **Repos** are one `repo` row with size 0. Their size isn't computed yet.
