@@ -5,15 +5,20 @@
 //! │ > tolk                                               │
 //! └──────────────────────────────────────────────────────┘
 //! ┌ Kind ───────┐┌ 3 results ────────────────────────────┐
-//! │ all       3 ││ ▶ book     1.1 MB  gaffer:home  Books/…│
-//! │ book      1 ││   document   4 KB  gaffer:home  Docs/…│
+//! │ all       3 ││ ▶ book     1.1 MB  ×2  gaffer:home  B…│
+//! │ book      1 ││   document   4 KB  ×1  gaffer:home  D…│
 //! └─────────────┘└───────────────────────────────────────┘
 //! ┌ Details ─────────────────────────────────────────────┐
 //! │ gaffer:/home/darren/Books/Tolkien/The Hobbit.epub    │
-//! │ book · 1.1 MB · modified 2025-03-02 · volume home    │
+//! │ book · 1.1 MB · modified 2025-03-02 · in 2 places    │
+//! │ mirror books, also at elrond:/volume1/darren/Books/… │
 //! └──────────────────────────────────────────────────────┘
 //!  type to search  ↑↓ move  Tab kind  Enter print path  Esc clear/quit
 //! ```
+//!
+//! The copies column counts places holding the same content, where a place is a machine or a
+//! whole mirror (as backup coverage counts them): ×1, in yellow, means no copy on another
+//! machine; blank means not fingerprinted yet.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -26,6 +31,7 @@ use crate::fmt;
 
 const KIND_WIDTH: u16 = 9;
 const SIZE_WIDTH: u16 = 9;
+const COPIES_WIDTH: u16 = 3;
 const HIGHLIGHT: &str = "▶ ";
 const COLUMN_GAP: u16 = 2;
 
@@ -33,7 +39,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let [search, middle, details, help] = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(5),
-        Constraint::Length(4),
+        Constraint::Length(5),
         Constraint::Length(1),
     ])
     .areas(frame.area());
@@ -122,14 +128,19 @@ fn draw_results(frame: &mut Frame, app: &mut App, area: Rect) {
         .clamp(6, 24) as u16;
     // Everything except the path column: the other columns, the gaps between columns, and the
     // highlight marker.
-    let fixed =
-        KIND_WIDTH + SIZE_WIDTH + loc_width + 3 * COLUMN_GAP + HIGHLIGHT.chars().count() as u16;
+    let fixed = KIND_WIDTH
+        + SIZE_WIDTH
+        + COPIES_WIDTH
+        + loc_width
+        + 4 * COLUMN_GAP
+        + HIGHLIGHT.chars().count() as u16;
     let path_width = inner.width.saturating_sub(fixed) as usize;
 
     let rows = app.hits.iter().map(|h| {
         Row::new(vec![
             Cell::from(h.kind.as_str()),
             Cell::from(Line::from(fmt::size(h.size)).right_aligned()),
+            copies_cell(h.copies),
             Cell::from(truncate_left(
                 &format!("{}:{}", h.machine, h.volume),
                 loc_width as usize,
@@ -143,6 +154,7 @@ fn draw_results(frame: &mut Frame, app: &mut App, area: Rect) {
         [
             Constraint::Length(KIND_WIDTH),
             Constraint::Length(SIZE_WIDTH),
+            Constraint::Length(COPIES_WIDTH),
             Constraint::Length(loc_width),
             Constraint::Fill(1),
         ],
@@ -154,22 +166,52 @@ fn draw_results(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_stateful_widget(table, area, &mut app.table);
 }
 
+fn copies_cell(copies: Option<i64>) -> Cell<'static> {
+    match copies {
+        None => Cell::from(""),
+        Some(1) => Cell::from("×1").yellow(),
+        Some(n) => Cell::from(format!("×{n}")).green(),
+    }
+}
+
 fn draw_details(frame: &mut Frame, app: &App, area: Rect) {
+    let width = area.width.saturating_sub(2) as usize;
     let lines = match app.selected() {
-        Some(h) => vec![
-            Line::from(truncate_left(
-                &format!("{}:{}", h.machine, h.abs_path),
-                area.width.saturating_sub(2) as usize,
-            )),
-            Line::from(format!(
-                "{} · {} · modified {} · volume {}",
-                h.kind,
-                fmt::size(h.size),
-                fmt::date(h.mtime),
-                h.volume
-            ))
-            .dark_gray(),
-        ],
+        Some(h) => {
+            let copies = match h.copies {
+                None => "not fingerprinted yet".to_string(),
+                Some(1) => "in 1 place".to_string(),
+                Some(n) => format!("in {n} places"),
+            };
+            let mut lines = vec![
+                Line::from(truncate_left(
+                    &format!("{}:{}", h.machine, h.abs_path),
+                    width,
+                )),
+                Line::from(format!(
+                    "{} · {} · modified {} · volume {} · {copies}",
+                    h.kind,
+                    fmt::size(h.size),
+                    fmt::date(h.mtime),
+                    h.volume
+                ))
+                .dark_gray(),
+            ];
+            if let Some(m) = &h.mirror {
+                let also: Vec<String> = h
+                    .replicas
+                    .iter()
+                    .map(|r| format!("{}:{}", r.machine, r.abs_path))
+                    .collect();
+                let text = if also.is_empty() {
+                    format!("mirror {m}, in no other replica")
+                } else {
+                    format!("mirror {m}, also at {}", also.join(", "))
+                };
+                lines.push(Line::from(truncate_right(&text, width)).dark_gray());
+            }
+            lines
+        }
         None => vec![],
     };
     frame.render_widget(
@@ -190,6 +232,18 @@ fn truncate_left(s: &str, width: usize) -> String {
     }
     let keep: String = s.chars().skip(len - (width - 1)).collect();
     format!("…{keep}")
+}
+
+/// Shortens `s` to `width` characters by cutting from the right.
+fn truncate_right(s: &str, width: usize) -> String {
+    if s.chars().count() <= width {
+        return s.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let keep: String = s.chars().take(width - 1).collect();
+    format!("{keep}…")
 }
 
 #[cfg(test)]
@@ -222,6 +276,9 @@ mod tests {
         assert!(screen.contains("gaffer:home"), "{screen}");
         assert!(screen.contains("Books/Tolkien/The Hobbit.epub"), "{screen}");
         assert!(screen.contains("modified"), "{screen}");
+        // Each file is fingerprinted and is in one place.
+        assert!(screen.contains("×1"), "{screen}");
+        assert!(screen.contains("in 1 place"), "{screen}");
     }
 
     #[test]
@@ -245,5 +302,6 @@ mod tests {
         assert_eq!(truncate_left("abcdef", 10), "abcdef");
         assert_eq!(truncate_left("abcdef", 4), "…def");
         assert_eq!(truncate_left("abcdef", 0), "");
+        assert_eq!(truncate_right("abcdef", 4), "abc…");
     }
 }

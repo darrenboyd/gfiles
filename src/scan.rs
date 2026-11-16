@@ -1,11 +1,15 @@
 //! Walks a volume and brings its catalog rows up to date, through `store::VolumeWriter`. The
-//! whole scan is one transaction, so an interrupted scan leaves the previous catalog untouched.
+//! walk is one transaction, so an interrupted walk leaves the previous catalog untouched.
+//!
+//! After the walk commits, a second pass fingerprints the files that need it (new or changed
+//! ones) and re-reads each repository's HEAD, committing in batches: reading contents is slow
+//! on a large disk, so an interrupted pass keeps what it did and the next scan carries on.
 //!
 //! A scan deletes the entries it didn't see, so it must not mistake "couldn't read" for "gone":
 //! an unreadable root fails the scan, and entries under an unreadable folder or file are kept.
 
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
@@ -14,6 +18,7 @@ use walkdir::WalkDir;
 
 use crate::classify;
 use crate::config::VolumeConfig;
+use crate::fingerprint;
 use crate::store::{Entry, Volume, VolumeWriter};
 
 /// Patterns every volume ignores, in gitignore syntax. A volume's own `ignore` patterns are
@@ -46,6 +51,10 @@ pub struct ScanStats {
     /// Names that aren't valid UTF-8; they're skipped because the catalog stores text paths.
     pub non_utf8: u64,
     pub errors: u64,
+    /// Files fingerprinted this time (new or changed since the last scan).
+    pub fingerprinted: u64,
+    /// Files still without a fingerprint: unreadable, or changed while being read.
+    pub unfingerprinted: u64,
 }
 
 pub fn scan_volume(conn: &mut Connection, vol: &VolumeConfig, machine: &str) -> Result<ScanStats> {
@@ -138,6 +147,8 @@ pub fn scan_volume(conn: &mut Connection, vol: &VolumeConfig, machine: &str) -> 
                     kind: classify::REPO.to_string(),
                     size: 0,
                     mtime,
+                    fingerprint: None,
+                    content_hash: None,
                 })?;
                 stats.repos += 1;
             }
@@ -157,10 +168,7 @@ pub fn scan_volume(conn: &mut Connection, vol: &VolumeConfig, machine: &str) -> 
                 continue;
             }
         };
-        let ext = Path::new(&name)
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(str::to_lowercase);
+        let ext = crate::store::ext_of(&name);
         let kind = classify::kind_for_ext(ext.as_deref()).to_string();
         writer.put(&Entry {
             path: rel,
@@ -169,6 +177,8 @@ pub fn scan_volume(conn: &mut Connection, vol: &VolumeConfig, machine: &str) -> 
             kind,
             size: meta.len() as i64,
             mtime: unix_secs(meta.modified().ok()),
+            fingerprint: None,
+            content_hash: None,
         })?;
         stats.files += 1;
     }
@@ -182,6 +192,147 @@ pub fn scan_volume(conn: &mut Connection, vol: &VolumeConfig, machine: &str) -> 
     stats.removed = finished.removed;
     stats.kept = finished.kept;
     tx.commit()?;
+
+    fingerprint_pass(conn, vol, &mut stats)?;
+    Ok(stats)
+}
+
+/// Rows written per transaction by the fingerprint pass.
+const BATCH: usize = 500;
+
+/// Fingerprints this volume's files that lack one and refreshes every repository's HEAD.
+/// Each fingerprint is written only if the row still has the size and mtime that were hashed.
+fn fingerprint_pass(
+    conn: &mut Connection,
+    vol: &VolumeConfig,
+    stats: &mut ScanStats,
+) -> Result<()> {
+    let todo: Vec<(i64, String, String, i64, i64)> = {
+        let mut stmt = conn.prepare(
+            "SELECT id, path, kind, size, mtime FROM entries
+             WHERE volume_id = ?1
+               AND (kind = ?2 OR (fingerprint IS NULL AND size > 0))",
+        )?;
+        stmt.query_map(rusqlite::params![vol.id, classify::REPO], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?
+    };
+    let files = todo.iter().filter(|t| t.2 != classify::REPO).count();
+    let started = Instant::now();
+    let mut last_report = started;
+    let mut done = 0;
+    for batch in todo.chunks(BATCH) {
+        let tx = conn.transaction()?;
+        {
+            let mut update = tx.prepare(
+                "UPDATE entries SET fingerprint = ?2 WHERE id = ?1 AND size = ?3 AND mtime = ?4",
+            )?;
+            for (id, rel, kind, size, mtime) in batch {
+                let path = vol.path.join(rel);
+                let fp = if kind == classify::REPO {
+                    fingerprint::repo(&path)
+                } else {
+                    done += 1;
+                    match fingerprint::file(&path, *size, *mtime) {
+                        Ok(fp) => fp,
+                        Err(e) => {
+                            eprintln!("warning: {}: {e}", path.display());
+                            None
+                        }
+                    }
+                };
+                if kind != classify::REPO {
+                    if fp.is_some() {
+                        stats.fingerprinted += 1;
+                    } else {
+                        stats.unfingerprinted += 1;
+                    }
+                }
+                update.execute(rusqlite::params![id, fp, size, mtime])?;
+            }
+        }
+        tx.commit()?;
+        if last_report.elapsed() > Duration::from_secs(30) {
+            last_report = Instant::now();
+            eprintln!(
+                "{}: fingerprinted {done} of {files} files ({:.0}s)",
+                vol.name,
+                started.elapsed().as_secs_f64()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Default, PartialEq)]
+pub struct HashStats {
+    pub hashed: u64,
+    /// Already had a full hash.
+    pub already: u64,
+    /// Unreadable, or changed since the last scan: run `gfiles scan`, then hash again.
+    pub skipped: u64,
+}
+
+/// Computes full content hashes for this machine's files in `vol`, or only those under
+/// `folder` (relative to the volume root). Only reads, with the same checks as fingerprinting.
+pub fn hash_volume(
+    conn: &mut Connection,
+    vol: &VolumeConfig,
+    folder: Option<&str>,
+) -> Result<HashStats> {
+    let folder = folder
+        .map(|f| f.trim_matches('/'))
+        .filter(|f| !f.is_empty());
+    if let Some(f) = folder
+        && f.split('/').any(|p| p.is_empty() || p == "." || p == "..")
+    {
+        bail!("folder {f:?} must be a path inside the volume, like Photos/2024");
+    }
+    let mut stats = HashStats::default();
+    let todo: Vec<(i64, String, i64, i64, bool)> = {
+        let mut stmt = conn.prepare(
+            "SELECT id, path, size, mtime, content_hash IS NOT NULL FROM entries
+             WHERE volume_id = ?1 AND kind != ?2 AND size > 0
+               AND (?3 IS NULL OR path = ?3 OR substr(path, 1, length(?3) + 1) = ?3 || '/')",
+        )?;
+        stmt.query_map(rusqlite::params![vol.id, classify::REPO, folder], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?
+    };
+    if todo.is_empty()
+        && let Some(f) = folder
+    {
+        bail!("no cataloged files under {f:?} in volume {:?}", vol.name);
+    }
+    for batch in todo.chunks(BATCH) {
+        let tx = conn.transaction()?;
+        {
+            let mut update = tx.prepare(
+                "UPDATE entries SET content_hash = ?2 WHERE id = ?1 AND size = ?3 AND mtime = ?4",
+            )?;
+            for (id, rel, size, mtime, has_hash) in batch {
+                if *has_hash {
+                    stats.already += 1;
+                    continue;
+                }
+                let path = vol.path.join(rel);
+                match fingerprint::full(&path, *size, *mtime) {
+                    Ok(Some(hash)) => {
+                        update.execute(rusqlite::params![id, hash, size, mtime])?;
+                        stats.hashed += 1;
+                    }
+                    Ok(None) => stats.skipped += 1,
+                    Err(e) => {
+                        eprintln!("warning: {}: {e}", path.display());
+                        stats.skipped += 1;
+                    }
+                }
+            }
+        }
+        tx.commit()?;
+    }
     Ok(stats)
 }
 
@@ -392,6 +543,117 @@ mod tests {
         let stats = scan_volume(&mut conn, &volume(&root, vec![]), "gaffer").unwrap();
         assert_eq!(stats.files, 1);
         assert_eq!(paths(&conn), vec![("real.txt".into(), "document".into())]);
+    }
+
+    fn fingerprints(conn: &Connection) -> Vec<(String, Option<String>)> {
+        let mut stmt = conn
+            .prepare("SELECT path, fingerprint FROM entries ORDER BY path")
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    #[test]
+    fn fingerprints_new_files_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("a.txt"), "same").unwrap();
+        fs::write(root.join("b.txt"), "same").unwrap();
+        fs::write(root.join("empty.txt"), "").unwrap();
+        let mut conn = db::open_in_memory().unwrap();
+        let vol = volume(root, vec![]);
+
+        let stats = scan_volume(&mut conn, &vol, "gaffer").unwrap();
+        assert_eq!((stats.fingerprinted, stats.unfingerprinted), (2, 0));
+        let fps = fingerprints(&conn);
+        assert!(fps[0].1.is_some());
+        assert_eq!(fps[0].1, fps[1].1, "same content, same fingerprint");
+        assert_eq!(fps[2], ("empty.txt".into(), None), "empty files have none");
+
+        // Nothing changed, so nothing is read again.
+        let stats = scan_volume(&mut conn, &vol, "gaffer").unwrap();
+        assert_eq!(stats.fingerprinted, 0);
+        assert_eq!(fingerprints(&conn), fps);
+    }
+
+    #[test]
+    fn a_new_commit_updates_a_repo_fingerprint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let repo = root.join("code/proj");
+        touch(root, "code/proj/src/main.rs");
+        let head = repo.join(".git/refs/heads/main");
+        fs::create_dir_all(head.parent().unwrap()).unwrap();
+        fs::write(repo.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::write(&head, "0123456789abcdef0123456789abcdef01234567\n").unwrap();
+        let mut conn = db::open_in_memory().unwrap();
+        let vol = volume(root, vec![]);
+        scan_volume(&mut conn, &vol, "gaffer").unwrap();
+        let before = fingerprints(&conn);
+        assert_eq!(
+            before[0].1.as_deref(),
+            Some("git:0123456789abcdef0123456789abcdef01234567")
+        );
+
+        // A commit writes only inside .git, so the repo folder's mtime doesn't change.
+        let dir_mtime = fs::metadata(&repo).unwrap().modified().unwrap();
+        fs::write(&head, "89abcdef0123456789abcdef0123456789abcdef\n").unwrap();
+        assert_eq!(fs::metadata(&repo).unwrap().modified().unwrap(), dir_mtime);
+        scan_volume(&mut conn, &vol, "gaffer").unwrap();
+        assert_eq!(
+            fingerprints(&conn)[0].1.as_deref(),
+            Some("git:89abcdef0123456789abcdef0123456789abcdef")
+        );
+    }
+
+    /// Every file's bytes and mtime under `root`, to show nothing was written.
+    fn snapshot(root: &Path) -> Vec<(std::path::PathBuf, Vec<u8>, SystemTime)> {
+        let mut all: Vec<_> = WalkDir::new(root)
+            .into_iter()
+            .map(Result::unwrap)
+            .filter(|e| e.file_type().is_file())
+            .map(|e| {
+                let m = e.metadata().unwrap();
+                (
+                    e.path().to_owned(),
+                    fs::read(e.path()).unwrap(),
+                    m.modified().unwrap(),
+                )
+            })
+            .collect();
+        all.sort();
+        all
+    }
+
+    #[test]
+    fn scanning_and_hashing_change_no_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        touch(root, "Photos/a.jpg");
+        touch(root, "Photos/2024/b.jpg");
+        touch(root, "notes.txt");
+        let before = snapshot(root);
+        let mut conn = db::open_in_memory().unwrap();
+        let vol = volume(root, vec![]);
+        scan_volume(&mut conn, &vol, "gaffer").unwrap();
+
+        let stats = hash_volume(&mut conn, &vol, Some("Photos/")).unwrap();
+        assert_eq!((stats.hashed, stats.already, stats.skipped), (2, 0, 0));
+        let hashed: Vec<String> = conn
+            .prepare("SELECT path FROM entries WHERE content_hash IS NOT NULL ORDER BY path")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(hashed, vec!["Photos/2024/b.jpg", "Photos/a.jpg"]);
+        assert_eq!(hash_volume(&mut conn, &vol, None).unwrap().already, 2);
+        assert!(hash_volume(&mut conn, &vol, Some("../etc")).is_err());
+        assert!(hash_volume(&mut conn, &vol, Some("Nope")).is_err());
+
+        assert_eq!(snapshot(root), before);
     }
 
     #[test]

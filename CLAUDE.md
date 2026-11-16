@@ -47,9 +47,10 @@ The repo is public on GitHub, MIT licensed. Changes are committed and pushed str
   `__pycache__`, `_build/`, `*.o`, Go's module cache, Synology `@eaDir` and `#recycle`,
   `Thumbs.db`, `.DS_Store`, ...) plus per-volume gitignore-style patterns. A git repository is
   cataloged as one item, not file by file.
-- **Scale target:** 1-10 TB and around 1M files. Rescans are incremental (unchanged size and mtime
-  means skip). Hashing is lazy: size plus a partial hash first, and a full content hash only when
-  sizes collide or on request.
+- **Scale target:** 1-10 TB and around 1M files. Every scan walks the whole volume and stamps
+  every row, but only new or changed files (by size and mtime) are read: unchanged files keep
+  their fingerprint. Fingerprints sample the start, middle and end of a file; a full content
+  hash is computed only on request.
 - **Acting on files:** plan, then apply. An action builds a reviewable plan, Darren confirms it,
   and every applied change is written to an undo journal. Deletes go to a trash folder, never
   straight to unlink.
@@ -73,7 +74,8 @@ Windows is out of scope for now, but don't make it impossible:
 3. **Multi-machine:** the hub (gaffer) pulls the NAS's catalog over SSH. Code done (`export`,
    `pull`, `sync`); deployment in progress (see `docs/setup.md`).
 4. **Duplicates and backup coverage:** identical files across machines; files that exist in only
-   one place.
+   one place; mirrors (synced folders) and their health. Code done; deploy both machines
+   together (sync `PROTOCOL` 2).
 5. **Classify and tag:** metadata extraction (EXIF, ID3, EPUB title and author) and Darren's own
    tags.
 6. **Actions:** move, rename, delete and copy through plan, apply and undo.
@@ -92,6 +94,10 @@ gfiles volume remove <name>             # from the config and the catalog
 gfiles scan [volume...]                 # all volumes if none named
 gfiles search [words...] [-k KIND] [--volume V] [--machine M] [-n 50 | --all] [--json]
 gfiles stats [--json]
+gfiles dupes [-k KIND] [--volume V] [--machine M] [--min-size 100M] [-n 20 | --all] [--json]
+gfiles coverage [same filters] [--folder machine:volume/dir | mirror:name/dir] [--json]
+gfiles mirrors [-n 20] [--json]         # [[mirror]] health, plus suggested mirrors
+gfiles hash <volume> [folder]           # full BLAKE3 hashes, to confirm duplicates (slow)
 gfiles mcp                              # MCP server on stdin/stdout
 gfiles pull                             # fetch each [[remote]]'s catalog over ssh
 gfiles sync                             # scan everything, then pull (what timers run)
@@ -118,8 +124,18 @@ scratch directory, when trying the binary out, so experiments never touch the re
   both use it), plus volume and entry reads.
 - `src/sync.rs`: the export/pull stream between machines (format in its module doc).
 - `src/classify.rs`: extension to kind.
+- `src/fingerprint.rs`: sampled fingerprints (`p1:`), full hashes (`b3:`), and repo HEAD
+  commits (`git:`). Every read goes through the guards there (no-follow open, same file
+  before and after).
+- `src/dupes.rs`: duplicate groups and backup coverage across machines.
+- `src/mirror.rs`: `[[mirror]]` config (folders that a sync tool keeps the same on several
+  machines), the SQL fragments that treat replicas as one logical file, mirror health and
+  mirror suggestions.
+- `src/platform.rs`: the OS-specific bits (no-follow open, network filesystem detection).
 - `src/search.rs`: queries shared by every interface (CLI, TUI and MCP). Interfaces
-  stay thin and call into it, so they can't drift apart.
+  stay thin and call into it (and `dupes`, `mirror`), so they can't drift apart. A mirror
+  file is one hit, listing its other replicas; each hit says how many places hold its
+  content.
 - `src/fmt.rs`: sizes and dates for display (dates are UTC, computed without a date crate).
 - `src/tui/`: `app.rs` holds state and key handling, `ui.rs` draws it, `mod.rs` runs the loop.
   Test behavior through `App::handle_key` and layout through ratatui's `TestBackend`, not a
@@ -127,12 +143,15 @@ scratch directory, when trying the binary out, so experiments never touch the re
 - `src/mcp.rs`: the MCP server. The JSON-RPC layer is hand-written (newline-delimited, no async
   runtime) because a tools-only server needs just `initialize`, `ping`, `tools/list` and
   `tools/call`. Tools: `catalog_overview`, `file_locations` (matches grouped by folder, for
-  "where are my X?"), `search_files`. All read-only.
+  "where are my X?"), `search_files`, `find_duplicates`, `backup_coverage`, `mirror_health`.
+  All read-only.
 
 ## Implementation notes
 
-- **Scans:** each scan is one transaction. It bumps the volume's `scan_gen`, stamps every entry it
-  sees, then deletes entries with an older stamp. A volume whose root is missing (an unmounted
+- **Scans:** the walk is one transaction. It bumps the volume's `scan_gen`, stamps every entry it
+  sees, then deletes entries with an older stamp. A fingerprint pass follows, reading only rows
+  without a fingerprint (and every repo's HEAD), committing in batches; each update is guarded
+  by the row's size and mtime, so a file that changed in between isn't stamped. A volume whose root is missing (an unmounted
   disk or share) or unreadable is refused instead of being treated as empty, and entries under
   a folder or file the walk couldn't read are kept, not deleted ("couldn't read" isn't "gone").
 - **Search:** FTS5 (external-content table kept in sync by triggers) over name and path. Every
@@ -141,12 +160,28 @@ scratch directory, when trying the binary out, so experiments never touch the re
   reported, since the catalog stores text paths).
 - **Hidden files** (`.*`) are ignored by default; a volume can bring one back with `!.name/`.
 - **PDFs** are documents, not books, until metadata extraction can tell them apart.
-- **Repos** are one `repo` row with size 0. Their size isn't computed yet.
+- **Repos** are one `repo` row with size 0. Their size isn't computed yet. They match each
+  other by HEAD commit.
+- **Duplicates and coverage:** same size + sampled fingerprint is a "probable" match; equal
+  full hashes on every copy (`gfiles hash`) make it confirmed. Zero-byte files never match.
+  A file is covered when its content is in at least two places and on at least two machines,
+  where a place is a machine, or a whole mirror (the sync tool replicates deletes, so a
+  mirror's replicas aren't backups of each other). Mirrors live in the hub's config and
+  are loaded into a per-connection temp table when a query command opens the catalog (the MCP
+  server reloads them before each tool call). A mirror folder whose volume isn't cataloged yet
+  is left out with a warning, carried in the results; the rest of the mirror still loads, so
+  its replicas never count as backups of each other.
+- **Mirror health** ignores Google-native stand-ins (`.gddoc`, `.gmap`, ...), reports sync
+  conflict copies, and pairs one-sided files across replicas by content or extension
+  (Insync and Cloud Sync name some files differently).
 - **The TUI draws to stderr**, so `$(gfiles)` captures only the path chosen with Enter (like
   fzf). Keep stdout clean while it runs. It loads at most 1000 rows; titles show the full count.
 - To check the TUI by hand, run it in a detached tmux session (`tmux new-session -d -x 110 -y 26`),
   drive it with `tmux send-keys` and read it with `tmux capture-pane -p`.
-- **Export/pull:** each export sends every scanned volume in full (no deltas yet; fine at LAN
+- **Network folders:** `volume add` warns when the path is on CIFS, NFS, sshfs or 9p: those
+  files belong to another machine, which should scan them itself.
+- **Export/pull:** each export sends every scanned volume in full, fingerprints and hashes
+  included, since content can only be read on the machine holding it (no deltas yet; fine at LAN
   speeds for ~1M files). Ingest (the receiving half of `pull`) writes one transaction per
   volume, verifies the entry count, and only after a complete stream forgets the remote's
   volumes that left its config. It refuses a stream claiming a machine other than the

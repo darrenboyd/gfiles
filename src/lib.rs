@@ -1,8 +1,12 @@
 pub mod classify;
 pub mod config;
 pub mod db;
+pub mod dupes;
+pub mod fingerprint;
 pub mod fmt;
 pub mod mcp;
+pub mod mirror;
+pub mod platform;
 pub mod scan;
 pub mod search;
 pub mod store;

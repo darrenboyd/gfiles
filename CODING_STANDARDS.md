@@ -14,6 +14,13 @@ review checks the diff against it. Commands, setup and anything `cargo clippy` o
   volume root (until the plan/apply/undo actions exist), and the scanner never follows a
   symlink. Each of these guarantees has a test that fails if it is removed, so a refactor
   can't drop one quietly.
+- **Content reads are guarded.** Code that reads a file's content (fingerprints, hashes)
+  opens it without following a symlink, checks it is still the regular file the catalog
+  row describes (size and mtime) before and after reading, and writes the result only to a
+  row that hasn't changed since. A file that changed or vanished is skipped, not recorded
+  with a fingerprint that belongs to other content. Small metadata reads (a repo's `HEAD`,
+  refs and `packed-refs`) go through the same no-follow open, never open a FIFO or other
+  special file (it could block an unattended scan), and are capped in size.
 
 ## Trust boundaries
 
@@ -30,8 +37,9 @@ review checks the diff against it. Commands, setup and anything `cargo clippy` o
 
 ## Interfaces
 
-- **Interfaces stay thin.** The CLI, TUI and MCP server call shared queries in
-  `src/search.rs` rather than writing their own, so their answers can't drift apart.
+- **Interfaces stay thin.** The CLI, TUI and MCP server call shared query modules
+  (`search`, `dupes`, `mirror`) rather than writing their own queries, so their answers
+  can't drift apart.
 - **stdout is reserved.** In `mcp` mode it carries protocol messages only; while the TUI runs
   it carries only the chosen path (the TUI draws to stderr). Diagnostics go to stderr.
 - **Agent-facing results don't mislead.** A result list that can be cut off says so (a

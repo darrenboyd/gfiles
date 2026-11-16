@@ -16,6 +16,27 @@ pub fn size(bytes: i64) -> String {
     }
 }
 
+/// `"100M"`, `"1.5G"`, `"512"` → bytes (binary units, as `size` prints them).
+pub fn parse_size(s: &str) -> Result<i64, String> {
+    let s = s.trim();
+    let split = s
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(s.len());
+    let (number, unit) = s.split_at(split);
+    let number: f64 = number
+        .parse()
+        .map_err(|_| format!("{s:?} isn't a size like 500K, 100M or 2G"))?;
+    let shift = match unit.trim().to_ascii_uppercase().trim_end_matches('B') {
+        "" => 0,
+        "K" => 10,
+        "M" => 20,
+        "G" => 30,
+        "T" => 40,
+        _ => return Err(format!("{s:?} isn't a size like 500K, 100M or 2G")),
+    };
+    Ok((number * (1u64 << shift) as f64) as i64)
+}
+
 /// Unix seconds → `"YYYY-MM-DD"` (UTC), without pulling in a date library.
 pub fn date(unix: i64) -> String {
     // Howard Hinnant's civil_from_days.
@@ -34,6 +55,15 @@ pub fn date(unix: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_sizes() {
+        assert_eq!(parse_size("512"), Ok(512));
+        assert_eq!(parse_size("100M"), Ok(100 << 20));
+        assert_eq!(parse_size("1.5gb"), Ok(3 << 29));
+        assert!(parse_size("lots").is_err());
+        assert!(parse_size("5X").is_err());
+    }
 
     #[test]
     fn sizes() {

@@ -6,8 +6,9 @@ use clap::builder::PossibleValuesParser;
 use clap::{Parser, Subcommand};
 
 use gfiles::config::{self, Config};
+use gfiles::dupes::{self, Filters};
 use gfiles::search::{self, Query};
-use gfiles::{classify, db, fmt, scan, store};
+use gfiles::{classify, db, fmt, mirror, scan, store};
 
 /// Catalog and organize your files across all your machines.
 ///
@@ -38,6 +39,13 @@ enum Command {
     /// Scan volumes into the catalog (all of them, or the ones named)
     Scan { volumes: Vec<String> },
 
+    /// Compute full content hashes for a volume's files, or a folder's, to confirm duplicates
+    Hash {
+        volume: String,
+        /// A folder inside the volume, like Photos/2024
+        folder: Option<String>,
+    },
+
     /// Fetch each remote's catalog over SSH into this one (see [[remote]] in the config)
     Pull,
 
@@ -67,6 +75,46 @@ enum Command {
         json: bool,
     },
 
+    /// Files with the same content in more than one place, most wasted space first
+    Dupes {
+        #[command(flatten)]
+        filters: FilterArgs,
+        /// Maximum groups
+        #[arg(short = 'n', long, default_value_t = 20, conflicts_with = "all")]
+        limit: usize,
+        /// Every group
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Files with no copy on another machine, by folder, most bytes first
+    Coverage {
+        #[command(flatten)]
+        filters: FilterArgs,
+        /// List the files of one folder from the report (like elrond:Media/Photos/2019)
+        #[arg(long)]
+        folder: Option<String>,
+        /// Maximum folders
+        #[arg(short = 'n', long, default_value_t = 30, conflicts_with = "all")]
+        limit: usize,
+        /// Every folder
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// How well each [[mirror]] is in sync, and folder pairs that look like mirrors
+    Mirrors {
+        /// Maximum files listed per kind of difference
+        #[arg(short = 'n', long, default_value_t = 20)]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Serve the catalog to AI tools over MCP (stdin/stdout)
     Mcp,
 
@@ -75,6 +123,31 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(clap::Args)]
+struct FilterArgs {
+    #[arg(short, long, value_parser = PossibleValuesParser::new(classify::all_kinds()))]
+    kind: Option<String>,
+    #[arg(long)]
+    volume: Option<String>,
+    #[arg(long)]
+    machine: Option<String>,
+    /// Leave out files smaller than this (like 500K, 100M, 2G)
+    #[arg(long, value_parser = fmt::parse_size, default_value = "0")]
+    min_size: i64,
+}
+
+impl FilterArgs {
+    fn into_filters(self, limit: usize, all: bool) -> Filters {
+        Filters {
+            kind: self.kind,
+            volume: self.volume,
+            machine: self.machine,
+            min_size: self.min_size,
+            limit: (!all).then_some(limit),
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -104,7 +177,7 @@ fn main() -> Result<()> {
     let db_path = cli.db.unwrap_or_else(gfiles::default_db_path);
 
     let Some(command) = cli.command else {
-        let conn = db::open(&db_path)?;
+        let conn = open_for_queries(&config_path, &db_path)?;
         if let Some(path) = gfiles::tui::run(conn)? {
             println!("{path}");
         }
@@ -120,6 +193,14 @@ fn main() -> Result<()> {
                 v.path.display(),
                 config_path.display()
             );
+            if let Some(fs) = gfiles::platform::network_fs(&v.path) {
+                eprintln!(
+                    "warning: {} is on a network filesystem ({fs}): scanning reads every new \
+                     file over the network, and the files belong to another machine. Scan them \
+                     there instead and pull its catalog (see [[remote]] in docs/setup.md).",
+                    v.path.display()
+                );
+            }
             println!("Run `gfiles scan {}` to catalog it.", v.name);
         }
         Command::Volume(VolumeCommand::List { json }) => {
@@ -150,6 +231,32 @@ fn main() -> Result<()> {
             let mut conn = db::open(&db_path)?;
             if !scan_volumes(&config, &mut conn, &volumes)? {
                 std::process::exit(1);
+            }
+        }
+        Command::Hash { volume, folder } => {
+            let config = Config::load(&config_path)?;
+            let Some(vol) = config.volume(&volume) else {
+                let names: Vec<&str> = config.volumes.iter().map(|v| v.name.as_str()).collect();
+                bail!(
+                    "no volume named {volume:?}; this machine has: {}",
+                    names.join(", ")
+                );
+            };
+            let mut conn = db::open(&db_path)?;
+            let started = Instant::now();
+            let s = scan::hash_volume(&mut conn, vol, folder.as_deref())?;
+            println!(
+                "{}: {} hashed, {} already hashed, {} skipped ({:.1}s)",
+                vol.name,
+                s.hashed,
+                s.already,
+                s.skipped,
+                started.elapsed().as_secs_f64()
+            );
+            if s.skipped > 0 {
+                println!(
+                    "Skipped files were unreadable or changed since the last scan; run `gfiles scan` first."
+                );
             }
         }
         Command::Pull => {
@@ -193,7 +300,7 @@ fn main() -> Result<()> {
             all,
             json,
         } => {
-            let conn = db::open(&db_path)?;
+            let conn = open_for_queries(&config_path, &db_path)?;
             let limit = (!all).then_some(limit);
             let query = Query {
                 terms,
@@ -215,13 +322,18 @@ fn main() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&out)?);
             } else {
                 for h in &hits {
+                    let copies = h.copies.map_or(String::new(), |n| format!("×{n}"));
                     println!(
-                        "{:<9}{:>9}  {}:{}",
+                        "{:<9}{:>9} {:>3}  {}:{}",
                         h.kind,
                         fmt::size(h.size),
+                        copies,
                         h.machine,
                         h.abs_path
                     );
+                    for r in &h.replicas {
+                        println!("{:23}{}:{}", "", r.machine, r.abs_path);
+                    }
                 }
                 if total > hits.len() as i64 {
                     eprintln!(
@@ -231,9 +343,63 @@ fn main() -> Result<()> {
                 }
             }
         }
+        Command::Dupes {
+            filters,
+            limit,
+            all,
+            json,
+        } => {
+            let conn = open_for_queries(&config_path, &db_path)?;
+            let filters = filters.into_filters(limit, all);
+            filters.check(&conn)?;
+            let d = dupes::duplicates(&conn, &filters)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&d)?);
+            } else {
+                print_duplicates(&d);
+            }
+        }
+        Command::Coverage {
+            filters,
+            folder,
+            limit,
+            all,
+            json,
+        } => {
+            let conn = open_for_queries(&config_path, &db_path)?;
+            let filters = filters.into_filters(limit, all);
+            filters.check(&conn)?;
+            let c = dupes::coverage(&conn, &filters, folder.as_deref())?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&c)?);
+            } else {
+                print_coverage(&c);
+            }
+        }
+        Command::Mirrors { limit, json } => {
+            let conn = open_for_queries(&config_path, &db_path)?;
+            let health = mirror::health(&conn, limit)?;
+            let suggestions = mirror::suggestions(&conn)?;
+            if json {
+                let out = serde_json::json!({
+                    "mirrors": health,
+                    "suggestions": suggestions,
+                    "warnings": mirror::warnings(&conn)?,
+                });
+                println!("{}", serde_json::to_string_pretty(&out)?);
+            } else {
+                print_mirrors(&health, &suggestions);
+            }
+        }
         Command::Mcp => {
-            let conn = db::open(&db_path)?;
-            gfiles::mcp::serve(&conn, std::io::stdin().lock(), std::io::stdout().lock())?;
+            let conn = open_for_queries(&config_path, &db_path)?;
+            let config = Config::load(&config_path)?;
+            gfiles::mcp::serve(
+                &conn,
+                Some(&config),
+                std::io::stdin().lock(),
+                std::io::stdout().lock(),
+            )?;
         }
         Command::Stats { json } => {
             let conn = db::open(&db_path)?;
@@ -253,6 +419,167 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Opens the catalog with the config's mirrors loaded, for commands that answer questions.
+/// Mirror warnings (a mirror skipped because its volume isn't in the catalog) go to stderr.
+fn open_for_queries(
+    config_path: &std::path::Path,
+    db_path: &std::path::Path,
+) -> Result<rusqlite::Connection> {
+    let config = Config::load(config_path)?;
+    let conn = db::open(db_path)?;
+    let warnings = mirror::load(&conn, &config)?;
+    for w in warnings {
+        eprintln!("warning: {w}");
+    }
+    Ok(conn)
+}
+
+/// One copy on a line: its location, or a mirror file and its replicas.
+fn copy_line(c: &dupes::Copy) -> String {
+    let loc = |l: &dupes::Location| format!("{}:{}", l.machine, l.abs_path);
+    match (&c.mirror, &c.mirror_path) {
+        (Some(m), Some(p)) => format!(
+            "mirror {m}: {p} ({})",
+            c.locations.iter().map(loc).collect::<Vec<_>>().join(", ")
+        ),
+        _ => loc(&c.locations[0]),
+    }
+}
+
+fn print_duplicates(d: &dupes::Duplicates) {
+    if d.groups.is_empty() {
+        println!("No duplicates found.");
+    }
+    for g in &d.groups {
+        println!(
+            "{} copies of {} {}, {} wasted{}",
+            g.copies.len(),
+            fmt::size(g.size),
+            g.kind,
+            fmt::size(g.wasted),
+            if g.confirmed { "" } else { " (probable)" }
+        );
+        for c in &g.copies {
+            println!("  {}", copy_line(c));
+        }
+    }
+    if d.total_groups > d.groups.len() as i64 {
+        eprintln!(
+            "(showing {} of {} groups; use -n or --all for more)",
+            d.groups.len(),
+            d.total_groups
+        );
+    }
+}
+
+fn print_coverage(c: &dupes::Coverage) {
+    let tally = |t: &dupes::Tally| format!("{} files, {}", t.files, fmt::size(t.bytes));
+    println!("Uncovered (one place only): {}", tally(&c.uncovered));
+    println!("Probably covered:           {}", tally(&c.probably_covered));
+    println!("Covered (confirmed):        {}", tally(&c.covered));
+    if c.not_yet_fingerprinted.files > 0 {
+        println!(
+            "Not yet fingerprinted:      {}",
+            tally(&c.not_yet_fingerprinted)
+        );
+    }
+    if let Some(files) = &c.files {
+        println!();
+        for f in files {
+            println!(
+                "{:<17}{:>9}  {}",
+                f.status,
+                fmt::size(f.size),
+                copy_line(&f.copy)
+            );
+        }
+        return;
+    }
+    if !c.folders.is_empty() {
+        println!("\n  uncovered          probably covered   folder");
+    }
+    for f in &c.folders {
+        println!(
+            "{:>6} {:>10}  {:>6} {:>10}   {}",
+            f.uncovered.files,
+            fmt::size(f.uncovered.bytes),
+            f.probably_covered.files,
+            fmt::size(f.probably_covered.bytes),
+            f.folder
+        );
+    }
+    if c.total_folders > c.folders.len() as i64 {
+        eprintln!(
+            "(showing {} of {} folders; use -n or --all for more, --folder to list one)",
+            c.folders.len(),
+            c.total_folders
+        );
+    }
+}
+
+fn print_mirrors(health: &[mirror::Health], suggestions: &[mirror::Suggestion]) {
+    if health.is_empty() {
+        println!("No mirrors configured.");
+    }
+    for h in health {
+        println!(
+            "Mirror {}: {}",
+            h.mirror,
+            if h.in_sync { "in sync" } else { "out of sync" }
+        );
+        for r in &h.replicas {
+            println!(
+                "  {:<40} {:>7} files, newest {}, scanned {}",
+                r.folder,
+                r.files,
+                r.newest_mtime.map_or("-".into(), fmt::date),
+                r.last_scan_at.map_or("never".into(), fmt::date),
+            );
+        }
+        let list = |title: &str, l: &mirror::Listed| {
+            if l.total > 0 {
+                println!("  {title} ({}):", l.total);
+                for item in &l.items {
+                    println!("    {item}");
+                }
+                if l.total > l.items.len() {
+                    println!("    ... and {} more (use -n)", l.total - l.items.len());
+                }
+            }
+        };
+        for o in &h.only_in {
+            list(&format!("Only in {}", o.replica), &o.files);
+        }
+        list("Same path, different content", &h.differing);
+        list("Conflict copies", &h.conflicts);
+        list(
+            "Same file, named differently by the sync tools",
+            &h.named_differently,
+        );
+        if h.skipped_placeholders > 0 {
+            println!(
+                "  ({} Google-native stand-ins and ignored files left out)",
+                h.skipped_placeholders
+            );
+        }
+    }
+    if !suggestions.is_empty() {
+        println!(
+            "\nThese folders look like mirrors. If a sync tool keeps them the same, add to the config:"
+        );
+        for s in suggestions {
+            println!(
+                "\n# {} of {} files match ({:.0}%)\n{}",
+                s.matching,
+                s.files[0].max(s.files[1]),
+                s.ratio * 100.0,
+                s.config
+            );
+        }
+        println!("(Don't add a folder that's a backup copy: a mirror counts as one place.)");
+    }
 }
 
 /// Scans the named volumes, or all of them. Returns false if any failed (after reporting it).
@@ -288,6 +615,15 @@ fn scan_volumes(
                 }
                 if s.errors > 0 {
                     line.push_str(&format!(", {} errors", s.errors));
+                }
+                if s.fingerprinted > 0 {
+                    line.push_str(&format!(", {} fingerprinted", s.fingerprinted));
+                }
+                if s.unfingerprinted > 0 {
+                    line.push_str(&format!(
+                        ", {} couldn't be fingerprinted (unreadable or changing)",
+                        s.unfingerprinted
+                    ));
                 }
                 if s.kept > 0 {
                     line.push_str(&format!(

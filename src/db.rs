@@ -7,7 +7,8 @@ use rusqlite::Connection;
 
 /// Schema migrations, applied in order. `PRAGMA user_version` records how many have run.
 /// Never edit a migration that has shipped; add a new one.
-const MIGRATIONS: &[&str] = &[r#"
+const MIGRATIONS: &[&str] = &[
+    r#"
 CREATE TABLE volumes (
     id           TEXT PRIMARY KEY,      -- UUID from the machine's config
     name         TEXT NOT NULL,
@@ -49,7 +50,14 @@ CREATE TRIGGER entries_au AFTER UPDATE OF name, path ON entries BEGIN
         VALUES ('delete', old.id, old.name, old.path);
     INSERT INTO entries_fts (rowid, name, path) VALUES (new.id, new.name, new.path);
 END;
-"#];
+"#,
+    r#"
+-- Content fingerprints, computed by the machine holding the file (see fingerprint.rs).
+ALTER TABLE entries ADD COLUMN fingerprint TEXT;   -- 'p1:<hex>' sampled, or 'git:<sha>' for a repo
+ALTER TABLE entries ADD COLUMN content_hash TEXT;  -- 'b3:<hex>' of the whole file, on request
+CREATE INDEX entries_fingerprint ON entries (size, fingerprint) WHERE fingerprint IS NOT NULL;
+"#,
+];
 
 pub fn open(path: &Path) -> Result<Connection> {
     if let Some(dir) = path.parent() {
@@ -81,5 +89,38 @@ fn setup(conn: &mut Connection) -> Result<()> {
         tx.pragma_update(None, "user_version", i as i64 + 1)?;
         tx.commit()?;
     }
+    conn.execute_batch(crate::mirror::CREATE_TABLE)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn migrates_a_first_version_catalog_keeping_its_rows() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(MIGRATIONS[0]).unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+        conn.execute_batch(
+            "INSERT INTO volumes (id, name, machine, root) VALUES ('v', 'v', 'm', '/v');
+             INSERT INTO entries (volume_id, path, name, kind, size, mtime, seen_gen)
+                 VALUES ('v', 'a.txt', 'a.txt', 'document', 3, 0, 1);",
+        )
+        .unwrap();
+
+        setup(&mut conn).unwrap();
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, MIGRATIONS.len() as i64);
+        let row: (String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT path, fingerprint, content_hash FROM entries",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("a.txt".into(), None, None));
+    }
 }

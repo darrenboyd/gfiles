@@ -26,6 +26,13 @@ pub struct Entry {
     pub size: i64,
     /// Unix seconds.
     pub mtime: i64,
+    /// Sampled content fingerprint (`p1:<hex>`) or a repo's HEAD commit (`git:<sha>`), when
+    /// the holding machine has computed it.
+    #[serde(default, rename = "fp", skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
+    /// Hash of the whole file (`b3:<hex>`), computed on request.
+    #[serde(default, rename = "hash", skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<String>,
 }
 
 impl Entry {
@@ -45,11 +52,45 @@ impl Entry {
         if path.rsplit('/').next() != Some(self.name.as_str()) {
             bail!("entry name {:?} doesn't match its path {path:?}", self.name);
         }
+        if self.ext.is_some() && self.ext != ext_of(&self.name) {
+            bail!(
+                "entry {path:?} has extension {:?}, which isn't its name's",
+                self.ext
+            );
+        }
         if !classify::all_kinds().any(|k| k == self.kind) {
             bail!("entry {path:?} has unknown kind {:?}", self.kind);
         }
+        if let Some(fp) = &self.fingerprint
+            && !(is_tagged_hex(fp, "p1:", &[64]) || is_tagged_hex(fp, "git:", &[40, 64]))
+        {
+            bail!("entry {path:?} has a malformed fingerprint {fp:?}");
+        }
+        if let Some(hash) = &self.content_hash
+            && !is_tagged_hex(hash, "b3:", &[64])
+        {
+            bail!("entry {path:?} has a malformed content hash {hash:?}");
+        }
         Ok(())
     }
+}
+
+/// A file name's extension as the catalog stores it: lowercase, without the dot.
+pub fn ext_of(name: &str) -> Option<String> {
+    std::path::Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_lowercase)
+}
+
+/// Whether `value` is `prefix` followed by lowercase hex of one of the allowed lengths.
+fn is_tagged_hex(value: &str, prefix: &str, lengths: &[usize]) -> bool {
+    value.strip_prefix(prefix).is_some_and(|hex| {
+        lengths.contains(&hex.len())
+            && hex
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
 }
 
 /// A volume row: which machine it's on and where.
@@ -93,12 +134,27 @@ impl<'t> VolumeWriter<'t> {
         )?;
         // Name and path aren't updated on conflict: they are the key (path) or derived from it
         // (name), and leaving them out of SET keeps the FTS update trigger from firing.
+        //
+        // A fingerprint or hash the entry brings (a pull) is stored. Without one (a scan), the
+        // stored values stay while size and mtime are unchanged, so unchanged files are never
+        // read again, and are cleared when either changed.
         let upsert = conn.prepare(
-            "INSERT INTO entries (volume_id, path, name, ext, kind, size, mtime, seen_gen)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "INSERT INTO entries
+               (volume_id, path, name, ext, kind, size, mtime, seen_gen, fingerprint, content_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT (volume_id, path) DO UPDATE SET
                ext = excluded.ext, kind = excluded.kind, size = excluded.size,
-               mtime = excluded.mtime, seen_gen = excluded.seen_gen",
+               mtime = excluded.mtime, seen_gen = excluded.seen_gen,
+               fingerprint = CASE
+                 WHEN excluded.fingerprint IS NOT NULL THEN excluded.fingerprint
+                 WHEN entries.size = excluded.size AND entries.mtime = excluded.mtime
+                   THEN entries.fingerprint
+               END,
+               content_hash = CASE
+                 WHEN excluded.content_hash IS NOT NULL THEN excluded.content_hash
+                 WHEN entries.size = excluded.size AND entries.mtime = excluded.mtime
+                   THEN entries.content_hash
+               END",
         )?;
         Ok(VolumeWriter {
             conn,
@@ -118,7 +174,9 @@ impl<'t> VolumeWriter<'t> {
             e.kind,
             e.size,
             e.mtime,
-            self.generation
+            self.generation,
+            e.fingerprint,
+            e.content_hash
         ])?;
         Ok(())
     }
@@ -208,8 +266,10 @@ pub fn for_each_entry(
     volume_id: &str,
     mut f: impl FnMut(Entry) -> Result<()>,
 ) -> Result<()> {
-    let mut stmt = conn
-        .prepare("SELECT path, name, ext, kind, size, mtime FROM entries WHERE volume_id = ?1")?;
+    let mut stmt = conn.prepare(
+        "SELECT path, name, ext, kind, size, mtime, fingerprint, content_hash
+         FROM entries WHERE volume_id = ?1",
+    )?;
     let mut rows = stmt.query([volume_id])?;
     while let Some(r) = rows.next()? {
         f(Entry {
@@ -219,6 +279,8 @@ pub fn for_each_entry(
             kind: r.get(3)?,
             size: r.get(4)?,
             mtime: r.get(5)?,
+            fingerprint: r.get(6)?,
+            content_hash: r.get(7)?,
         })?;
     }
     Ok(())
@@ -262,6 +324,8 @@ mod tests {
             kind: "other".into(),
             size: 0,
             mtime: 0,
+            fingerprint: None,
+            content_hash: None,
         }
     }
 
@@ -286,6 +350,99 @@ mod tests {
         let mut e = entry("a.txt", "a.txt");
         e.kind = "virus".into();
         assert!(e.validate().is_err());
+        // A pulled extension must be the name's own, lowercased.
+        let mut e = entry("a", "a");
+        e.ext = Some("zzzz".into());
+        assert!(e.validate().is_err());
+        let mut e = entry("Photo.JPG", "Photo.JPG");
+        e.ext = Some("jpg".into());
+        assert!(e.validate().is_ok());
+    }
+
+    const FP: &str = "p1:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+    const HASH: &str = "b3:ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100";
+
+    fn vol() -> Volume {
+        Volume {
+            id: "v".into(),
+            name: "v".into(),
+            machine: "m".into(),
+            root: "/v".into(),
+            last_scan_at: None,
+        }
+    }
+
+    /// Writes `entries` as one scan of the test volume.
+    fn write(conn: &Connection, entries: &[Entry]) {
+        let mut w = VolumeWriter::begin(conn, &vol()).unwrap();
+        for e in entries {
+            w.put(e).unwrap();
+        }
+        w.finish(0, &[]).unwrap();
+    }
+
+    fn stored(conn: &Connection, path: &str) -> (Option<String>, Option<String>) {
+        conn.query_row(
+            "SELECT fingerprint, content_hash FROM entries WHERE path = ?1",
+            [path],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn an_unchanged_file_keeps_its_fingerprint() {
+        let conn = crate::db::open_in_memory().unwrap();
+        let mut e = entry("a.txt", "a.txt");
+        e.size = 10;
+        e.mtime = 100;
+        e.fingerprint = Some(FP.into());
+        e.content_hash = Some(HASH.into());
+        write(&conn, &[e.clone()]);
+
+        // A scan sends no fingerprint; size and mtime match, so the stored ones stay.
+        let mut rescanned = e.clone();
+        rescanned.fingerprint = None;
+        rescanned.content_hash = None;
+        write(&conn, &[rescanned.clone()]);
+        assert_eq!(stored(&conn, "a.txt"), (Some(FP.into()), Some(HASH.into())));
+
+        // A changed mtime means the content may have changed: both are cleared.
+        rescanned.mtime = 101;
+        write(&conn, &[rescanned.clone()]);
+        assert_eq!(stored(&conn, "a.txt"), (None, None));
+
+        // An entry that brings its own fingerprint (a pull) stores it.
+        let mut pulled = rescanned;
+        pulled.fingerprint = Some(FP.into());
+        write(&conn, &[pulled]);
+        assert_eq!(stored(&conn, "a.txt"), (Some(FP.into()), None));
+    }
+
+    #[test]
+    fn validate_checks_fingerprints() {
+        let ok = |fp: &str| {
+            let mut e = entry("a", "a");
+            e.fingerprint = Some(fp.into());
+            e.validate().is_ok()
+        };
+        assert!(ok(FP));
+        assert!(ok("git:0123456789abcdef0123456789abcdef01234567"));
+        for bad in [
+            "p1:xyz",
+            "p1:00112233",
+            "md5:00112233445566778899aabbccddeeff",
+            "p1:00112233445566778899AABBCCDDEEFF00112233445566778899aabbccddeeff",
+            HASH, // a full hash isn't a fingerprint
+            "",
+        ] {
+            assert!(!ok(bad), "{bad:?} accepted");
+        }
+        let mut e = entry("a", "a");
+        e.content_hash = Some(FP.into());
+        assert!(e.validate().is_err(), "a fingerprint isn't a full hash");
+        e.content_hash = Some(HASH.into());
+        assert!(e.validate().is_ok());
     }
 
     #[test]

@@ -152,6 +152,22 @@ fn sync_pulls_from_a_remote() {
     seen.sort();
     assert_eq!(seen, vec!["elrond:Dune.epub", "gaffer:todo.txt"]);
 
+    // Both files hold the same bytes, and the fingerprint came across with the pull: one
+    // duplicate group, and each file has a copy on the other machine.
+    let out = hub().args(["dupes", "--json"]).output().unwrap();
+    let d: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(d["total_groups"], 1, "{d}");
+    assert_eq!(d["groups"][0]["copies"].as_array().unwrap().len(), 2);
+    let out = hub().args(["coverage", "--json"]).output().unwrap();
+    let c: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(c["uncovered"]["files"], 0, "{c}");
+    assert_eq!(c["probably_covered"]["files"], 2, "{c}");
+    let out = hub()
+        .args(["dupes", "--machine", "bilbo"])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&out.stderr).contains("unknown machine"));
+
     // Taking the remote out of the config forgets its volumes; the hub's own stay.
     let config = fs::read_to_string(tmp.path().join("hub.toml")).unwrap();
     let start = config.find("[[remote]]").unwrap();

@@ -55,7 +55,19 @@ by email* (only when the script terminates abnormally) is the only way you'll he
 failed scan. Test it with **Run**; with Task Scheduler → Settings → *Save output results* turned
 on, Action → View Result shows what the scan printed.
 
-The first scan of a large share takes a while; later ones are faster on a warm cache.
+The first scan of a large share takes a while: besides walking it, gfiles reads a sample
+(three 64 KiB pieces) of every file to fingerprint it, for finding duplicates. Later scans
+only read new and changed files. The same happens once on the first scan after upgrading from
+a version without fingerprints. gfiles only ever opens files to read them, but on a
+filesystem that records access times, reading a file updates its atime (`relatime`, the usual
+default, does this at most once a day).
+
+Fingerprints match files by sample, so duplicates are "probable" until full hashes agree. To
+confirm, hash a volume (or one folder of it) on the machine that holds it, then pull:
+
+```sh
+~/.local/bin/gfiles hash Media Photos/2019   # reads every byte: slow on big folders
+```
 
 ## 3. The hub
 
@@ -139,3 +151,32 @@ claude mcp add gfiles -- gfiles mcp    # AI tools, over everything
 
 Taking a remote out of the config removes its volumes from the catalog on the next `pull` or
 `sync`.
+
+```bash
+gfiles dupes --min-size 100M           # same content in more than one place
+gfiles coverage                        # files with no copy on another machine, by folder
+gfiles coverage --folder elrond:Media/Photos/2019   # one folder's files
+gfiles mirrors                         # mirror health, and folders that look like mirrors
+```
+
+## Mirrors
+
+A mirror is a folder that a sync tool keeps the same on several machines, like Google Drive
+synced by Insync on gaffer and by Synology Cloud Sync on the NAS. Tell the hub about it, in
+`~/.config/gfiles/config.toml` on `gaffer`:
+
+```toml
+[[mirror]]
+name = "drive"
+folders = ["gaffer:darren/Drive", "elrond:darren/Drive"]   # machine:volume/folder
+ignore = [".sync/"]                                        # optional, gitignore-style
+```
+
+Each folder is `machine:volume/path`, with the volume names from `gfiles stats`. Search then
+shows each mirror file once with its replicas. A mirror counts as one place for backup
+coverage, because the sync tool copies deletes and damage to every replica: a file only in
+the Drive mirror isn't backed up, however many machines sync it. `gfiles mirrors` reports
+files only in some replicas, files that differ, sync-tool conflict copies, and files the two
+tools named differently, and suggests folder pairs that look like mirrors with a snippet to
+paste. Don't add a folder that's a backup copy rather than a sync: a backup should count as
+its own place.

@@ -21,6 +21,9 @@ pub struct Config {
     /// Machines whose catalogs `pull` fetches into this one (only on the hub).
     #[serde(default, rename = "remote")]
     pub remotes: Vec<Remote>,
+    /// Folders kept in sync by a sync tool, each treated as one logical folder (on the hub).
+    #[serde(default, rename = "mirror")]
+    pub mirrors: Vec<crate::mirror::MirrorConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -68,6 +71,11 @@ const NEW_FILE_HEADER: &str = "\
 # name = \"elrond\"                   # that machine's name
 # host = \"elrond\"                   # ssh destination; defaults to name
 # gfiles = \"~/.local/bin/gfiles\"    # gfiles on that host (the default)
+#
+# and folders a sync tool keeps the same on several machines (`gfiles mirrors` suggests some):
+# [[mirror]]
+# name = \"drive\"
+# folders = [\"gaffer:darren/Drive\", \"elrond:darren/Drive\"]   # machine:volume/path
 #
 # Add volumes with `gfiles volume add <path>`.
 ";

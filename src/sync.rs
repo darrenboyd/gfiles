@@ -5,13 +5,16 @@
 //! The stream is newline-delimited JSON, one message per line:
 //!
 //! ```text
-//! {"t":"hello","protocol":1,"machine":"elrond","volumes":["<id>", ...]}   every configured volume
+//! {"t":"hello","protocol":2,"machine":"elrond","volumes":["<id>", ...]}   every configured volume
 //! {"t":"volume","id":..,"name":..,"machine":..,"root":..,"last_scan_at":..}
-//! {"t":"entry","path":..,"name":..,"ext":..,"kind":..,"size":..,"mtime":..}   × N
+//! {"t":"entry","path":..,"name":..,"ext":..,"kind":..,"size":..,"mtime":..,"fp":..,"hash":..}   × N
 //! {"t":"end","entries":N}
 //! ... more volumes ...
 //! {"t":"done"}
 //! ```
+//!
+//! `fp` (the content fingerprint) and `hash` (the full content hash) are left out when the
+//! remote hasn't computed them; both are validated like every other entry field.
 //!
 //! Every export sends each scanned volume in full; ingest applies it with the same
 //! `VolumeWriter` a local scan uses, one transaction per volume, so a cut-off stream never
@@ -36,7 +39,7 @@ use crate::store::{self, Entry, Volume, VolumeWriter};
 
 /// Bump when the stream format changes incompatibly. Ingest refuses other versions, so the
 /// binaries on both ends must be updated together.
-pub const PROTOCOL: u32 = 1;
+pub const PROTOCOL: u32 = 2;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
@@ -416,6 +419,54 @@ mod tests {
     }
 
     #[test]
+    fn fingerprints_travel_with_the_catalog() {
+        let tmp = tempfile::tempdir().unwrap();
+        touch(tmp.path(), "a.txt");
+        let mut remote_db = db::open_in_memory().unwrap();
+        let mut hub = db::open_in_memory().unwrap();
+        let v = vol("v", tmp.path());
+        scan::scan_volume(&mut remote_db, &v, "elrond").unwrap();
+        scan::hash_volume(&mut remote_db, &v, None).unwrap();
+        transfer(&remote_db, "elrond", &["v"], &mut hub).unwrap();
+
+        let row = |c: &Connection| -> (Option<String>, Option<String>) {
+            c.query_row("SELECT fingerprint, content_hash FROM entries", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap()
+        };
+        let (fp, hash) = row(&hub);
+        assert!(fp.unwrap().starts_with("p1:"));
+        assert!(hash.unwrap().starts_with("b3:"));
+        assert_eq!(row(&hub), row(&remote_db));
+    }
+
+    #[test]
+    fn a_malformed_fingerprint_keeps_the_previous_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        touch(tmp.path(), "a.txt");
+        let mut remote_db = db::open_in_memory().unwrap();
+        let mut hub = db::open_in_memory().unwrap();
+        scan::scan_volume(&mut remote_db, &vol("v", tmp.path()), "elrond").unwrap();
+        transfer(&remote_db, "elrond", &["v"], &mut hub).unwrap();
+
+        let lines = [
+            r#"{"t":"hello","protocol":2,"machine":"elrond","volumes":["v"]}"#.to_string(),
+            format!(
+                r#"{{"t":"volume","id":"v","name":"vol-v","machine":"elrond","root":"{}","last_scan_at":null}}"#,
+                tmp.path().display()
+            ),
+            r#"{"t":"entry","path":"b.txt","name":"b.txt","ext":"txt","kind":"document","size":1,"mtime":1,"fp":"p1:'; DROP TABLE entries"}"#.into(),
+            r#"{"t":"end","entries":1}"#.into(),
+            r#"{"t":"done"}"#.into(),
+        ];
+        let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let err = ingest_lines(&mut hub, "elrond", &lines).unwrap_err();
+        assert!(err.to_string().contains("malformed fingerprint"), "{err}");
+        assert_eq!(hub_paths(&hub), vec!["elrond:a.txt"]);
+    }
+
+    #[test]
     fn refusals() {
         let tmp = tempfile::tempdir().unwrap();
         touch(tmp.path(), "a.txt");
@@ -426,9 +477,15 @@ mod tests {
         let err = transfer(&remote_db, "gaffer", &[], &mut hub).unwrap_err();
         assert!(err.to_string().contains("this machine's own name"), "{err}");
 
-        let hello = r#"{"t":"hello","protocol":99,"machine":"elrond","volumes":[]}"#;
-        let err = ingest(&mut hub, "gaffer", "elrond", hello.as_bytes(), |_| Ok(())).unwrap_err();
-        assert!(err.to_string().contains("protocol 99"), "{err}");
+        for old in [1, 99] {
+            let hello =
+                format!(r#"{{"t":"hello","protocol":{old},"machine":"elrond","volumes":[]}}"#);
+            let err =
+                ingest(&mut hub, "gaffer", "elrond", hello.as_bytes(), |_| Ok(())).unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains(&format!("protocol {old}")), "{err}");
+            assert!(msg.contains(&format!("speaks {PROTOCOL}")), "{err}");
+        }
 
         // The same volume id sent by a different machine.
         transfer(&remote_db, "elrond", &["v"], &mut hub).unwrap();
@@ -458,7 +515,7 @@ mod tests {
             &mut hub,
             "nas2",
             &[
-                r#"{"t":"hello","protocol":1,"machine":"elrond","volumes":[]}"#,
+                r#"{"t":"hello","protocol":2,"machine":"elrond","volumes":[]}"#,
                 r#"{"t":"done"}"#,
             ],
         )
@@ -473,7 +530,7 @@ mod tests {
     #[test]
     fn entries_that_leave_their_volume_are_refused() {
         let mut hub = db::open_in_memory().unwrap();
-        let hello = r#"{"t":"hello","protocol":1,"machine":"nas2","volumes":["v"]}"#;
+        let hello = r#"{"t":"hello","protocol":2,"machine":"nas2","volumes":["v"]}"#;
         let volume = |root: &str| {
             format!(
                 r#"{{"t":"volume","id":"v","name":"x","machine":"nas2","root":"{root}","last_scan_at":null}}"#

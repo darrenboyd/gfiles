@@ -7,6 +7,7 @@ description = "Catalog and organize your files across all your machines"
 
 [dependencies]
 anyhow = "1.0.104"
+blake3 = { version = "1.8.7", default-features = false, features = ["std"] }
 clap = { version = "4.6.7", features = ["derive", "env"] }
 directories = "6.0.0"
 gethostname = "1.1.0"
@@ -23,3 +24,6 @@ walkdir = "2.5.0"
 [dev-dependencies]
 assert_cmd = "2.2.2"
 tempfile = "3.27.0"
+
+[target."cfg(unix)".dependencies]
+libc = "0.2.191"
