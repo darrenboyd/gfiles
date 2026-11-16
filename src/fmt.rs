@@ -52,6 +52,17 @@ pub fn date(unix: i64) -> String {
     format!("{year:04}-{month:02}-{day:02}")
 }
 
+/// Unix seconds → `"YYYY-MM-DD HH:MM UTC"`.
+pub fn date_time(unix: i64) -> String {
+    let secs = unix.rem_euclid(86_400);
+    format!(
+        "{} {:02}:{:02} UTC",
+        date(unix),
+        secs / 3600,
+        secs % 3600 / 60
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -78,6 +89,7 @@ mod tests {
         assert_eq!(date(0), "1970-01-01");
         assert_eq!(date(951_782_400), "2000-02-29");
         assert_eq!(date(1_792_690_968), "2026-10-22");
+        assert_eq!(date_time(1_792_690_968), "2026-10-22 17:42 UTC");
         assert_eq!(date(-86_400), "1969-12-31");
     }
 }

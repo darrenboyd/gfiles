@@ -353,6 +353,10 @@ pub struct Health {
     pub differing: Listed,
     /// Conflict copies a sync tool made when both sides changed.
     pub conflicts: Listed,
+    /// Files that are missing from, or differ in, another replica but changed after that
+    /// replica was last scanned (as `replica/path`): the catalog can't tell yet whether the
+    /// sync tool copied them. A rescan of the other replica settles it. Not counted as drift.
+    pub not_yet_seen: Listed,
     /// Google-native stand-ins (and files matching the mirror's ignore patterns), left out.
     pub skipped_placeholders: usize,
     pub in_sync: bool,
@@ -363,6 +367,7 @@ struct Seen {
     replica: usize,
     path: String,
     size: i64,
+    mtime: i64,
     fingerprint: Option<String>,
 }
 
@@ -442,12 +447,17 @@ pub fn health(conn: &Connection, limit: usize) -> Result<Vec<Health>> {
                 replica,
                 path,
                 size: r.get(4)?,
+                mtime,
                 fingerprint: r.get(6)?,
             });
         }
 
         let n = replicas.len();
+        // Whether a file that changed at `mtime` can't have reached replica `i` in the catalog
+        // yet: that replica was last scanned before the change (or never).
+        let unseen_by = |i: usize, mtime: i64| replicas[i].last_scan_at.is_none_or(|t| t < mtime);
         let mut differing = Vec::new();
+        let mut not_yet_seen = Vec::new();
         let mut one_sided: Vec<Seen> = Vec::new();
         for (path, seen) in by_path {
             let present: HashSet<usize> = seen.iter().map(|s| s.replica).collect();
@@ -458,10 +468,26 @@ pub fn health(conn: &Connection, limit: usize) -> Result<Vec<Health>> {
                         && first.fingerprint.is_some()
                         && s.fingerprint != first.fingerprint)
             }) {
-                differing.push(path);
+                let newest = seen.iter().max_by_key(|s| s.mtime).unwrap();
+                if seen
+                    .iter()
+                    .any(|s| s.replica != newest.replica && unseen_by(s.replica, newest.mtime))
+                {
+                    not_yet_seen.push(format!("{}/{}", replicas[newest.replica].folder, path));
+                } else {
+                    differing.push(path);
+                }
+                continue;
             }
             if present.len() < n {
-                one_sided.extend(seen);
+                for s in seen {
+                    let missing_from = (0..n).filter(|i| !present.contains(i));
+                    if missing_from.clone().any(|i| unseen_by(i, s.mtime)) {
+                        not_yet_seen.push(format!("{}/{}", replicas[s.replica].folder, s.path));
+                    } else {
+                        one_sided.push(s);
+                    }
+                }
             }
         }
 
@@ -530,6 +556,7 @@ pub fn health(conn: &Connection, limit: usize) -> Result<Vec<Health>> {
             named_differently: Listed::from(named_differently, limit),
             differing: Listed::from(differing, limit),
             conflicts: Listed::from(conflicts, limit),
+            not_yet_seen: Listed::from(not_yet_seen, limit),
             skipped_placeholders: skipped,
             in_sync,
         });
@@ -847,6 +874,21 @@ mod tests {
         volume: &str,
         entries: &[(&str, i64, Option<String>)],
     ) {
+        let entries: Vec<_> = entries
+            .iter()
+            .map(|(p, s, f)| (*p, *s, 0, f.clone()))
+            .collect();
+        put_at(conn, machine, volume, &entries, 0);
+    }
+
+    /// Like `put`, with each entry's mtime and the time of the scan.
+    fn put_at(
+        conn: &Connection,
+        machine: &str,
+        volume: &str,
+        entries: &[(&str, i64, i64, Option<String>)],
+        scanned_at: i64,
+    ) {
         let vol = Volume {
             id: format!("{machine}-{volume}"),
             name: volume.into(),
@@ -855,7 +897,7 @@ mod tests {
             last_scan_at: Some(100),
         };
         let mut w = VolumeWriter::begin(conn, &vol).unwrap();
-        for (path, size, fp) in entries {
+        for (path, size, mtime, fp) in entries {
             let name = path.rsplit('/').next().unwrap();
             w.put(&Entry {
                 path: path.to_string(),
@@ -863,13 +905,13 @@ mod tests {
                 ext: name.rsplit_once('.').map(|(_, e)| e.to_lowercase()),
                 kind: "other".into(),
                 size: *size,
-                mtime: 0,
+                mtime: *mtime,
                 fingerprint: fp.clone(),
                 content_hash: None,
             })
             .unwrap();
         }
-        w.finish(0, &[]).unwrap();
+        w.finish(scanned_at, &[]).unwrap();
     }
 
     fn fp(n: u32) -> Option<String> {
@@ -936,6 +978,43 @@ mod tests {
         );
         assert_eq!(h.replicas[0].files, 7);
         assert_eq!(h.replicas[0].last_scan_at, Some(0));
+    }
+
+    #[test]
+    fn changes_after_the_other_replicas_scan_are_not_drift() {
+        let conn = crate::db::open_in_memory().unwrap();
+        // elrond was scanned at 1000; gaffer at 2000, after new.md appeared and notes.md changed.
+        put_at(
+            &conn,
+            "elrond",
+            "darren",
+            &[
+                ("Drive/notes.md", 3, 500, fp(1)),
+                ("Drive/old.md", 3, 500, fp(2)),
+            ],
+            1000,
+        );
+        put_at(
+            &conn,
+            "gaffer",
+            "darren",
+            &[
+                ("Drive/notes.md", 4, 1500, fp(3)),
+                ("Drive/new.md", 3, 1500, fp(4)),
+                ("Drive/stuck.md", 3, 900, fp(5)),
+            ],
+            2000,
+        );
+        load(&conn, &config(DRIVE)).unwrap();
+        let h = &health(&conn, 50).unwrap()[0];
+        assert_eq!(
+            h.not_yet_seen.items,
+            vec!["gaffer:darren/Drive/new.md", "gaffer:darren/Drive/notes.md"]
+        );
+        assert_eq!(h.differing.total, 0);
+        // Older than elrond's scan, so elrond really lacks it; old.md really left gaffer.
+        assert_eq!(h.only_in.len(), 2);
+        assert!(!h.in_sync);
     }
 
     #[test]

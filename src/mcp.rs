@@ -288,8 +288,10 @@ fn tool_definitions() -> Value {
             "title": "Mirror health",
             "description": "For each configured mirror: its replicas (file counts, newest \
                 file, last scan), files only in some replicas, files at the same path with \
-                different content, conflict copies, and files the sync tools named \
-                differently. Lists are capped with totals. Also suggests folder pairs that \
+                different content, conflict copies, files the sync tools named \
+                differently, and files changed after another replica's last scan \
+                (not_yet_seen: probably fine, the catalog just hasn't seen the other side \
+                yet). Lists are capped with totals. Also suggests folder pairs that \
                 look like unconfigured mirrors, with a config snippet the user can add.",
             "inputSchema": {"type": "object", "properties": {
                 "limit": {

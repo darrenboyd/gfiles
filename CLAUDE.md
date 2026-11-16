@@ -173,7 +173,9 @@ scratch directory, when trying the binary out, so experiments never touch the re
   its replicas never count as backups of each other.
 - **Mirror health** ignores Google-native stand-ins (`.gddoc`, `.gmap`, ...), reports sync
   conflict copies, and pairs one-sided files across replicas by content or extension
-  (Insync and Cloud Sync name some files differently).
+  (Insync and Cloud Sync name some files differently). A file missing from, or different in,
+  a replica scanned before the file last changed is listed as `not_yet_seen`, not as drift:
+  the catalog hasn't seen that side since.
 - **The TUI draws to stderr**, so `$(gfiles)` captures only the path chosen with Enter (like
   fzf). Keep stdout clean while it runs. It loads at most 1000 rows; titles show the full count.
 - To check the TUI by hand, run it in a detached tmux session (`tmux new-session -d -x 110 -y 26`),

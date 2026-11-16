@@ -535,7 +535,7 @@ fn print_mirrors(health: &[mirror::Health], suggestions: &[mirror::Suggestion]) 
                 r.folder,
                 r.files,
                 r.newest_mtime.map_or("-".into(), fmt::date),
-                r.last_scan_at.map_or("never".into(), fmt::date),
+                r.last_scan_at.map_or("never".into(), fmt::date_time),
             );
         }
         let list = |title: &str, l: &mirror::Listed| {
@@ -554,6 +554,10 @@ fn print_mirrors(health: &[mirror::Health], suggestions: &[mirror::Suggestion]) 
         }
         list("Same path, different content", &h.differing);
         list("Conflict copies", &h.conflicts);
+        list(
+            "Changed since another replica was scanned (not drift; rescan it to compare)",
+            &h.not_yet_seen,
+        );
         list(
             "Same file, named differently by the sync tools",
             &h.named_differently,
