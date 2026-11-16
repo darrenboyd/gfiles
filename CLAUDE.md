@@ -22,6 +22,12 @@ A Windows machine is out of scope for now, but no decision may rule it out (see 
 The repo is public on GitHub, MIT licensed. Changes are committed and pushed straight to `main`
 (no branches or PRs), when Darren asks.
 
+## Review docs
+
+- `CODING_STANDARDS.md`: the rules code here follows. Read it before writing or reviewing code;
+  update it when a change establishes or retires a rule.
+- `REVIEW.md`: how review behaves here (what ranks highest). Read it before reviewing a change.
+
 ## Decisions
 
 - **Language:** Rust, built as a single binary. TUI with `ratatui`.
