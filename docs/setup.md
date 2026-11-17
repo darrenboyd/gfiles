@@ -170,6 +170,7 @@ what to remove and which copy of each file stays:
 gfiles plan drain elrond:darren/todo                         # remove what has a copy elsewhere
 gfiles plan keep elrond:darren/Photos --over elrond:darren/todo   # remove what Photos also holds
 gfiles plan show <id> --all                                  # review every file
+gfiles plan show <id> --under elrond:darren/todo/Incoming    # what it leaves there, by folder
 gfiles plan apply <id>                                       # asks you to type the id
 gfiles plan undo <id>                                        # put everything back
 gfiles plan empty <id>                                       # free the space for good

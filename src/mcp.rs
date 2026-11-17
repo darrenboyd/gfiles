@@ -380,11 +380,18 @@ fn tool_definitions() -> Value {
             "name": "show_cleanup_plan",
             "title": "Show a cleanup plan",
             "description": "A cleanup plan's totals, the files it removes with the copy that \
-                stays for each (and, once applied, whether each moved), and the files it \
-                leaves, by reason.",
+                stays for each (and, once applied, whether each moved), and what it leaves: \
+                by reason, by folder one level below the plan's folders, and the biggest \
+                files. Pass `under` to drill into one folder.",
             "inputSchema": {"type": "object", "required": ["id"], "properties": {
                 "id": {"type": "string"},
                 "limit": limit_prop(SEARCH_DEFAULT_LIMIT),
+                "under": {
+                    "type": "string",
+                    "description": "A folder inside the plan, as machine:volume/path (like \
+                        a left_by_folder entry). Limits the leftovers to it and groups them \
+                        one level below it."
+                },
             }},
             "annotations": {"readOnlyHint": true},
         },
@@ -465,7 +472,7 @@ fn draft_cleanup_plan(conn: &Connection, config: Option<&Config>, args: &Value) 
     })?;
     let now = crate::scan::unix_secs(Some(std::time::SystemTime::now()));
     let id = plan::save(conn, &built, now)?;
-    let mut view = serde_json::to_value(plan::show(conn, &id, Some(SEARCH_DEFAULT_LIMIT))?)?;
+    let mut view = serde_json::to_value(plan::show(conn, &id, Some(SEARCH_DEFAULT_LIMIT), None)?)?;
     view["next_step"] = json!(format!(
         "Saved as a draft; nothing has moved. The user reviews it with `gfiles plan show {id}` \
          and applies it themselves with `gfiles plan apply {id}`, or deletes it with \
@@ -477,7 +484,15 @@ fn draft_cleanup_plan(conn: &Connection, config: Option<&Config>, args: &Value) 
 fn show_cleanup_plan(conn: &Connection, args: &Value) -> Result<Value> {
     let id = string_arg(args, "id")?.ok_or_else(|| anyhow::anyhow!("id is required"))?;
     let limit = limit_from(args, SEARCH_DEFAULT_LIMIT)?;
-    Ok(serde_json::to_value(plan::show(conn, &id, Some(limit))?)?)
+    let under = string_arg(args, "under")?
+        .map(|u| mirror::parse_folder(&u))
+        .transpose()?;
+    Ok(serde_json::to_value(plan::show(
+        conn,
+        &id,
+        Some(limit),
+        under.as_ref(),
+    )?)?)
 }
 
 fn catalog_overview(conn: &Connection) -> Result<Value> {

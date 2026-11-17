@@ -40,6 +40,10 @@ pub const NOT_MOVED: &str = concat!("NOT EXISTS (SELECT 1 ", moved_by!(), ")");
 /// Folder names that sync tools own: a file removed there is removed from every other copy the
 /// tool keeps, so plans refuse them unless they're configured as mirrors or listed as not
 /// synced.
+/// The leftover reason for the copy a plan keeps inside its own folders (when every copy of a
+/// content is inside them, one stays).
+pub const KEPT_HERE: &str = "kept copy of files it removes";
+
 const SYNC_TOOL_FOLDERS: &[&str] = &["Dropbox", "OneDrive", "SynologyDrive"];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -259,6 +263,15 @@ pub fn build(conn: &Connection, spec: Spec) -> Result<Built> {
         };
         match kept {
             Some(kept) => {
+                if in_targets(kept) {
+                    left.push(Left {
+                        volume_id: kept.volume_id.clone(),
+                        volume: kept.volume.clone(),
+                        path: kept.path.clone(),
+                        size: kept.size,
+                        reason: KEPT_HERE.to_string(),
+                    });
+                }
                 for m in inside.iter().filter(|m| !same(m, kept)) {
                     items.push(Item {
                         volume_id: m.volume_id.clone(),
@@ -662,6 +675,19 @@ pub struct LeftGroup {
     pub bytes: i64,
 }
 
+/// Files left behind under one folder: a folder one level below the plan's folder (or below
+/// the folder `show` was asked to break down), or, with `here`, the files directly in it.
+#[derive(Debug, Serialize)]
+pub struct LeftFolder {
+    pub folder: FolderRef,
+    /// The files directly in `folder`, not in its subfolders.
+    pub here: bool,
+    pub files: i64,
+    pub bytes: i64,
+    /// Most bytes first.
+    pub reasons: Vec<LeftGroup>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct LeftView {
     pub volume: String,
@@ -678,12 +704,44 @@ pub struct View {
     #[serde(flatten)]
     pub summary: Summary,
     pub items: Vec<ItemView>,
+    /// The folder the leftovers below are limited to, when `show` was given one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub under: Option<FolderRef>,
     pub left_by_reason: Vec<LeftGroup>,
+    /// Leftovers grouped one folder level down, most bytes first, cut to the limit.
+    pub left_by_folder: Vec<LeftFolder>,
+    /// How many folder groups there are, before the limit.
+    pub left_folders_total: usize,
+    /// The biggest leftover files, cut to the limit.
     pub left_files: Vec<LeftView>,
 }
 
-pub fn show(conn: &Connection, id: &str, limit: Option<usize>) -> Result<View> {
+/// A plan in full. With `under` (a folder inside the plan), the leftovers are limited to that
+/// folder and grouped one level below it, to drill into where they are.
+pub fn show(
+    conn: &Connection,
+    id: &str,
+    limit: Option<usize>,
+    under: Option<&FolderRef>,
+) -> Result<View> {
     let summary = summary(conn, id)?;
+    let folders = summary
+        .folders
+        .iter()
+        .map(|f| mirror::parse_folder(f))
+        .collect::<Result<Vec<_>>>()?;
+    if let Some(u) = under
+        && !folders.iter().any(|f| f.contains(u))
+    {
+        bail!(
+            "{u} isn't inside plan {id}'s folders ({})",
+            summary.folders.join(", ")
+        );
+    }
+    let bases: Vec<FolderRef> = match under {
+        Some(u) => vec![u.clone()],
+        None => folders,
+    };
     let lim = limit.map_or(-1, |l| l as i64);
     let items = conn
         .prepare(
@@ -711,41 +769,98 @@ pub fn show(conn: &Connection, id: &str, limit: Option<usize>) -> Result<View> {
             })
         })?
         .collect::<rusqlite::Result<_>>()?;
-    let left_by_reason = conn
-        .prepare(
-            "SELECT reason, count(*), sum(size) FROM plan_left WHERE plan_id = ?1
-             GROUP BY reason ORDER BY sum(size) DESC, reason",
-        )?
-        .query_map([id], |r| {
-            Ok(LeftGroup {
-                reason: r.get(0)?,
-                files: r.get(1)?,
-                bytes: r.get(2)?,
+    let mut rows: Vec<LeftView> = Vec::new();
+    let mut stmt = conn.prepare(
+        "SELECT coalesce(v.name, l.volume_id), l.path, coalesce(v.root, ''), l.size, l.reason
+         FROM plan_left l LEFT JOIN volumes v ON v.id = l.volume_id
+         WHERE l.plan_id = ?1 ORDER BY l.size DESC, l.path",
+    )?;
+    let mut found = stmt.query([id])?;
+    // (base, group path) → (tally, reason → tally), for each row under a base.
+    let mut by_folder: HashMap<(usize, String), (Tally, BTreeMap<String, Tally>)> = HashMap::new();
+    let mut by_reason: BTreeMap<String, Tally> = BTreeMap::new();
+    while let Some(r) = found.next()? {
+        let (volume, path, root): (String, String, String) = (r.get(0)?, r.get(1)?, r.get(2)?);
+        let (size, reason): (i64, String) = (r.get(3)?, r.get(4)?);
+        // The deepest base holding the file (plan folders don't nest, but be sure).
+        let Some((b, base)) = bases
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.volume == volume && f.holds(&path))
+            .max_by_key(|(_, f)| f.path.len())
+        else {
+            continue;
+        };
+        let rest = if base.path.is_empty() {
+            path.as_str()
+        } else {
+            &path[base.path.len() + 1..]
+        };
+        let group = match rest.split_once('/') {
+            Some((first, _)) if base.path.is_empty() => first.to_string(),
+            Some((first, _)) => format!("{}/{first}", base.path),
+            None => base.path.clone(),
+        };
+        let add = |t: &mut Tally| {
+            t.files += 1;
+            t.bytes += size;
+        };
+        let (t, reasons) = by_folder.entry((b, group)).or_default();
+        add(t);
+        add(reasons.entry(reason.clone()).or_default());
+        add(by_reason.entry(reason.clone()).or_default());
+        rows.push(LeftView {
+            volume,
+            abs_path: crate::search::join_root(&root, &path),
+            path,
+            size,
+            reason,
+        });
+    }
+    let groups = |m: BTreeMap<String, Tally>| -> Vec<LeftGroup> {
+        let mut v: Vec<LeftGroup> = m
+            .into_iter()
+            .map(|(reason, t)| LeftGroup {
+                reason,
+                files: t.files,
+                bytes: t.bytes,
             })
-        })?
-        .collect::<rusqlite::Result<_>>()?;
-    let left_files = conn
-        .prepare(
-            "SELECT coalesce(v.name, l.volume_id), l.path, coalesce(v.root, ''), l.size, l.reason
-             FROM plan_left l LEFT JOIN volumes v ON v.id = l.volume_id
-             WHERE l.plan_id = ?1 ORDER BY l.size DESC, l.path LIMIT ?2",
-        )?
-        .query_map(params![id, lim], |r| {
-            let (root, path): (String, String) = (r.get(2)?, r.get(1)?);
-            Ok(LeftView {
-                volume: r.get(0)?,
-                abs_path: crate::search::join_root(&root, &path),
+            .collect();
+        v.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.reason.cmp(&b.reason)));
+        v
+    };
+    let mut left_by_folder: Vec<LeftFolder> = by_folder
+        .into_iter()
+        .map(|((b, path), (t, reasons))| LeftFolder {
+            here: path == bases[b].path,
+            folder: FolderRef {
+                machine: bases[b].machine.clone(),
+                volume: bases[b].volume.clone(),
                 path,
-                size: r.get(3)?,
-                reason: r.get(4)?,
-            })
-        })?
-        .collect::<rusqlite::Result<_>>()?;
+            },
+            files: t.files,
+            bytes: t.bytes,
+            reasons: groups(reasons),
+        })
+        .collect();
+    left_by_folder.sort_by(|a, b| {
+        b.bytes
+            .cmp(&a.bytes)
+            .then_with(|| (&a.folder, a.here).cmp(&(&b.folder, b.here)))
+    });
+    let left_folders_total = left_by_folder.len();
+    if let Some(l) = limit {
+        left_by_folder.truncate(l);
+        rows.truncate(l);
+    }
     Ok(View {
         summary,
         items,
-        left_by_reason,
-        left_files,
+        under: under.cloned(),
+        left_by_reason: groups(by_reason),
+        left_by_folder,
+        left_folders_total,
+        left_files: rows,
     })
 }
 
@@ -920,7 +1035,110 @@ pub(crate) mod tests {
             removed(&b),
             vec![pair("PhotoMgmt/2012/IMG_1.jpg", "todo/IMG_1.jpg")]
         );
-        assert!(b.left.is_empty());
+        // The copy that stays is inside the folders, so it's listed as left there.
+        let left: Vec<(&str, &str)> = b
+            .left
+            .iter()
+            .map(|l| (l.path.as_str(), l.reason.as_str()))
+            .collect();
+        assert_eq!(left, vec![("todo/IMG_1.jpg", KEPT_HERE)]);
+    }
+
+    #[test]
+    fn every_file_in_the_folders_is_removed_or_left() {
+        let conn = crate::db::open_in_memory().unwrap();
+        put(
+            &conn,
+            "elrond",
+            "darren",
+            &[
+                ("todo/a.jpg", 10, Some(A)),
+                ("todo/x/a.jpg", 10, Some(A)),
+                ("todo/y/a.jpg", 10, Some(A)),
+                ("todo/b.jpg", 5, Some(B)),
+                ("Photos/b.jpg", 5, Some(B)),
+                ("todo/c.jpg", 3, Some(C)),
+                ("todo/empty.txt", 0, None),
+                ("todo/new.jpg", 4, None),
+            ],
+        );
+        let b = drain(&conn, &["elrond:darren/todo"]).unwrap();
+        let in_todo = 7;
+        assert_eq!(b.items.len() + b.left.len(), in_todo);
+        let kept: Vec<&str> = b
+            .left
+            .iter()
+            .filter(|l| l.reason == KEPT_HERE)
+            .map(|l| l.path.as_str())
+            .collect();
+        assert_eq!(kept, vec!["todo/a.jpg"]);
+    }
+
+    #[test]
+    fn leftovers_group_by_folder_and_drill_down() {
+        let conn = crate::db::open_in_memory().unwrap();
+        put(
+            &conn,
+            "elrond",
+            "darren",
+            &[
+                ("todo/top.jpg", 1, Some(A)),
+                ("todo/Movies/home/v1.avi", 100, Some(B)),
+                ("todo/Movies/home/v2.avi", 50, Some(C)),
+                ("todo/Movies/talk.avi", 7, None),
+                (
+                    "todo/stuff/doc.pdf",
+                    20,
+                    Some("p1:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"),
+                ),
+            ],
+        );
+        let b = drain(&conn, &["elrond:darren/todo"]).unwrap();
+        let id = save(&conn, &b, 1_763_300_000).unwrap();
+
+        let v = show(&conn, &id, None, None).unwrap();
+        let groups: Vec<(String, bool, i64, i64)> = v
+            .left_by_folder
+            .iter()
+            .map(|f| (f.folder.to_string(), f.here, f.files, f.bytes))
+            .collect();
+        assert_eq!(
+            groups,
+            vec![
+                ("elrond:darren/todo/Movies".into(), false, 3, 157),
+                ("elrond:darren/todo/stuff".into(), false, 1, 20),
+                ("elrond:darren/todo".into(), true, 1, 1),
+            ]
+        );
+        assert_eq!(v.left_folders_total, 3);
+        let movies = &v.left_by_folder[0];
+        let reasons: Vec<(&str, i64)> = movies
+            .reasons
+            .iter()
+            .map(|g| (g.reason.as_str(), g.files))
+            .collect();
+        assert_eq!(reasons, vec![("unique", 2), ("not fingerprinted yet", 1)]);
+
+        let v = show(
+            &conn,
+            &id,
+            Some(1),
+            Some(&folder("elrond:darren/todo/Movies")),
+        )
+        .unwrap();
+        assert_eq!(v.left_folders_total, 2);
+        assert_eq!(v.left_by_folder.len(), 1);
+        assert_eq!(v.left_by_folder[0].folder.path, "todo/Movies/home");
+        assert_eq!(v.left_by_folder[0].bytes, 150);
+        assert_eq!(v.left_files.len(), 1);
+        assert_eq!(v.left_files[0].path, "todo/Movies/home/v1.avi");
+        let total: i64 = v.left_by_reason.iter().map(|g| g.files).sum();
+        assert_eq!(total, 3, "only the files under Movies");
+
+        let err = show(&conn, &id, None, Some(&folder("elrond:darren/Photos")))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("isn't inside plan"), "{err}");
     }
 
     #[test]
@@ -1148,7 +1366,7 @@ pub(crate) mod tests {
         let id = save(&conn, &b, 1_763_300_000).unwrap();
         assert!(valid_id(&id), "{id}");
         assert!(id.starts_with("20251116-"), "{id}");
-        let v = show(&conn, &id, None).unwrap();
+        let v = show(&conn, &id, None, None).unwrap();
         assert_eq!(v.summary.state, "draft");
         assert_eq!(
             v.summary.remove,

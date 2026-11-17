@@ -104,7 +104,7 @@ gfiles overlaps [--machine M] [-n 30 | --all] [--json]   # folder pairs sharing 
 gfiles drain <machine:volume/dir> [--json]              # what draining it would free (saves nothing)
 gfiles plan drain <folder>... [--json]  # draft plan: remove files with a copy elsewhere
 gfiles plan keep <keeper> --over <folder> [--json]      # draft plan: remove what keeper holds
-gfiles plan list | show <id> [-n | --all] [--json]
+gfiles plan list | show <id> [--under <folder>] [-n | --all] [--json]
 gfiles plan apply | undo | empty <id>   # Darren only: asks for the id on the terminal
 gfiles plan drop <id>                   # delete a draft
 gfiles hash <volume> [folder]           # full BLAKE3 hashes, to confirm duplicates (slow)

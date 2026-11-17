@@ -209,11 +209,15 @@ enum PlanCommand {
     /// A plan's totals, the files it removes, and the files it leaves
     Show {
         id: String,
-        /// Maximum files listed
+        /// Maximum files and folders listed
         #[arg(short = 'n', long, default_value_t = 30, conflicts_with = "all")]
         limit: usize,
         #[arg(long)]
         all: bool,
+        /// A folder in the plan (machine:volume/dir): break down what's left in it, one level
+        /// down, and list its biggest leftover files
+        #[arg(long)]
+        under: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -592,10 +596,12 @@ fn plan_command(
             id,
             limit,
             all,
+            under,
             json,
         } => {
             let conn = db::open(db_path)?;
-            let view = plan::show(&conn, &id, (!all).then_some(limit))?;
+            let under = under.as_deref().map(mirror::parse_folder).transpose()?;
+            let view = plan::show(&conn, &id, (!all).then_some(limit), under.as_ref())?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&view)?);
             } else {
@@ -644,7 +650,7 @@ fn make_plan(
     plan::check_not_synced(&conn, &built, &config.not_synced_folders()?)?;
     let now = scan_now();
     let id = plan::save(&conn, &built, now)?;
-    let view = plan::show(&conn, &id, Some(20))?;
+    let view = plan::show(&conn, &id, Some(20), None)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&view)?);
     } else {
@@ -875,8 +881,15 @@ fn print_plan(v: &plan::View) {
             );
         }
     }
+    if v.under.is_none() && v.items.is_empty() && v.left_by_reason.is_empty() {
+        return;
+    }
+    let scope = match &v.under {
+        Some(u) => format!(" in {u}"),
+        None => String::new(),
+    };
     if !v.left_by_reason.is_empty() {
-        println!("\nLeaves:");
+        println!("\nLeaves{scope}:");
         for g in &v.left_by_reason {
             println!(
                 "  {:>7} files {:>10}  {}",
@@ -885,6 +898,46 @@ fn print_plan(v: &plan::View) {
                 g.reason
             );
         }
+        println!("\nLeaves{scope}, by folder:");
+        for f in &v.left_by_folder {
+            let name = if f.here {
+                format!("{} (files directly in it)", f.folder)
+            } else {
+                f.folder.to_string()
+            };
+            let reasons = match f.reasons.as_slice() {
+                [only] => only.reason.clone(),
+                many => many
+                    .iter()
+                    .map(|g| format!("{} {}", g.reason, fmt::size(g.bytes)))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            };
+            println!(
+                "  {:>7} files {:>10}  {name}  ({reasons})",
+                f.files,
+                fmt::size(f.bytes)
+            );
+        }
+        if v.left_folders_total > v.left_by_folder.len() {
+            println!(
+                "  ... and {} more folders (use -n or --all)",
+                v.left_folders_total - v.left_by_folder.len()
+            );
+        }
+        if v.under.is_some() {
+            println!("\nBiggest files left:");
+            for l in &v.left_files {
+                println!("{:>10}  {}  ({})", fmt::size(l.size), l.abs_path, l.reason);
+            }
+        } else {
+            println!(
+                "\nBreak a folder down with `gfiles plan show {} --under <folder>`.",
+                s.id
+            );
+        }
+    } else if let Some(u) = &v.under {
+        println!("\nThe plan leaves nothing in {u}.");
     }
 }
 
