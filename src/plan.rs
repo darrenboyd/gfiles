@@ -704,7 +704,9 @@ pub struct View {
     #[serde(flatten)]
     pub summary: Summary,
     pub items: Vec<ItemView>,
-    /// The folder the leftovers below are limited to, when `show` was given one.
+    /// How many files it removes (in `under`, when given), before the limit.
+    pub items_total: i64,
+    /// The folder the removals and leftovers are limited to, when `show` was given one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub under: Option<FolderRef>,
     pub left_by_reason: Vec<LeftGroup>,
@@ -716,8 +718,9 @@ pub struct View {
     pub left_files: Vec<LeftView>,
 }
 
-/// A plan in full. With `under` (a folder inside the plan), the leftovers are limited to that
-/// folder and grouped one level below it, to drill into where they are.
+/// A plan in full. With `under` (a folder inside the plan), the files it removes and the
+/// leftovers are limited to that folder, and the leftovers grouped one level below it, to
+/// drill into where they are. The summary stays the whole plan's.
 pub fn show(
     conn: &Connection,
     id: &str,
@@ -743,17 +746,29 @@ pub fn show(
         None => folders,
     };
     let lim = limit.map_or(-1, |l| l as i64);
+    // With `under`, only removals in that folder (its volume by name, as plans show them).
+    let under_sql = "(?3 IS NULL OR (v.name = ?3
+                       AND (?4 = '' OR substr(i.path, 1, length(?4) + 1) = ?4 || '/')))";
+    let (under_volume, under_path) = (under.map(|u| &u.volume), under.map(|u| &u.path));
+    let items_total: i64 = conn.query_row(
+        &format!(
+            "SELECT count(*) FROM plan_items i LEFT JOIN volumes v ON v.id = i.volume_id
+             WHERE i.plan_id = ?1 AND {under_sql}"
+        ),
+        params![id, lim, under_volume, under_path],
+        |r| r.get(0),
+    )?;
     let items = conn
-        .prepare(
+        .prepare(&format!(
             "SELECT coalesce(v.name, i.volume_id), i.path, coalesce(v.root, ''), i.size,
                     coalesce(k.name, i.keep_volume_id), i.keep_path, coalesce(k.root, ''),
                     i.outcome, i.reason
              FROM plan_items i
              LEFT JOIN volumes v ON v.id = i.volume_id
              LEFT JOIN volumes k ON k.id = i.keep_volume_id
-             WHERE i.plan_id = ?1 ORDER BY i.seq LIMIT ?2",
-        )?
-        .query_map(params![id, lim], |r| {
+             WHERE i.plan_id = ?1 AND {under_sql} ORDER BY i.seq LIMIT ?2"
+        ))?
+        .query_map(params![id, lim, under_volume, under_path], |r| {
             let (root, path): (String, String) = (r.get(2)?, r.get(1)?);
             let (keep_root, keep_path): (String, String) = (r.get(6)?, r.get(5)?);
             Ok(ItemView {
@@ -856,6 +871,7 @@ pub fn show(
     Ok(View {
         summary,
         items,
+        items_total,
         under: under.cloned(),
         left_by_reason: groups(by_reason),
         left_by_folder,
@@ -1074,6 +1090,9 @@ pub(crate) mod tests {
         assert_eq!(kept, vec!["todo/a.jpg"]);
     }
 
+    const EXTRA: &str = "p1:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    const EXTRA2: &str = "p1:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+
     #[test]
     fn leftovers_group_by_folder_and_drill_down() {
         let conn = crate::db::open_in_memory().unwrap();
@@ -1091,10 +1110,25 @@ pub(crate) mod tests {
                     20,
                     Some("p1:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"),
                 ),
+                // Removed: one copy in stuff, one in Movies, both kept in Photos.
+                ("todo/stuff/x.jpg", 3, Some(EXTRA)),
+                ("todo/Movies/y.jpg", 4, Some(EXTRA2)),
+                ("Photos/x.jpg", 3, Some(EXTRA)),
+                ("Photos/y.jpg", 4, Some(EXTRA2)),
             ],
         );
         let b = drain(&conn, &["elrond:darren/todo"]).unwrap();
         let id = save(&conn, &b, 1_763_300_000).unwrap();
+        let removes = |under: Option<&str>| -> (i64, Vec<String>) {
+            let v = show(&conn, &id, None, under.map(folder).as_ref()).unwrap();
+            (v.items_total, v.items.into_iter().map(|i| i.path).collect())
+        };
+        assert_eq!(removes(None).0, 2);
+        assert_eq!(
+            removes(Some("elrond:darren/todo/stuff")),
+            (1, vec!["todo/stuff/x.jpg".to_string()])
+        );
+        assert_eq!(removes(Some("elrond:darren/todo/Movies/home")), (0, vec![]));
 
         let v = show(&conn, &id, None, None).unwrap();
         let groups: Vec<(String, bool, i64, i64)> = v

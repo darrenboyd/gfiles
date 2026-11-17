@@ -214,8 +214,8 @@ enum PlanCommand {
         limit: usize,
         #[arg(long)]
         all: bool,
-        /// A folder in the plan (machine:volume/dir): break down what's left in it, one level
-        /// down, and list its biggest leftover files
+        /// A folder in the plan (machine:volume/dir): list only what it removes there, break
+        /// down what's left in it one level down, and list its biggest leftover files
         #[arg(long)]
         under: Option<String>,
         #[arg(long)]
@@ -863,8 +863,15 @@ fn print_plan(v: &plan::View) {
         println!("  moved   {}", tally(&s.moved));
         println!("  skipped {}", tally(&s.skipped));
     }
+    let scope = match &v.under {
+        Some(u) => format!(" in {u}"),
+        None => String::new(),
+    };
     if !v.items.is_empty() {
-        println!("\nRemoves (the copy that stays below each):");
+        println!(
+            "\nRemoves{scope}: {} files (the copy that stays below each):",
+            v.items_total
+        );
         for i in &v.items {
             let status = match (&i.outcome, &i.reason) {
                 (Some(o), Some(r)) => format!("  [{o}: {r}]"),
@@ -874,20 +881,15 @@ fn print_plan(v: &plan::View) {
             println!("{:>10}  {}{status}", fmt::size(i.size), i.abs_path);
             println!("{:>10}  = {}", "", i.keep_abs_path);
         }
-        if s.remove.files > v.items.len() as i64 {
+        if v.items_total > v.items.len() as i64 {
             println!(
                 "  ... and {} more (use -n or --all)",
-                s.remove.files - v.items.len() as i64
+                v.items_total - v.items.len() as i64
             );
         }
+    } else if v.under.is_some() {
+        println!("\nRemoves nothing{scope}.");
     }
-    if v.under.is_none() && v.items.is_empty() && v.left_by_reason.is_empty() {
-        return;
-    }
-    let scope = match &v.under {
-        Some(u) => format!(" in {u}"),
-        None => String::new(),
-    };
     if !v.left_by_reason.is_empty() {
         println!("\nLeaves{scope}:");
         for g in &v.left_by_reason {

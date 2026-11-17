@@ -389,8 +389,9 @@ fn tool_definitions() -> Value {
                 "under": {
                     "type": "string",
                     "description": "A folder inside the plan, as machine:volume/path (like \
-                        a left_by_folder entry). Limits the leftovers to it and groups them \
-                        one level below it."
+                        a left_by_folder entry). Limits the files it removes and the leftovers \
+                        to it, and groups the leftovers one level below it. Totals stay the \
+                        whole plan's."
                 },
             }},
             "annotations": {"readOnlyHint": true},
