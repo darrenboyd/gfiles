@@ -57,6 +57,44 @@ ALTER TABLE entries ADD COLUMN fingerprint TEXT;   -- 'p1:<hex>' sampled, or 'gi
 ALTER TABLE entries ADD COLUMN content_hash TEXT;  -- 'b3:<hex>' of the whole file, on request
 CREATE INDEX entries_fingerprint ON entries (size, fingerprint) WHERE fingerprint IS NOT NULL;
 "#,
+    r#"
+-- Cleanup plans (see plan.rs): files to move to a volume's trash, each with the copy that stays.
+CREATE TABLE plans (
+    id          TEXT PRIMARY KEY,       -- also names the plan's trash folder on the machine
+    machine     TEXT NOT NULL,
+    kind        TEXT NOT NULL,          -- 'drain' or 'keep'
+    folders     TEXT NOT NULL,          -- JSON array of machine:volume/path; for 'keep', [keeper, over]
+    state       TEXT NOT NULL,          -- draft, applying, applied, undone, emptied
+    created_at  INTEGER NOT NULL,
+    updated_at  INTEGER NOT NULL
+);
+CREATE TABLE plan_items (
+    plan_id        TEXT NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
+    seq            INTEGER NOT NULL,
+    volume_id      TEXT NOT NULL,       -- the file to remove
+    path           TEXT NOT NULL,
+    size           INTEGER NOT NULL,
+    mtime          INTEGER NOT NULL,
+    fingerprint    TEXT NOT NULL,
+    keep_volume_id TEXT NOT NULL,       -- the copy that stays
+    keep_path      TEXT NOT NULL,
+    keep_size      INTEGER NOT NULL,
+    keep_mtime     INTEGER NOT NULL,
+    outcome        TEXT,                -- NULL until applied: 'moved' or 'skipped'
+    reason         TEXT,                -- why it was skipped
+    PRIMARY KEY (plan_id, seq)
+);
+CREATE INDEX plan_items_file ON plan_items (volume_id, path);
+-- Files in the plan's folders that it leaves alone, and why.
+CREATE TABLE plan_left (
+    plan_id   TEXT NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
+    volume_id TEXT NOT NULL,
+    path      TEXT NOT NULL,
+    size      INTEGER NOT NULL,
+    reason    TEXT NOT NULL
+);
+CREATE INDEX plan_left_plan ON plan_left (plan_id);
+"#,
 ];
 
 pub fn open(path: &Path) -> Result<Connection> {

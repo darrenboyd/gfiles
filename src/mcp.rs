@@ -4,7 +4,8 @@
 //! The protocol layer is written by hand: newline-delimited JSON-RPC 2.0 with just the methods
 //! a tools-only server needs (`initialize`, `ping`, `tools/list`, `tools/call`). That keeps the
 //! crate synchronous, with no async runtime. Stdout carries protocol messages only; anything
-//! else goes to stderr. Every tool is read-only.
+//! else goes to stderr. Every tool is read-only, except that `draft_cleanup_plan` saves a draft
+//! plan in the catalog. No tool touches files: only Darren applies a plan, at his terminal.
 
 use std::io::{BufRead, Write};
 
@@ -14,8 +15,9 @@ use serde_json::{Value, json};
 
 use crate::config::Config;
 use crate::dupes::{self, Filters};
+use crate::plan::{self, Spec};
 use crate::search::{self, Query};
-use crate::{classify, mirror};
+use crate::{classify, mirror, overlap};
 
 /// Protocol versions this server can speak; it answers with the client's if listed, else the
 /// newest. Tools-only servers behave the same under all of them.
@@ -41,7 +43,13 @@ backups, since the sync tool copies deletes too. Files match by a sampled finger
 their content: 'probable' or 'probably covered' means the full content wasn't compared yet \
 (the user can run `gfiles hash` to confirm). Use find_duplicates for wasted space, \
 backup_coverage for files with no copy on another machine, and mirror_health to see whether \
-mirrors are in sync. All tools are read-only.";
+mirrors are in sync. To reclaim duplicate space on one machine: folder_overlaps finds folder \
+pairs holding the same files, drain_preview shows what emptying a folder would free and what \
+would stay, and draft_cleanup_plan saves a reviewable plan. Tools never move or delete files: \
+the user applies a plan themselves with `gfiles plan apply <id>` at a terminal. Applying moves \
+files to a trash folder on their volume, where `gfiles plan undo` can put them back until \
+`gfiles plan empty` deletes them for good. Plans go draft, applying, applied, then undone or \
+emptied. Never run plan apply, undo, empty or exec for them, by any means.";
 
 struct RpcError {
     code: i64,
@@ -123,6 +131,11 @@ const TOOLS: &[&str] = &[
     "find_duplicates",
     "backup_coverage",
     "mirror_health",
+    "folder_overlaps",
+    "drain_preview",
+    "draft_cleanup_plan",
+    "list_cleanup_plans",
+    "show_cleanup_plan",
 ];
 
 fn handle_request(
@@ -170,6 +183,11 @@ fn handle_request(
                 "search_files" => search_files(conn, &args),
                 "find_duplicates" => find_duplicates(conn, &args),
                 "backup_coverage" => backup_coverage(conn, &args),
+                "folder_overlaps" => folder_overlaps(conn, &args),
+                "drain_preview" => drain_preview(conn, &args),
+                "draft_cleanup_plan" => draft_cleanup_plan(conn, config, &args),
+                "list_cleanup_plans" => Ok(json!({"plans": plan::list(conn)?})),
+                "show_cleanup_plan" => show_cleanup_plan(conn, &args),
                 _ => mirror_health(conn, &args),
             });
             Ok(match result {
@@ -302,7 +320,164 @@ fn tool_definitions() -> Value {
             }},
             "annotations": {"readOnlyHint": true},
         },
+        {
+            "name": "folder_overlaps",
+            "title": "Folder overlaps",
+            "description": "Pairs of folders on one machine that hold the same files, most \
+                shared bytes first: where duplicate space is. Two copies pair at the first \
+                folder where their paths differ; a folder paired with itself holds copies \
+                inside it. Shared counts each content once. Only files a cleanup plan could \
+                remove count (no mirrors, repositories or empty files).",
+            "inputSchema": {"type": "object", "properties": {
+                "machine": {"type": "string", "description": "Only this machine."},
+                "limit": limit_prop(FOLDERS_DEFAULT_LIMIT),
+            }},
+            "annotations": {"readOnlyHint": true},
+        },
+        {
+            "name": "drain_preview",
+            "title": "Drain preview",
+            "description": "What emptying a folder of its duplicates would do, without saving \
+                anything: how much it would remove (files with another copy on the same \
+                machine), which folders hold the copies that stay, and what it would leave \
+                and why (unique, other copies only on other machines, in a mirror, not fingerprinted).",
+            "inputSchema": {"type": "object", "required": ["folder"], "properties": {
+                "folder": {"type": "string", "description": "machine:volume/path, as \
+                    folder_overlaps returns them."},
+                "limit": limit_prop(FOLDERS_DEFAULT_LIMIT),
+            }},
+            "annotations": {"readOnlyHint": true},
+        },
+        {
+            "name": "draft_cleanup_plan",
+            "title": "Draft a cleanup plan",
+            "description": "Saves a draft cleanup plan in the catalog for the user to review \
+                and apply; it moves no files. Either drain (folders to empty of every file \
+                with a copy elsewhere on the machine; when all copies are inside them, one \
+                stays) or keep + over (remove from `over` each file `keep` also holds). \
+                Returns the plan with its id. Tell the user to review it with `gfiles plan \
+                show <id>` and apply it themselves with `gfiles plan apply <id>`, which asks \
+                them to type the id; never run it for them. Plans refuse mirrors and folders \
+                that look synced.",
+            "inputSchema": {"type": "object", "properties": {
+                "drain": {"type": "array", "items": {"type": "string"},
+                    "description": "Folders to drain, all on one machine (machine:volume/path)."},
+                "keep": {"type": "string", "description": "The folder whose copies stay."},
+                "over": {"type": "string", "description": "The folder files are removed from."},
+            }},
+            "annotations": {"readOnlyHint": false, "destructiveHint": false,
+                "idempotentHint": false},
+        },
+        {
+            "name": "list_cleanup_plans",
+            "title": "List cleanup plans",
+            "description": "Every cleanup plan, newest first, with its state (draft, \
+                applying, applied, undone, emptied) and totals.",
+            "inputSchema": {"type": "object", "properties": {}},
+            "annotations": {"readOnlyHint": true},
+        },
+        {
+            "name": "show_cleanup_plan",
+            "title": "Show a cleanup plan",
+            "description": "A cleanup plan's totals, the files it removes with the copy that \
+                stays for each (and, once applied, whether each moved), and the files it \
+                leaves, by reason.",
+            "inputSchema": {"type": "object", "required": ["id"], "properties": {
+                "id": {"type": "string"},
+                "limit": limit_prop(SEARCH_DEFAULT_LIMIT),
+            }},
+            "annotations": {"readOnlyHint": true},
+        },
     ])
+}
+
+fn limit_prop(default: usize) -> Value {
+    json!({
+        "type": "integer", "minimum": 1, "maximum": SEARCH_MAX_LIMIT,
+        "description": format!("Most items listed (default {default}, max {SEARCH_MAX_LIMIT}).")
+    })
+}
+
+fn string_arg(args: &Value, key: &str) -> Result<Option<String>> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.clone())),
+        Some(other) => anyhow::bail!("{key} must be a string, got {other}"),
+    }
+}
+
+fn folder_overlaps(conn: &Connection, args: &Value) -> Result<Value> {
+    let machine = string_arg(args, "machine")?;
+    let limit = limit_from(args, FOLDERS_DEFAULT_LIMIT)?;
+    Ok(serde_json::to_value(overlap::pairs(
+        conn,
+        machine.as_deref(),
+        Some(limit),
+    )?)?)
+}
+
+fn drain_preview(conn: &Connection, args: &Value) -> Result<Value> {
+    let folder = string_arg(args, "folder")?
+        .ok_or_else(|| anyhow::anyhow!("folder is required (machine:volume/path)"))?;
+    let limit = limit_from(args, FOLDERS_DEFAULT_LIMIT)?;
+    let folder = mirror::parse_folder(&folder)?;
+    Ok(serde_json::to_value(overlap::drain_preview(
+        conn,
+        &folder,
+        Some(limit),
+    )?)?)
+}
+
+fn draft_cleanup_plan(conn: &Connection, config: Option<&Config>, args: &Value) -> Result<Value> {
+    let drain = match args.get("drain") {
+        None | Some(Value::Null) => None,
+        Some(Value::Array(a)) => Some(
+            a.iter()
+                .map(|f| {
+                    f.as_str()
+                        .ok_or_else(|| anyhow::anyhow!("drain must be a list of folder strings"))
+                        .and_then(mirror::parse_folder)
+                })
+                .collect::<Result<Vec<_>>>()?,
+        ),
+        Some(other) => anyhow::bail!("drain must be a list of folders, got {other}"),
+    };
+    let keep = string_arg(args, "keep")?;
+    let over = string_arg(args, "over")?;
+    let spec = match (drain, keep, over) {
+        (Some(folders), None, None) if !folders.is_empty() => Spec::Drain(folders),
+        (None, Some(keep), Some(over)) => Spec::Keep {
+            keeper: mirror::parse_folder(&keep)?,
+            over: mirror::parse_folder(&over)?,
+        },
+        _ => anyhow::bail!("pass either drain (a list of folders) or both keep and over"),
+    };
+    let built = plan::build(conn, spec)?;
+    let not_synced = config
+        .map(Config::not_synced_folders)
+        .transpose()?
+        .unwrap_or_default();
+    plan::check_not_synced(conn, &built, &not_synced).map_err(|e| {
+        e.context(
+            "Only the user knows whether a sync tool manages these folders. Ask them; they \
+             edit the hub's config themselves. Don't change the config for them",
+        )
+    })?;
+    let now = crate::scan::unix_secs(Some(std::time::SystemTime::now()));
+    let id = plan::save(conn, &built, now)?;
+    let mut view = serde_json::to_value(plan::show(conn, &id, Some(SEARCH_DEFAULT_LIMIT))?)?;
+    view["next_step"] = json!(format!(
+        "Saved as a draft; nothing has moved. The user reviews it with `gfiles plan show {id}` \
+         and applies it themselves with `gfiles plan apply {id}`, or deletes it with \
+         `gfiles plan drop {id}`."
+    ));
+    Ok(view)
+}
+
+fn show_cleanup_plan(conn: &Connection, args: &Value) -> Result<Value> {
+    let id = string_arg(args, "id")?.ok_or_else(|| anyhow::anyhow!("id is required"))?;
+    let limit = limit_from(args, SEARCH_DEFAULT_LIMIT)?;
+    Ok(serde_json::to_value(plan::show(conn, &id, Some(limit))?)?)
 }
 
 fn catalog_overview(conn: &Connection) -> Result<Value> {
@@ -485,7 +660,12 @@ mod tests {
                 "search_files",
                 "find_duplicates",
                 "backup_coverage",
-                "mirror_health"
+                "mirror_health",
+                "folder_overlaps",
+                "drain_preview",
+                "draft_cleanup_plan",
+                "list_cleanup_plans",
+                "show_cleanup_plan"
             ]
         );
         assert_eq!(out[2]["id"], 3);
@@ -549,6 +729,61 @@ mod tests {
                 "{r}"
             );
         }
+    }
+
+    #[test]
+    fn overlaps_preview_and_a_drafted_plan() {
+        use crate::plan::tests::{A, put};
+        let conn = db::open_in_memory().unwrap();
+        put(
+            &conn,
+            "elrond",
+            "darren",
+            &[("todo/a.jpg", 10, Some(A)), ("Photos/a.jpg", 10, Some(A))],
+        );
+        let r = call_tool(&conn, "folder_overlaps", json!({}));
+        assert_eq!(
+            r["structuredContent"]["pairs"][0]["b"],
+            "elrond:darren/todo"
+        );
+        let r = call_tool(
+            &conn,
+            "drain_preview",
+            json!({"folder": "elrond:darren/todo"}),
+        );
+        assert_eq!(r["structuredContent"]["removable"]["files"], 1);
+
+        let r = call_tool(
+            &conn,
+            "draft_cleanup_plan",
+            json!({"keep": "elrond:darren/Photos"}),
+        );
+        assert_eq!(r["isError"], true);
+        let r = call_tool(
+            &conn,
+            "draft_cleanup_plan",
+            json!({"drain": ["elrond:darren/todo"]}),
+        );
+        assert_eq!(r["isError"], false, "{r}");
+        let plan = &r["structuredContent"];
+        assert_eq!(plan["state"], "draft");
+        assert!(
+            plan["next_step"]
+                .as_str()
+                .unwrap()
+                .contains("gfiles plan apply")
+        );
+        let id = plan["id"].as_str().unwrap();
+        let r = call_tool(&conn, "show_cleanup_plan", json!({"id": id}));
+        assert_eq!(
+            r["structuredContent"]["items"][0]["keep_path"],
+            "Photos/a.jpg"
+        );
+        let r = call_tool(&conn, "list_cleanup_plans", json!({}));
+        assert_eq!(r["structuredContent"]["plans"][0]["id"], id);
+        // Drafting moved nothing: the catalog still sees both copies.
+        let r = call_tool(&conn, "folder_overlaps", json!({}));
+        assert_eq!(r["structuredContent"]["pairs"].as_array().unwrap().len(), 1);
     }
 
     #[test]

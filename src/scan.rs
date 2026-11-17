@@ -113,7 +113,9 @@ pub fn scan_volume(conn: &mut Connection, vol: &VolumeConfig, machine: &str) -> 
             continue;
         }
         let is_dir = file_type.is_dir();
-        if ignores.matched(entry.path(), is_dir).is_ignore() {
+        // Cleanup plans' trash: always skipped, even when the volume un-ignores hidden folders.
+        let in_trash = entry.depth() == 1 && entry.file_name() == crate::apply::TRASH;
+        if in_trash || ignores.matched(entry.path(), is_dir).is_ignore() {
             if is_dir {
                 walk.skip_current_dir();
             }
@@ -425,6 +427,22 @@ mod tests {
                 ("Photos/beach.jpg".into(), "photo".into()),
                 ("code/proj".into(), "repo".into()),
             ]
+        );
+    }
+
+    #[test]
+    fn the_cleanup_trash_is_never_scanned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        touch(root, ".gfiles-trash/20261116-120000-abcd/files/a.jpg");
+        touch(root, "sub/.gfiles-trash/b.jpg");
+        let mut conn = db::open_in_memory().unwrap();
+        // Even a volume that brings back every hidden folder skips the trash at its root.
+        let vol = volume(root, vec!["!.*".into()]);
+        scan_volume(&mut conn, &vol, "gaffer").unwrap();
+        assert_eq!(
+            paths(&conn),
+            vec![("sub/.gfiles-trash/b.jpg".into(), "photo".into())]
         );
     }
 

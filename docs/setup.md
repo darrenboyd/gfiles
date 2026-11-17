@@ -159,6 +159,44 @@ gfiles coverage --folder elrond:Media/Photos/2019   # one folder's files
 gfiles mirrors                         # mirror health, and folders that look like mirrors
 ```
 
+## Cleaning up duplicates
+
+`gfiles overlaps` lists folder pairs on one machine that hold the same files (with what only
+each side holds), and
+`gfiles drain <machine:volume/dir>` shows what emptying one of them would free. A plan records
+what to remove and which copy of each file stays:
+
+```bash
+gfiles plan drain elrond:darren/todo                         # remove what has a copy elsewhere
+gfiles plan keep elrond:darren/Photos --over elrond:darren/todo   # remove what Photos also holds
+gfiles plan show <id> --all                                  # review every file
+gfiles plan apply <id>                                       # asks you to type the id
+gfiles plan undo <id>                                        # put everything back
+gfiles plan empty <id>                                       # free the space for good
+```
+
+`apply` moves each file to `.gfiles-trash/<id>/files/` at the top of its volume, after checking
+its full content against the copy that stays. The space comes back only with `empty`, which
+keeps any file that changed in the trash or whose kept copy has since gone or changed. A
+volume that isn't mounted is left alone: apply skips its files, and undo and empty leave the
+plan as it was until the disk is back. Plans refuse mirrors, and folders
+that look synced (ones `gfiles mirrors` suggests, or inside `Dropbox`, `OneDrive` or
+`SynologyDrive`): add the folder to `[[mirror]]` if a tool syncs it, or list it in
+`not_synced = ["machine:volume/dir"]` at the top of the hub's config if none does.
+
+**Before the first plan on the NAS:**
+
+- Deploy the same gfiles to both machines (`bin/deploy elrond`, then
+  `cargo install --path . --root ~/.local`): the hub refuses a NAS on another plan protocol.
+- A NAS plan runs as `ssh elrond gfiles plan exec`, with your normal login, not the pull-only
+  key (that one only runs `export`, and the hub refuses its answer). Set `apply_host` in the
+  `[[remote]]` if `elrond` isn't the right ssh destination. If an ssh agent holds the pull key,
+  add `IdentitiesOnly yes` and your own `IdentityFile` to the `Host elrond` entry, so the agent
+  doesn't offer the pull key first.
+- Synology snapshots of the share keep the deleted files' space until the snapshots holding
+  them expire.
+- Files owned by another DSM user can't be moved and are skipped.
+
 ## Mirrors
 
 A mirror is a folder that a sync tool keeps the same on several machines, like Google Drive

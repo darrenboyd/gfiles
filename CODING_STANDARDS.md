@@ -10,10 +10,24 @@ review checks the diff against it. Commands, setup and anything `cargo clippy` o
   weren't seen must leave out anything the walk failed to read, and must refuse outright when
   the volume root is missing or unreadable. A scan that deletes on partial information
   silently wipes the catalog, and the hub's next `pull` copies the loss into its catalog.
-- **Nothing touches the files in a volume.** No code path writes, moves or deletes under a
-  volume root (until the plan/apply/undo actions exist), and the scanner never follows a
-  symlink. Each of these guarantees has a test that fails if it is removed, so a refactor
-  can't drop one quietly.
+- **Only the apply executor touches the files in a volume.** No other code path writes,
+  moves or deletes under a volume root, and the scanner never follows a symlink. The
+  executor (`apply`) only creates and writes inside the volume's `.gfiles-trash` folder,
+  renames files into it and back out of it, recreates a restored file's missing parent
+  folders on undo, and deletes a plan's trash folder when emptying it. Its renames never
+  replace an existing file and never fall back to copy-and-delete. Before moving a file it
+  checks that the file and the copy that stays are unchanged since the scan, aren't the same
+  file, and have equal full content; any doubt skips the file. It never creates a volume
+  root, and creates each trash folder level only after checking the one above isn't a
+  symlink. Emptying keeps any file that changed since the move, whose kept copy is gone or
+  changed, or that the journal doesn't vouch for, and never deletes anything it didn't list
+  and check. Undo and empty don't count a plan done while one of its volumes is missing. Each
+  of these guarantees has a test that fails if it is removed, so a refactor can't drop one
+  quietly.
+- **Only Darren applies a plan.** `plan apply`, `undo` and `empty` ask for the plan id on
+  the controlling terminal (not stdin), refuse without one, and have no flag to skip the
+  question. `plan exec`, which carries out a confirmed plan for the hub, refuses unless it
+  runs over SSH. MCP tools may draft plans in the catalog but never apply them.
 - **Content reads are guarded.** Code that reads a file's content (fingerprints, hashes)
   opens it without following a symlink, checks it is still the regular file the catalog
   row describes (size and mtime) before and after reading, and writes the result only to a
@@ -38,7 +52,7 @@ review checks the diff against it. Commands, setup and anything `cargo clippy` o
 ## Interfaces
 
 - **Interfaces stay thin.** The CLI, TUI and MCP server call shared query modules
-  (`search`, `dupes`, `mirror`) rather than writing their own queries, so their answers
+  (`search`, `dupes`, `mirror`, `overlap`, `plan`) rather than writing their own queries, so their answers
   can't drift apart.
 - **stdout is reserved.** In `mcp` mode it carries protocol messages only; while the TUI runs
   it carries only the chosen path (the TUI draws to stderr). Diagnostics go to stderr.
@@ -52,7 +66,8 @@ review checks the diff against it. Commands, setup and anything `cargo clippy` o
 
 - **Schema and protocol changes are additive.** Never edit a migration that has been
   committed; add a new one. Bump `sync::PROTOCOL` on any incompatible change to the export
-  stream, since ingest refuses other versions.
+  stream, since ingest refuses other versions, and `apply::PROTOCOL` on any incompatible
+  change to the `plan exec` exchange.
 - **Don't rule out Windows.** Unix-only crates and APIs stay inside a small, isolated
   platform module (unix-only tests behind `#[cfg(unix)]` are fine). Stored relative paths
   use `/` and are converted at the filesystem boundary. Config and data directories come

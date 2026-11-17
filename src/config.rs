@@ -24,6 +24,10 @@ pub struct Config {
     /// Folders kept in sync by a sync tool, each treated as one logical folder (on the hub).
     #[serde(default, rename = "mirror")]
     pub mirrors: Vec<crate::mirror::MirrorConfig>,
+    /// Folders (`machine:volume/path`) that look synced but aren't: cleanup plans may touch
+    /// them (on the hub).
+    #[serde(default)]
+    pub not_synced: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -39,11 +43,28 @@ pub struct Remote {
     /// so a full path is safest; `~` is expanded by the remote shell.
     #[serde(default = "default_remote_gfiles")]
     pub gfiles: String,
+    /// SSH destination for applying cleanup plans there, which moves files. Defaults to `name`,
+    /// not `host`: `host` is usually a key restricted to `gfiles export`.
+    pub apply_host: Option<String>,
+}
+
+impl Config {
+    /// `not_synced`, parsed.
+    pub fn not_synced_folders(&self) -> Result<Vec<crate::mirror::FolderRef>> {
+        self.not_synced
+            .iter()
+            .map(|f| crate::mirror::parse_folder(f).context("in not_synced"))
+            .collect()
+    }
 }
 
 impl Remote {
     pub fn host(&self) -> &str {
         self.host.as_deref().unwrap_or(&self.name)
+    }
+
+    pub fn apply_host(&self) -> &str {
+        self.apply_host.as_deref().unwrap_or(&self.name)
     }
 }
 
@@ -71,11 +92,16 @@ const NEW_FILE_HEADER: &str = "\
 # name = \"elrond\"                   # that machine's name
 # host = \"elrond\"                   # ssh destination; defaults to name
 # gfiles = \"~/.local/bin/gfiles\"    # gfiles on that host (the default)
+# apply_host = \"elrond\"             # ssh destination for `plan apply`; defaults to name
 #
 # and folders a sync tool keeps the same on several machines (`gfiles mirrors` suggests some):
 # [[mirror]]
 # name = \"drive\"
 # folders = [\"gaffer:darren/Drive\", \"elrond:darren/Drive\"]   # machine:volume/path
+#
+# Cleanup plans refuse folders that look synced (suggested mirrors, Dropbox, ...). List the
+# ones no sync tool manages, at the top of the file:
+# not_synced = [\"elrond:darren/todo\"]
 #
 # Add volumes with `gfiles volume add <path>`.
 ";

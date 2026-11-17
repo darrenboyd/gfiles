@@ -58,11 +58,33 @@ pub const PLACE: &str =
     "(CASE WHEN mf.mirror IS NULL THEN 'machine:' || v.machine ELSE 'mirror:' || mf.mirror END)";
 
 /// A parsed `machine:volume/path`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct FolderRef {
     pub machine: String,
     pub volume: String,
     pub path: String,
+}
+
+impl FolderRef {
+    /// Whether `path` (relative to this folder's volume root) is this folder or inside it.
+    pub fn holds(&self, path: &str) -> bool {
+        self.path.is_empty()
+            || path == self.path
+            || path
+                .strip_prefix(self.path.as_str())
+                .is_some_and(|rest| rest.starts_with('/'))
+    }
+
+    /// Whether `other` is this folder or inside it.
+    pub fn contains(&self, other: &FolderRef) -> bool {
+        self.machine == other.machine && self.volume == other.volume && self.holds(&other.path)
+    }
+}
+
+impl Serialize for FolderRef {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.collect_str(self)
+    }
 }
 
 impl std::fmt::Display for FolderRef {
@@ -76,7 +98,7 @@ impl std::fmt::Display for FolderRef {
 }
 
 pub fn parse_folder(s: &str) -> Result<FolderRef> {
-    let bad = || anyhow::anyhow!("mirror folder {s:?} must look like machine:volume/path");
+    let bad = || anyhow::anyhow!("folder {s:?} must look like machine:volume/path");
     let (machine, rest) = s.split_once(':').ok_or_else(bad)?;
     let rest = rest.trim_end_matches('/');
     let (volume, path) = rest.split_once('/').unwrap_or((rest, ""));
@@ -88,7 +110,7 @@ pub fn parse_folder(s: &str) -> Result<FolderRef> {
             .split('/')
             .any(|p| p.is_empty() || p == "." || p == "..")
     {
-        bail!("mirror folder {s:?}: the path must not contain empty, '.' or '..' parts");
+        bail!("folder {s:?}: the path must not contain empty, '.' or '..' parts");
     }
     Ok(FolderRef {
         machine: machine.into(),

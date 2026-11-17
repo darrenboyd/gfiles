@@ -40,15 +40,7 @@ impl Entry {
     /// doesn't match what a scan would have produced.
     pub fn validate(&self) -> Result<()> {
         let path = &self.path;
-        if path.is_empty() || path.contains('\0') {
-            bail!("bad entry path {path:?}");
-        }
-        if path
-            .split('/')
-            .any(|part| part.is_empty() || part == "." || part == "..")
-        {
-            bail!("entry path {path:?} must be relative, with no empty, '.' or '..' parts");
-        }
+        check_rel_path(path)?;
         if path.rsplit('/').next() != Some(self.name.as_str()) {
             bail!("entry name {:?} doesn't match its path {path:?}", self.name);
         }
@@ -73,6 +65,21 @@ impl Entry {
         }
         Ok(())
     }
+}
+
+/// Refuses a path relative to a volume root that could point outside it: empty, absolute, or
+/// with empty, `.` or `..` parts.
+pub fn check_rel_path(path: &str) -> Result<()> {
+    if path.is_empty() || path.contains('\0') {
+        bail!("bad entry path {path:?}");
+    }
+    if path
+        .split('/')
+        .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        bail!("entry path {path:?} must be relative, with no empty, '.' or '..' parts");
+    }
+    Ok(())
 }
 
 /// A file name's extension as the catalog stores it: lowercase, without the dot.

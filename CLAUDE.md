@@ -76,9 +76,12 @@ Windows is out of scope for now, but don't make it impossible:
 4. **Duplicates and backup coverage:** identical files across machines; files that exist in only
    one place; mirrors (synced folders) and their health. Code done; deploy both machines
    together (sync `PROTOCOL` 2).
-5. **Classify and tag:** metadata extraction (EXIF, ID3, EPUB title and author) and Darren's own
+5. **Duplicate cleanup:** folder overlaps on one machine, drain previews, and cleanup plans
+   (drain, keep-over) applied through a trash with undo. Code done; deploy both machines
+   together before the first NAS plan.
+6. **Classify and tag:** metadata extraction (EXIF, ID3, EPUB title and author) and Darren's own
    tags.
-6. **Actions:** move, rename, delete and copy through plan, apply and undo.
+7. **More actions:** move, rename and copy through plan, apply and undo.
 
 ## Commands
 
@@ -97,6 +100,13 @@ gfiles stats [--json]
 gfiles dupes [-k KIND] [--volume V] [--machine M] [--min-size 100M] [-n 20 | --all] [--json]
 gfiles coverage [same filters] [--folder machine:volume/dir | mirror:name/dir] [--json]
 gfiles mirrors [-n 20] [--json]         # [[mirror]] health, plus suggested mirrors
+gfiles overlaps [--machine M] [-n 30 | --all] [--json]   # folder pairs sharing files, and what only each holds
+gfiles drain <machine:volume/dir> [--json]              # what draining it would free (saves nothing)
+gfiles plan drain <folder>... [--json]  # draft plan: remove files with a copy elsewhere
+gfiles plan keep <keeper> --over <folder> [--json]      # draft plan: remove what keeper holds
+gfiles plan list | show <id> [-n | --all] [--json]
+gfiles plan apply | undo | empty <id>   # Darren only: asks for the id on the terminal
+gfiles plan drop <id>                   # delete a draft
 gfiles hash <volume> [folder]           # full BLAKE3 hashes, to confirm duplicates (slow)
 gfiles mcp                              # MCP server on stdin/stdout
 gfiles pull                             # fetch each [[remote]]'s catalog over ssh
@@ -136,6 +146,11 @@ scratch directory, when trying the binary out, so experiments never touch the re
   stay thin and call into it (and `dupes`, `mirror`), so they can't drift apart. A mirror
   file is one hit, listing its other replicas; each hit says how many places hold its
   content.
+- `src/overlap.rs`: folder pairs that share content on one machine, and drain previews.
+- `src/plan.rs`: building cleanup plans (which copy stays, what's left and why), the
+  synced-folder refusal, and plan storage (`plans`, `plan_items`, `plan_left`).
+- `src/apply.rs`: the only code that writes under a volume root: moves to the trash, undo,
+  empty, the per-machine lock, and the `plan exec` exchange the hub runs over SSH.
 - `src/fmt.rs`: sizes and dates for display (dates are UTC, computed without a date crate).
 - `src/tui/`: `app.rs` holds state and key handling, `ui.rs` draws it, `mod.rs` runs the loop.
   Test behavior through `App::handle_key` and layout through ratatui's `TestBackend`, not a
@@ -143,8 +158,10 @@ scratch directory, when trying the binary out, so experiments never touch the re
 - `src/mcp.rs`: the MCP server. The JSON-RPC layer is hand-written (newline-delimited, no async
   runtime) because a tools-only server needs just `initialize`, `ping`, `tools/list` and
   `tools/call`. Tools: `catalog_overview`, `file_locations` (matches grouped by folder, for
-  "where are my X?"), `search_files`, `find_duplicates`, `backup_coverage`, `mirror_health`.
-  All read-only.
+  "where are my X?"), `search_files`, `find_duplicates`, `backup_coverage`, `mirror_health`,
+  `folder_overlaps`, `drain_preview`, `draft_cleanup_plan`, `list_cleanup_plans`,
+  `show_cleanup_plan`. All read-only, except that `draft_cleanup_plan` saves a draft plan in
+  the catalog; none touches files.
 
 ## Implementation notes
 
@@ -201,3 +218,20 @@ scratch directory, when trying the binary out, so experiments never touch the re
   itself); only unknown methods or tools are JSON-RPC errors. Results carry both a JSON text
   block and `structuredContent`. To check it with a real client, point `claude -p` at a scratch
   catalog with `--strict-mcp-config --mcp-config <file>` and ask it a question.
+- **Cleanup plans:** only same-machine copies count; mirror files are never removed or kept,
+  repos never removed. The copy that stays is outside the plan's folders when one exists, else
+  the shortest path, then alphabetical; a keep-over plan only keeps copies in its keeper. Plans
+  are stored on the hub; `apply` runs in-process for this machine and as
+  `ssh <apply_host> gfiles plan exec` for a remote (format in `apply`'s module doc, versioned
+  by `apply::PROTOCOL`). Files go to `<volume root>/.gfiles-trash/<plan id>/files/`, which scans
+  always skip; the catalog forgets them at the next scan, and until then overlaps and new plans
+  leave out files an applied plan moved (as they were when moved; a new file at the same path
+  counts). A re-run apply resumes. The executor never creates a volume root: a file on an
+  unmounted volume is skipped, and undo and empty leave the plan where it was while one of its
+  volumes is missing. Undo leaves a file in the trash when its path is taken again. Empty
+  keeps files that changed after the move, whose kept copy is gone or changed, or that the
+  journal doesn't list, and removes the plan's trash folder only once nothing is left in it.
+- **Agents never run `gfiles plan apply`, `undo`, `empty` or `exec`**, by any means (including
+  tmux, a pseudo-terminal, or setting `SSH_CONNECTION`). `plan exec` refuses outside SSH, but
+  anyone with an SSH login to a remote can still call it there without the confirmation. They may build and show plans; Darren applies them. To try the executor,
+  use the tests or a scratch `--config`/`--db` over a scratch folder.

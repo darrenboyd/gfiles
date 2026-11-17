@@ -5,10 +5,12 @@ use anyhow::{Result, bail};
 use clap::builder::PossibleValuesParser;
 use clap::{Parser, Subcommand};
 
+use gfiles::apply::{self, Op};
 use gfiles::config::{self, Config};
 use gfiles::dupes::{self, Filters};
+use gfiles::plan::{self, Spec};
 use gfiles::search::{self, Query};
-use gfiles::{classify, db, fmt, mirror, scan, store};
+use gfiles::{classify, db, fmt, mirror, overlap, scan, store};
 
 /// Catalog and organize your files across all your machines.
 ///
@@ -115,6 +117,35 @@ enum Command {
         json: bool,
     },
 
+    /// Folder pairs on one machine holding the same files, most shared space first
+    Overlaps {
+        #[arg(long)]
+        machine: Option<String>,
+        /// Maximum pairs
+        #[arg(short = 'n', long, default_value_t = 30, conflicts_with = "all")]
+        limit: usize,
+        /// Every pair
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// What emptying a folder of its duplicates would free, and what would stay (saves nothing)
+    Drain {
+        /// Like elrond:darren/todo
+        folder: String,
+        /// Maximum folders listed as holding the copies that stay
+        #[arg(short = 'n', long, default_value_t = 20)]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Cleanup plans: build, review, apply, undo
+    #[command(subcommand)]
+    Plan(PlanCommand),
+
     /// Serve the catalog to AI tools over MCP (stdin/stdout)
     Mcp,
 
@@ -148,6 +179,55 @@ impl FilterArgs {
             limit: (!all).then_some(limit),
         }
     }
+}
+
+#[derive(Subcommand)]
+enum PlanCommand {
+    /// Plan removing every file in these folders that has a copy elsewhere on the machine
+    Drain {
+        /// Like elrond:darren/todo (all on one machine)
+        #[arg(required = true)]
+        folders: Vec<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Plan removing from one folder every file another folder also holds
+    Keep {
+        /// The folder whose copies stay
+        keeper: String,
+        /// The folder files are removed from
+        #[arg(long)]
+        over: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Every plan, newest first
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// A plan's totals, the files it removes, and the files it leaves
+    Show {
+        id: String,
+        /// Maximum files listed
+        #[arg(short = 'n', long, default_value_t = 30, conflicts_with = "all")]
+        limit: usize,
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Move a plan's files to each volume's trash (asks you to type the plan id)
+    Apply { id: String },
+    /// Put a plan's files back (asks you to type the plan id)
+    Undo { id: String },
+    /// Delete a plan's files from the trash for good (asks you to type the plan id)
+    Empty { id: String },
+    /// Delete a draft plan
+    Drop { id: String },
+    /// Run a plan step for the hub, on stdin/stdout (run by `plan apply` over SSH)
+    #[command(hide = true)]
+    Exec,
 }
 
 #[derive(Subcommand)]
@@ -391,6 +471,35 @@ fn main() -> Result<()> {
                 print_mirrors(&health, &suggestions);
             }
         }
+        Command::Overlaps {
+            machine,
+            limit,
+            all,
+            json,
+        } => {
+            let conn = open_for_queries(&config_path, &db_path)?;
+            let pairs = overlap::pairs(&conn, machine.as_deref(), (!all).then_some(limit))?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&pairs)?);
+            } else {
+                print_overlaps(&pairs);
+            }
+        }
+        Command::Drain {
+            folder,
+            limit,
+            json,
+        } => {
+            let conn = open_for_queries(&config_path, &db_path)?;
+            let folder = mirror::parse_folder(&folder)?;
+            let p = overlap::drain_preview(&conn, &folder, Some(limit))?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&p)?);
+            } else {
+                print_drain(&p);
+            }
+        }
+        Command::Plan(cmd) => plan_command(cmd, &config_path, &db_path)?,
         Command::Mcp => {
             let conn = open_for_queries(&config_path, &db_path)?;
             let config = Config::load(&config_path)?;
@@ -434,6 +543,349 @@ fn open_for_queries(
         eprintln!("warning: {w}");
     }
     Ok(conn)
+}
+
+fn plan_command(
+    cmd: PlanCommand,
+    config_path: &std::path::Path,
+    db_path: &std::path::Path,
+) -> Result<()> {
+    let lock_path = db_path.with_file_name("actions.lock");
+    match cmd {
+        PlanCommand::Drain { folders, json } => {
+            let folders = folders
+                .iter()
+                .map(|f| mirror::parse_folder(f))
+                .collect::<Result<Vec<_>>>()?;
+            make_plan(config_path, db_path, Spec::Drain(folders), json)
+        }
+        PlanCommand::Keep { keeper, over, json } => {
+            let spec = Spec::Keep {
+                keeper: mirror::parse_folder(&keeper)?,
+                over: mirror::parse_folder(&over)?,
+            };
+            make_plan(config_path, db_path, spec, json)
+        }
+        PlanCommand::List { json } => {
+            let conn = db::open(db_path)?;
+            let plans = plan::list(&conn)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&plans)?);
+            } else if plans.is_empty() {
+                println!("No plans yet. Find folders to clean up with `gfiles overlaps`.");
+            } else {
+                for p in &plans {
+                    println!(
+                        "{}  {:<8} {:<5} {:>7} files {:>10}  {}",
+                        p.id,
+                        p.state,
+                        p.kind,
+                        p.remove.files,
+                        fmt::size(p.remove.bytes),
+                        p.folders.join(" ")
+                    );
+                }
+            }
+            Ok(())
+        }
+        PlanCommand::Show {
+            id,
+            limit,
+            all,
+            json,
+        } => {
+            let conn = db::open(db_path)?;
+            let view = plan::show(&conn, &id, (!all).then_some(limit))?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&view)?);
+            } else {
+                print_plan(&view);
+            }
+            Ok(())
+        }
+        PlanCommand::Drop { id } => {
+            let conn = db::open(db_path)?;
+            plan::drop(&conn, &id)?;
+            println!("Dropped plan {id}.");
+            Ok(())
+        }
+        PlanCommand::Apply { id } => run_plan(config_path, db_path, &lock_path, Op::Apply, &id),
+        PlanCommand::Undo { id } => run_plan(config_path, db_path, &lock_path, Op::Undo, &id),
+        PlanCommand::Empty { id } => run_plan(config_path, db_path, &lock_path, Op::Empty, &id),
+        PlanCommand::Exec => {
+            // Only the hub runs this, over SSH, after Darren confirmed the plan there. Run
+            // locally it would skip that confirmation, so it refuses.
+            if std::env::var_os("SSH_CONNECTION").is_none() {
+                bail!(
+                    "plan exec only runs over SSH from the hub; use `gfiles plan apply`, \
+                     `undo` or `empty`, which ask you to confirm"
+                );
+            }
+            let config = Config::load(config_path)?;
+            apply::serve(
+                &config,
+                &lock_path,
+                std::io::stdin().lock(),
+                std::io::stdout().lock(),
+            )
+        }
+    }
+}
+
+fn make_plan(
+    config_path: &std::path::Path,
+    db_path: &std::path::Path,
+    spec: Spec,
+    json: bool,
+) -> Result<()> {
+    let config = Config::load(config_path)?;
+    let conn = open_for_queries(config_path, db_path)?;
+    let built = plan::build(&conn, spec)?;
+    plan::check_not_synced(&conn, &built, &config.not_synced_folders()?)?;
+    let now = scan_now();
+    let id = plan::save(&conn, &built, now)?;
+    let view = plan::show(&conn, &id, Some(20))?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&view)?);
+    } else {
+        print_plan(&view);
+        println!(
+            "\nSaved as a draft. Review it with `gfiles plan show {id} --all`; apply it with \
+             `gfiles plan apply {id}`."
+        );
+    }
+    Ok(())
+}
+
+fn scan_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
+}
+
+/// Applies, undoes or empties a plan after Darren types its id on the terminal.
+fn run_plan(
+    config_path: &std::path::Path,
+    db_path: &std::path::Path,
+    lock_path: &std::path::Path,
+    op: Op,
+    id: &str,
+) -> Result<()> {
+    let config = Config::load(config_path)?;
+    let mut conn = db::open(db_path)?;
+    let s = plan::summary(&conn, id)?;
+    let what = match op {
+        Op::Apply => format!(
+            "move {} files ({}) on {} to the trash",
+            s.remove.files - s.moved.files - s.skipped.files,
+            fmt::size(s.remove.bytes - s.moved.bytes - s.skipped.bytes),
+            s.machine
+        ),
+        Op::Undo => format!(
+            "put back the {} files ({}) plan {id} moved on {}",
+            s.moved.files,
+            fmt::size(s.moved.bytes),
+            s.machine
+        ),
+        Op::Empty => format!(
+            "permanently delete the {} files ({}) plan {id} moved to the trash on {}",
+            s.moved.files,
+            fmt::size(s.moved.bytes),
+            s.machine
+        ),
+    };
+    let route = apply::Route::for_machine(&config, &s.machine, lock_path)?;
+    // Name the folders, so a plan drafted the wrong way round (by an agent, say) shows here.
+    println!("Plan {id}: {}", plan_folders(&s));
+    println!("This will {what}.");
+    let typed = gfiles::platform::ask_terminal(&format!(
+        "Type the plan id to {}: ",
+        apply::op_name(op)
+    ))
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "plan {} needs you at a terminal to confirm, and there isn't one ({e}); nothing was done",
+            apply::op_name(op)
+        )
+    })?;
+    if typed != id {
+        println!("That isn't the plan id; nothing was done.");
+        return Ok(());
+    }
+    let started = Instant::now();
+    let done = apply::execute(&mut conn, &route, op, id)?;
+    let after = plan::summary(&conn, id)?;
+    match op {
+        Op::Apply => {
+            println!(
+                "Moved {} files, skipped {} ({:.1}s). Plan {id} is {}.",
+                done.moved,
+                done.skipped,
+                started.elapsed().as_secs_f64(),
+                after.state
+            );
+            if done.skipped > 0 {
+                println!("`gfiles plan show {id}` lists the skipped files and why.");
+            }
+            println!(
+                "The files are in .gfiles-trash/{id} on each volume. Check things over, then \
+                 `gfiles plan empty {id}` frees the space (or `gfiles plan undo {id}`)."
+            );
+        }
+        Op::Undo => println!(
+            "Put back {} files. Plan {id} is {}.",
+            done.restored, after.state
+        ),
+        Op::Empty => println!(
+            "Deleted {} files ({}). Plan {id} is {}.",
+            done.deleted,
+            fmt::size(done.deleted_bytes as i64),
+            after.state
+        ),
+    }
+    if !done.left_in_trash.is_empty() {
+        println!("Left in the trash ({}):", done.left_in_trash.len());
+        for l in done.left_in_trash.iter().take(20) {
+            println!("  {l}");
+        }
+    }
+    Ok(())
+}
+
+fn tally(t: &plan::Tally) -> String {
+    format!("{} files, {}", t.files, fmt::size(t.bytes))
+}
+
+fn print_overlaps(p: &overlap::Pairs) {
+    let pairs = &p.pairs;
+    if pairs.is_empty() {
+        println!("No folders share files on one machine.");
+    }
+    for p in pairs {
+        if p.a == p.b {
+            println!(
+                "{:>10} shared  within {} ({})",
+                fmt::size(p.shared.bytes),
+                p.a,
+                tally(&p.a_total)
+            );
+        } else {
+            let side = |f: &mirror::FolderRef, total: &plan::Tally, only: &plan::Tally| {
+                format!(
+                    "{f} ({}; {} only here)",
+                    tally(total),
+                    fmt::size(only.bytes)
+                )
+            };
+            println!(
+                "{:>10} shared  {}\n{:18}{}",
+                fmt::size(p.shared.bytes),
+                side(&p.a, &p.a_total, &p.a_only),
+                "",
+                side(&p.b, &p.b_total, &p.b_only)
+            );
+        }
+    }
+    if p.total > pairs.len() {
+        eprintln!(
+            "(showing the top {} of {}; use -n or --all for more)",
+            pairs.len(),
+            p.total
+        );
+    }
+    if !pairs.is_empty() {
+        println!("\nSee what draining one would free with `gfiles drain <folder>`.");
+    }
+}
+
+fn print_drain(p: &overlap::Preview) {
+    println!("{}: {}", p.folder, tally(&p.total));
+    println!(
+        "A drain would remove {}, whose copies stay in:",
+        tally(&p.removable)
+    );
+    for c in &p.copies_in {
+        println!(
+            "  {:>7} files {:>10}  {}",
+            c.tally.files,
+            fmt::size(c.tally.bytes),
+            c.folder
+        );
+    }
+    if p.copies_in_total > p.copies_in.len() {
+        println!(
+            "  and {} more folders",
+            p.copies_in_total - p.copies_in.len()
+        );
+    }
+    if !p.left.is_empty() {
+        println!("It would leave:");
+        for l in &p.left {
+            println!(
+                "  {:>7} files {:>10}  {}",
+                l.tally.files,
+                fmt::size(l.tally.bytes),
+                l.reason
+            );
+        }
+    }
+    println!("\nPlan it with `gfiles plan drain {}`.", p.folder);
+}
+
+/// A plan's kind and folders, as `drain a b` or `keep a over b`.
+fn plan_folders(s: &plan::Summary) -> String {
+    format!(
+        "{} {}",
+        s.kind,
+        s.folders
+            .join(if s.kind == "keep" { " over " } else { " " })
+    )
+}
+
+fn print_plan(v: &plan::View) {
+    let s = &v.summary;
+    println!(
+        "Plan {} ({}, {}): {}",
+        s.id,
+        s.state,
+        fmt::date_time(s.created_at),
+        plan_folders(s)
+    );
+    println!("  removes {}", tally(&s.remove));
+    println!("  leaves  {}", tally(&s.left));
+    if s.moved.files + s.skipped.files > 0 {
+        println!("  moved   {}", tally(&s.moved));
+        println!("  skipped {}", tally(&s.skipped));
+    }
+    if !v.items.is_empty() {
+        println!("\nRemoves (the copy that stays below each):");
+        for i in &v.items {
+            let status = match (&i.outcome, &i.reason) {
+                (Some(o), Some(r)) => format!("  [{o}: {r}]"),
+                (Some(o), None) => format!("  [{o}]"),
+                _ => String::new(),
+            };
+            println!("{:>10}  {}{status}", fmt::size(i.size), i.abs_path);
+            println!("{:>10}  = {}", "", i.keep_abs_path);
+        }
+        if s.remove.files > v.items.len() as i64 {
+            println!(
+                "  ... and {} more (use -n or --all)",
+                s.remove.files - v.items.len() as i64
+            );
+        }
+    }
+    if !v.left_by_reason.is_empty() {
+        println!("\nLeaves:");
+        for g in &v.left_by_reason {
+            println!(
+                "  {:>7} files {:>10}  {}",
+                g.files,
+                fmt::size(g.bytes),
+                g.reason
+            );
+        }
+    }
 }
 
 /// One copy on a line: its location, or a mirror file and its replicas.

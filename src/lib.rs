@@ -1,3 +1,4 @@
+pub mod apply;
 pub mod classify;
 pub mod config;
 pub mod db;
@@ -6,6 +7,8 @@ pub mod fingerprint;
 pub mod fmt;
 pub mod mcp;
 pub mod mirror;
+pub mod overlap;
+pub mod plan;
 pub mod platform;
 pub mod scan;
 pub mod search;

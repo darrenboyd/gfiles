@@ -86,6 +86,120 @@ fn unescape_octal(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// Whether two stats are the same file (hard links, or one path reached twice). Unix compares
+/// device and inode; elsewhere this can't tell, and says no.
+pub fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        a.dev() == b.dev() && a.ino() == b.ino()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (a, b);
+        false
+    }
+}
+
+/// Renames `from` to `to`, failing (with `AlreadyExists`) instead of replacing a file already
+/// at `to`; `std::fs::rename` replaces it on Unix. Never copies: a rename across filesystems
+/// fails.
+pub fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let c = |p: &Path| {
+            CString::new(p.as_os_str().as_bytes())
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))
+        };
+        let (from_c, to_c) = (c(from)?, c(to)?);
+        // The raw syscall, since musl's libc may not wrap renameat2.
+        let r = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                libc::AT_FDCWD,
+                from_c.as_ptr(),
+                libc::AT_FDCWD,
+                to_c.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        if r == 0 {
+            return Ok(());
+        }
+        let err = io::Error::last_os_error();
+        // An old kernel or a filesystem without the flag: fall back to link + unlink.
+        if !matches!(err.raw_os_error(), Some(libc::EINVAL | libc::ENOSYS)) {
+            return Err(err);
+        }
+    }
+    #[cfg(unix)]
+    {
+        // A hard link never replaces an existing name; then drop the old one.
+        std::fs::hard_link(from, to)?;
+        std::fs::remove_file(from)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (from, to);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "moving files to the trash is only supported on Unix",
+        ))
+    }
+}
+
+/// Takes an exclusive lock on `file`, without waiting. `Ok(false)` when another process
+/// holds it. The lock goes away with the process, so a crash never leaves it stuck.
+pub fn try_lock(file: &File) -> io::Result<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(true);
+        }
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            Ok(false)
+        } else {
+            Err(err)
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = file;
+        Ok(true)
+    }
+}
+
+/// Shows `prompt` on the controlling terminal and reads one line typed there, ignoring stdin
+/// and stdout (so a script or agent piping input can't answer). Fails when there is no
+/// terminal.
+pub fn ask_terminal(prompt: &str) -> io::Result<String> {
+    #[cfg(unix)]
+    {
+        use std::io::{BufRead, Write};
+        let tty = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/tty")?;
+        (&tty).write_all(prompt.as_bytes())?;
+        (&tty).flush()?;
+        let mut line = String::new();
+        io::BufReader::new(&tty).read_line(&mut line)?;
+        Ok(line.trim().to_string())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = prompt;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "confirming on the terminal is only supported on Unix",
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
