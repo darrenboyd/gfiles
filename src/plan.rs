@@ -112,6 +112,8 @@ pub struct Left {
 pub struct Built {
     pub machine: String,
     pub spec: Spec,
+    /// Folders inside the plan's folders that it leaves out entirely (outermost only).
+    pub except: Vec<FolderRef>,
     pub items: Vec<Item>,
     pub left: Vec<Left>,
 }
@@ -151,8 +153,10 @@ impl Resolved {
 }
 
 /// Builds a plan from the catalog (with mirrors loaded). Refuses folders that aren't in the
-/// catalog, that span machines, or that are inside a configured mirror.
-pub fn build(conn: &Connection, spec: Spec) -> Result<Built> {
+/// catalog, that span machines, or that are inside a configured mirror. Files under an `except`
+/// folder (which must be inside a folder files are removed from) are left out entirely: never
+/// removed or listed, though a copy there can be the one that stays.
+pub fn build(conn: &Connection, spec: Spec, except: &[FolderRef]) -> Result<Built> {
     let folders = spec.folders();
     let Some(first) = folders.first() else {
         bail!("name at least one folder");
@@ -177,6 +181,25 @@ pub fn build(conn: &Connection, spec: Spec) -> Result<Built> {
         Spec::Drain(_) => (resolved.iter().collect(), None),
         Spec::Keep { .. } => (vec![&resolved[1]], Some(&resolved[0])),
     };
+    let mut except: Vec<FolderRef> = except.to_vec();
+    except.sort();
+    except.dedup();
+    let outer: Vec<FolderRef> = except
+        .iter()
+        .filter(|e| !except.iter().any(|o| o != *e && o.contains(e)))
+        .cloned()
+        .collect();
+    let mut excluded = Vec::new();
+    for e in &outer {
+        if !targets.iter().any(|t| t.folder.contains(e)) {
+            bail!("can't leave out {e}: it isn't inside a folder this plan removes files from");
+        }
+        if targets.iter().any(|t| t.folder == *e) {
+            bail!("can't leave out {e}: it's a whole folder of the plan; just don't name it");
+        }
+        excluded.push(resolve(conn, e)?);
+    }
+    let left_out = |volume_id: &str, path: &str| excluded.iter().any(|x| x.holds(volume_id, path));
 
     let mut items = Vec::new();
     let mut left = Vec::new();
@@ -184,7 +207,9 @@ pub fn build(conn: &Connection, spec: Spec) -> Result<Built> {
     let mut candidates: BTreeMap<(i64, String), ()> = BTreeMap::new();
     for t in &targets {
         for e in target_entries(conn, t)? {
-            if !seen.insert((e.volume_id.clone(), e.path.clone())) {
+            if left_out(&e.volume_id, &e.path)
+                || !seen.insert((e.volume_id.clone(), e.path.clone()))
+            {
                 continue;
             }
             let reason = if e.kind == crate::classify::REPO {
@@ -216,7 +241,9 @@ pub fn build(conn: &Connection, spec: Spec) -> Result<Built> {
         }
     }
 
-    let in_targets = |m: &Member| targets.iter().any(|t| t.holds(&m.volume_id, &m.path));
+    let in_targets = |m: &Member| {
+        targets.iter().any(|t| t.holds(&m.volume_id, &m.path)) && !left_out(&m.volume_id, &m.path)
+    };
     let mut members_stmt = conn.prepare(&format!(
         "SELECT e.volume_id, v.name, e.path, e.size, e.mtime
          FROM entries e JOIN volumes v ON v.id = e.volume_id{JOIN}
@@ -323,6 +350,7 @@ pub fn build(conn: &Connection, spec: Spec) -> Result<Built> {
     Ok(Built {
         machine,
         spec,
+        except: outer,
         items,
         left,
     })
@@ -477,15 +505,18 @@ pub fn check_not_synced(conn: &Connection, built: &Built, not_synced: &[FolderRe
 pub fn save(conn: &Connection, built: &Built, now: i64) -> Result<String> {
     let id = new_id(now);
     let folders: Vec<String> = built.spec.folders().iter().map(|f| f.to_string()).collect();
+    let except: Vec<String> = built.except.iter().map(|f| f.to_string()).collect();
     let tx = conn.unchecked_transaction()?;
     tx.execute(
-        "INSERT INTO plans (id, machine, kind, folders, state, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, 'draft', ?5, ?5)",
+        "INSERT INTO plans (id, machine, kind, folders, except_folders, state, created_at,
+             updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'draft', ?6, ?6)",
         params![
             id,
             built.machine,
             built.spec.kind(),
             serde_json::to_string(&folders)?,
+            serde_json::to_string(&except)?,
             now
         ],
     )?;
@@ -559,6 +590,9 @@ pub struct Summary {
     pub machine: String,
     pub kind: String,
     pub folders: Vec<String>,
+    /// Folders inside `folders` the plan leaves out entirely.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub except: Vec<String>,
     pub state: String,
     pub created_at: i64,
     pub updated_at: i64,
@@ -581,7 +615,8 @@ const SUMMARY_SQL: &str = "SELECT p.id, p.machine, p.kind, p.folders, p.state, p
         (SELECT count(*) FROM plan_items WHERE plan_id = p.id AND outcome = 'moved'),
         (SELECT coalesce(sum(size), 0) FROM plan_items WHERE plan_id = p.id AND outcome = 'moved'),
         (SELECT count(*) FROM plan_items WHERE plan_id = p.id AND outcome = 'skipped'),
-        (SELECT coalesce(sum(size), 0) FROM plan_items WHERE plan_id = p.id AND outcome = 'skipped')
+        (SELECT coalesce(sum(size), 0) FROM plan_items WHERE plan_id = p.id AND outcome = 'skipped'),
+        p.except_folders
     FROM plans p";
 
 fn read_summary(r: &rusqlite::Row) -> rusqlite::Result<Summary> {
@@ -596,6 +631,7 @@ fn read_summary(r: &rusqlite::Row) -> rusqlite::Result<Summary> {
         machine: r.get(1)?,
         kind: r.get(2)?,
         folders: serde_json::from_str(&folders).unwrap_or_default(),
+        except: serde_json::from_str(&r.get::<_, String>(15)?).unwrap_or_default(),
         in_trash: if matches!(state.as_str(), "applying" | "applied") {
             moved.bytes
         } else {
@@ -1013,6 +1049,7 @@ pub(crate) mod tests {
         build(
             conn,
             Spec::Drain(folders.iter().map(|f| folder(f)).collect()),
+            &[],
         )
     }
 
@@ -1088,6 +1125,60 @@ pub(crate) mod tests {
             .map(|l| l.path.as_str())
             .collect();
         assert_eq!(kept, vec!["todo/a.jpg"]);
+    }
+
+    #[test]
+    fn a_plan_can_leave_out_folders_inside_it() {
+        let conn = crate::db::open_in_memory().unwrap();
+        put(
+            &conn,
+            "elrond",
+            "darren",
+            &[
+                ("todo/Pictures/2012/a.jpg", 10, Some(A)),
+                ("Rayla/a.jpg", 10, Some(A)),
+                ("todo/b.jpg", 5, Some(B)),
+                ("Photos/b.jpg", 5, Some(B)),
+                ("todo/Pictures/u.jpg", 3, Some(C)),
+            ],
+        );
+        let except = [
+            folder("elrond:darren/todo/Pictures/2012"),
+            folder("elrond:darren/todo/Pictures"),
+        ];
+        let b = build(
+            &conn,
+            Spec::Drain(vec![folder("elrond:darren/todo")]),
+            &except,
+        )
+        .unwrap();
+        assert_eq!(removed(&b), vec![pair("todo/b.jpg", "Photos/b.jpg")]);
+        assert!(b.left.is_empty(), "nothing under Pictures is listed");
+        assert_eq!(
+            b.except,
+            vec![folder("elrond:darren/todo/Pictures")],
+            "outermost only"
+        );
+        let id = save(&conn, &b, 1_763_300_000).unwrap();
+        assert_eq!(
+            summary(&conn, &id).unwrap().except,
+            vec!["elrond:darren/todo/Pictures"]
+        );
+
+        let refused = |except: &str| {
+            build(
+                &conn,
+                Spec::Keep {
+                    keeper: folder("elrond:darren/Photos"),
+                    over: folder("elrond:darren/todo"),
+                },
+                &[folder(except)],
+            )
+            .unwrap_err()
+            .to_string()
+        };
+        assert!(refused("elrond:darren/Photos/x").contains("isn't inside"));
+        assert!(refused("elrond:darren/todo").contains("whole folder"));
     }
 
     const EXTRA: &str = "p1:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
@@ -1270,6 +1361,7 @@ pub(crate) mod tests {
                 keeper: folder("elrond:darren/A"),
                 over: folder("elrond:darren/B"),
             },
+            &[],
         )
         .unwrap();
         assert_eq!(removed(&b), vec![pair("B/x.jpg", "A/deep/x.jpg")]);
@@ -1287,6 +1379,7 @@ pub(crate) mod tests {
                 keeper: folder("elrond:darren/A"),
                 over: folder("elrond:darren/A/B"),
             },
+            &[],
         )
         .unwrap_err();
         assert!(err.to_string().contains("contain one another"), "{err}");

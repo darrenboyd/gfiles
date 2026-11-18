@@ -344,6 +344,7 @@ fn tool_definitions() -> Value {
             "inputSchema": {"type": "object", "required": ["folder"], "properties": {
                 "folder": {"type": "string", "description": "machine:volume/path, as \
                     folder_overlaps returns them."},
+                "except": except_prop(),
                 "limit": limit_prop(FOLDERS_DEFAULT_LIMIT),
             }},
             "annotations": {"readOnlyHint": true},
@@ -364,6 +365,7 @@ fn tool_definitions() -> Value {
                     "description": "Folders to drain, all on one machine (machine:volume/path)."},
                 "keep": {"type": "string", "description": "The folder whose copies stay."},
                 "over": {"type": "string", "description": "The folder files are removed from."},
+                "except": except_prop(),
             }},
             "annotations": {"readOnlyHint": false, "destructiveHint": false,
                 "idempotentHint": false},
@@ -399,6 +401,14 @@ fn tool_definitions() -> Value {
     ])
 }
 
+fn except_prop() -> Value {
+    json!({
+        "type": "array", "items": {"type": "string"},
+        "description": "Folders inside the folder(s) files are removed from to leave out \
+            entirely (machine:volume/path): nothing in them is removed or listed."
+    })
+}
+
 fn limit_prop(default: usize) -> Value {
     json!({
         "type": "integer", "minimum": 1, "maximum": SEARCH_MAX_LIMIT,
@@ -429,27 +439,35 @@ fn drain_preview(conn: &Connection, args: &Value) -> Result<Value> {
         .ok_or_else(|| anyhow::anyhow!("folder is required (machine:volume/path)"))?;
     let limit = limit_from(args, FOLDERS_DEFAULT_LIMIT)?;
     let folder = mirror::parse_folder(&folder)?;
+    let except = folder_list(args, "except")?.unwrap_or_default();
     Ok(serde_json::to_value(overlap::drain_preview(
         conn,
         &folder,
+        &except,
         Some(limit),
     )?)?)
 }
 
-fn draft_cleanup_plan(conn: &Connection, config: Option<&Config>, args: &Value) -> Result<Value> {
-    let drain = match args.get("drain") {
-        None | Some(Value::Null) => None,
-        Some(Value::Array(a)) => Some(
+/// An optional argument holding a list of machine:volume/path folders.
+fn folder_list(args: &Value, name: &str) -> Result<Option<Vec<mirror::FolderRef>>> {
+    match args.get(name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Array(a)) => Ok(Some(
             a.iter()
                 .map(|f| {
                     f.as_str()
-                        .ok_or_else(|| anyhow::anyhow!("drain must be a list of folder strings"))
+                        .ok_or_else(|| anyhow::anyhow!("{name} must be a list of folder strings"))
                         .and_then(mirror::parse_folder)
                 })
                 .collect::<Result<Vec<_>>>()?,
-        ),
-        Some(other) => anyhow::bail!("drain must be a list of folders, got {other}"),
-    };
+        )),
+        Some(other) => anyhow::bail!("{name} must be a list of folders, got {other}"),
+    }
+}
+
+fn draft_cleanup_plan(conn: &Connection, config: Option<&Config>, args: &Value) -> Result<Value> {
+    let drain = folder_list(args, "drain")?;
+    let except = folder_list(args, "except")?.unwrap_or_default();
     let keep = string_arg(args, "keep")?;
     let over = string_arg(args, "over")?;
     let spec = match (drain, keep, over) {
@@ -460,7 +478,7 @@ fn draft_cleanup_plan(conn: &Connection, config: Option<&Config>, args: &Value) 
         },
         _ => anyhow::bail!("pass either drain (a list of folders) or both keep and over"),
     };
-    let built = plan::build(conn, spec)?;
+    let built = plan::build(conn, spec, &except)?;
     let not_synced = config
         .map(Config::not_synced_folders)
         .transpose()?

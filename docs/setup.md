@@ -168,6 +168,7 @@ what to remove and which copy of each file stays:
 
 ```bash
 gfiles plan drain elrond:darren/todo                         # remove what has a copy elsewhere
+gfiles plan drain elrond:darren/todo --except elrond:darren/todo/Pictures   # but leave Pictures alone
 gfiles plan keep elrond:darren/Photos --over elrond:darren/todo   # remove what Photos also holds
 gfiles plan show <id> --all                                  # review every file
 gfiles plan show <id> --under elrond:darren/todo/Incoming    # what it leaves there, by folder

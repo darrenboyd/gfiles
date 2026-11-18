@@ -253,6 +253,10 @@ pub struct Leftover {
 #[derive(Debug, Serialize)]
 pub struct Preview {
     pub folder: FolderRef,
+    /// Folders inside it the drain would leave out entirely.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub except: Vec<FolderRef>,
+    /// Everything cataloged in the folder, less the folders left out.
     pub total: Tally,
     /// Files with a copy elsewhere on the machine: what a drain plan removes.
     pub removable: Tally,
@@ -267,9 +271,10 @@ pub struct Preview {
 pub fn drain_preview(
     conn: &Connection,
     folder: &FolderRef,
+    except: &[FolderRef],
     limit: Option<usize>,
 ) -> Result<Preview> {
-    let built = plan::build(conn, plan::Spec::Drain(vec![folder.clone()]))?;
+    let built = plan::build(conn, plan::Spec::Drain(vec![folder.clone()]), except)?;
     let mut copies: BTreeMap<FolderRef, Tally> = BTreeMap::new();
     let mut removable = Tally::default();
     for i in &built.items {
@@ -306,9 +311,17 @@ pub fn drain_preview(
         .map(|(reason, tally)| Leftover { reason, tally })
         .collect();
     left.sort_by_key(|l| std::cmp::Reverse(l.tally.bytes));
+    let mut totals = Totals::new(conn)?;
+    let mut total = totals.of(folder)?;
+    for e in &built.except {
+        let t = totals.of(e)?;
+        total.files -= t.files;
+        total.bytes -= t.bytes;
+    }
     Ok(Preview {
-        total: Totals::new(conn)?.of(folder)?,
+        total,
         folder: folder.clone(),
+        except: built.except.clone(),
         removable,
         copies_in,
         copies_in_total,
@@ -448,6 +461,7 @@ mod tests {
         let p = drain_preview(
             &conn,
             &crate::mirror::parse_folder("elrond:darren/todo").unwrap(),
+            &[],
             None,
         )
         .unwrap();
@@ -469,5 +483,39 @@ mod tests {
         assert_eq!(p.copies_in_total, 1);
         let reasons: Vec<&str> = p.left.iter().map(|l| l.reason.as_str()).collect();
         assert_eq!(reasons, vec!["unique", "not fingerprinted yet"]);
+    }
+
+    #[test]
+    fn a_drain_preview_can_leave_out_a_folder() {
+        let conn = crate::db::open_in_memory().unwrap();
+        put(
+            &conn,
+            "elrond",
+            "darren",
+            &[
+                ("todo/Pictures/p.jpg", 10, Some(A)),
+                ("Rayla/p.jpg", 10, Some(A)),
+                ("todo/Pictures/u.jpg", 4, Some(B)),
+                ("todo/x/q.jpg", 5, Some(C)),
+                ("todo/Pictures/q.jpg", 5, Some(C)),
+            ],
+        );
+        let f = |s: &str| crate::mirror::parse_folder(s).unwrap();
+        let p = drain_preview(
+            &conn,
+            &f("elrond:darren/todo"),
+            &[f("elrond:darren/todo/Pictures")],
+            None,
+        )
+        .unwrap();
+        // Only todo/x/q.jpg is in scope; its copy in the left-out folder is the one that stays.
+        assert_eq!(p.total, Tally { files: 1, bytes: 5 });
+        assert_eq!(p.removable, Tally { files: 1, bytes: 5 });
+        assert_eq!(
+            p.copies_in[0].folder.to_string(),
+            "elrond:darren/todo/Pictures"
+        );
+        assert!(p.left.is_empty());
+        assert_eq!(p.except, vec![f("elrond:darren/todo/Pictures")]);
     }
 }

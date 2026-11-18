@@ -101,9 +101,9 @@ gfiles dupes [-k KIND] [--volume V] [--machine M] [--min-size 100M] [-n 20 | --a
 gfiles coverage [same filters] [--folder machine:volume/dir | mirror:name/dir] [--json]
 gfiles mirrors [-n 20] [--json]         # [[mirror]] health, plus suggested mirrors
 gfiles overlaps [--machine M] [-n 30 | --all] [--json]   # folder pairs sharing files, and what only each holds
-gfiles drain <machine:volume/dir> [--json]              # what draining it would free (saves nothing)
-gfiles plan drain <folder>... [--json]  # draft plan: remove files with a copy elsewhere
-gfiles plan keep <keeper> --over <folder> [--json]      # draft plan: remove what keeper holds
+gfiles drain <machine:volume/dir> [--except <dir>]... [--json]              # what draining it would free (saves nothing)
+gfiles plan drain <folder>... [--except <dir>]... [--json]  # draft plan: remove files with a copy elsewhere
+gfiles plan keep <keeper> --over <folder> [--except <dir>]... [--json]      # draft plan: remove what keeper holds
 gfiles plan list | show <id> [--under <folder>] [-n | --all] [--json]
 gfiles plan apply | undo | empty <id>   # Darren only: asks for the id on the terminal
 gfiles plan drop <id>                   # delete a draft
@@ -220,8 +220,9 @@ scratch directory, when trying the binary out, so experiments never touch the re
   catalog with `--strict-mcp-config --mcp-config <file>` and ask it a question.
 - **Cleanup plans:** only same-machine copies count; mirror files are never removed or kept,
   repos never removed. The copy that stays is outside the plan's folders when one exists, else
-  the shortest path, then alphabetical; a keep-over plan only keeps copies in its keeper. Plans
-  are stored on the hub; `apply` runs in-process for this machine and as
+  the shortest path, then alphabetical; a keep-over plan only keeps copies in its keeper.
+  `--except` folders (inside the folders files are removed from) are left out entirely, and
+  count as outside, so a copy there can be the one that stays. Plans are stored on the hub; `apply` runs in-process for this machine and as
   `ssh <apply_host> gfiles plan exec` for a remote (format in `apply`'s module doc, versioned
   by `apply::PROTOCOL`). Files go to `<volume root>/.gfiles-trash/<plan id>/files/`, which scans
   always skip; the catalog forgets them at the next scan, and until then overlaps and new plans

@@ -95,6 +95,10 @@ CREATE TABLE plan_left (
 );
 CREATE INDEX plan_left_plan ON plan_left (plan_id);
 "#,
+    r#"
+-- Folders inside a plan's folders that it leaves out entirely (JSON array, like folders).
+ALTER TABLE plans ADD COLUMN except_folders TEXT NOT NULL DEFAULT '[]';
+"#,
 ];
 
 pub fn open(path: &Path) -> Result<Connection> {

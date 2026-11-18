@@ -1357,7 +1357,7 @@ mod tests {
             &[("todo/a.jpg", 10, Some(A)), ("Photos/a.jpg", 10, Some(A))],
         );
         let folder = crate::mirror::parse_folder("elrond:darren/todo").unwrap();
-        let built = plan::build(&conn, plan::Spec::Drain(vec![folder])).unwrap();
+        let built = plan::build(&conn, plan::Spec::Drain(vec![folder]), &[]).unwrap();
         let id = plan::save(&conn, &built, 0).unwrap();
         let lock = v._tmp.path().join("actions.lock");
         let _held = Lock::take(&lock).unwrap();

@@ -135,6 +135,9 @@ enum Command {
     Drain {
         /// Like elrond:darren/todo
         folder: String,
+        /// A folder inside it to leave out entirely (repeatable)
+        #[arg(long)]
+        except: Vec<String>,
         /// Maximum folders listed as holding the copies that stay
         #[arg(short = 'n', long, default_value_t = 20)]
         limit: usize,
@@ -188,6 +191,9 @@ enum PlanCommand {
         /// Like elrond:darren/todo (all on one machine)
         #[arg(required = true)]
         folders: Vec<String>,
+        /// A folder inside them to leave out entirely (repeatable)
+        #[arg(long)]
+        except: Vec<String>,
         #[arg(long)]
         json: bool,
     },
@@ -198,6 +204,9 @@ enum PlanCommand {
         /// The folder files are removed from
         #[arg(long)]
         over: String,
+        /// A folder inside --over to leave out entirely (repeatable)
+        #[arg(long)]
+        except: Vec<String>,
         #[arg(long)]
         json: bool,
     },
@@ -491,12 +500,14 @@ fn main() -> Result<()> {
         }
         Command::Drain {
             folder,
+            except,
             limit,
             json,
         } => {
             let conn = open_for_queries(&config_path, &db_path)?;
             let folder = mirror::parse_folder(&folder)?;
-            let p = overlap::drain_preview(&conn, &folder, Some(limit))?;
+            let except = parse_folders(&except)?;
+            let p = overlap::drain_preview(&conn, &folder, &except, Some(limit))?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&p)?);
             } else {
@@ -556,19 +567,25 @@ fn plan_command(
 ) -> Result<()> {
     let lock_path = db_path.with_file_name("actions.lock");
     match cmd {
-        PlanCommand::Drain { folders, json } => {
-            let folders = folders
-                .iter()
-                .map(|f| mirror::parse_folder(f))
-                .collect::<Result<Vec<_>>>()?;
-            make_plan(config_path, db_path, Spec::Drain(folders), json)
+        PlanCommand::Drain {
+            folders,
+            except,
+            json,
+        } => {
+            let spec = Spec::Drain(parse_folders(&folders)?);
+            make_plan(config_path, db_path, spec, &parse_folders(&except)?, json)
         }
-        PlanCommand::Keep { keeper, over, json } => {
+        PlanCommand::Keep {
+            keeper,
+            over,
+            except,
+            json,
+        } => {
             let spec = Spec::Keep {
                 keeper: mirror::parse_folder(&keeper)?,
                 over: mirror::parse_folder(&over)?,
             };
-            make_plan(config_path, db_path, spec, json)
+            make_plan(config_path, db_path, spec, &parse_folders(&except)?, json)
         }
         PlanCommand::List { json } => {
             let conn = db::open(db_path)?;
@@ -638,15 +655,20 @@ fn plan_command(
     }
 }
 
+fn parse_folders(folders: &[String]) -> Result<Vec<mirror::FolderRef>> {
+    folders.iter().map(|f| mirror::parse_folder(f)).collect()
+}
+
 fn make_plan(
     config_path: &std::path::Path,
     db_path: &std::path::Path,
     spec: Spec,
+    except: &[mirror::FolderRef],
     json: bool,
 ) -> Result<()> {
     let config = Config::load(config_path)?;
     let conn = open_for_queries(config_path, db_path)?;
-    let built = plan::build(&conn, spec)?;
+    let built = plan::build(&conn, spec, except)?;
     plan::check_not_synced(&conn, &built, &config.not_synced_folders()?)?;
     let now = scan_now();
     let id = plan::save(&conn, &built, now)?;
@@ -805,7 +827,17 @@ fn print_overlaps(p: &overlap::Pairs) {
 }
 
 fn print_drain(p: &overlap::Preview) {
-    println!("{}: {}", p.folder, tally(&p.total));
+    if p.except.is_empty() {
+        println!("{}: {}", p.folder, tally(&p.total));
+    } else {
+        let except: Vec<String> = p.except.iter().map(|e| e.to_string()).collect();
+        println!(
+            "{} except {}: {}",
+            p.folder,
+            except.join(", "),
+            tally(&p.total)
+        );
+    }
     println!(
         "A drain would remove {}, whose copies stay in:",
         tally(&p.removable)
@@ -835,17 +867,22 @@ fn print_drain(p: &overlap::Preview) {
             );
         }
     }
-    println!("\nPlan it with `gfiles plan drain {}`.", p.folder);
+    let except: String = p.except.iter().map(|e| format!(" --except {e}")).collect();
+    println!("\nPlan it with `gfiles plan drain {}{except}`.", p.folder);
 }
 
 /// A plan's kind and folders, as `drain a b` or `keep a over b`.
 fn plan_folders(s: &plan::Summary) -> String {
-    format!(
+    let mut text = format!(
         "{} {}",
         s.kind,
         s.folders
             .join(if s.kind == "keep" { " over " } else { " " })
-    )
+    );
+    if !s.except.is_empty() {
+        text.push_str(&format!(" except {}", s.except.join(", ")));
+    }
+    text
 }
 
 fn print_plan(v: &plan::View) {
