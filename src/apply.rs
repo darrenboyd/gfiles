@@ -1,31 +1,45 @@
-//! Carrying out cleanup plans (see `plan`) on the machine that holds the files: moving files to
-//! the trash, undoing that, and emptying the trash. This is the only code in gfiles that
-//! writes under a volume root, and it only:
+//! Carrying out plans (see `plan`) on the machine that holds the files: moving files to the
+//! trash or to a new place, undoing that, and emptying the trash. This is the only code in
+//! gfiles that writes under a volume root, and it only:
 //!
 //! - creates and writes inside the volume's `.gfiles-trash` folder,
 //! - renames a file into it, or back out of it on undo,
+//! - moves a file to its destination (and back on undo), creating the destination's missing
+//!   folders and removing them on undo once empty,
 //! - recreates a restored file's missing parent folders on undo,
 //! - deletes a plan's files from the trash when emptying it.
 //!
-//! A plan's trash is `<volume root>/.gfiles-trash/<plan id>/`: `files/` holds each moved file
-//! at its path relative to the volume root, and `journal.jsonl` records each move (with the
-//! copy that stays). Moves are single renames that never replace anything, so a file is never
-//! copied and nothing is overwritten.
+//! A plan's trash is `<volume root>/.gfiles-trash/<plan id>/`: `files/` holds each removed
+//! file at its path relative to the volume root, and `journal.jsonl` records each change
+//! (with the copy that stays, or where a file went). Renames never replace anything.
 //!
-//! Before moving a file, the executor checks that it and the copy that stays are unchanged
-//! since the scan (size and mtime), aren't the same file, and have the same full content. Any
-//! doubt skips the file. The full hashes it reads of files that stay (kept copies, and files
-//! whose content differs) go into this machine's catalog afterwards (`record_hashes`), so the
-//! catalog stops matching files apply found different. Re-running a plan resumes it: a file already in the trash counts as
-//! moved.
+//! A removal checks that the file and the copy that stays are unchanged since the scan (size
+//! and mtime) and aren't the same file, then compares their full content, unless the list
+//! that made the plan vouched for the pair (their bytes may differ). Any doubt skips the file.
+//! The full hashes it reads of files that stay (kept copies, and files whose content differs)
+//! go into this machine's catalog afterwards (`record_hashes`), so the catalog stops matching
+//! files apply found different.
+//!
+//! A move checks the file is unchanged and nothing is at its destination, then renames it.
+//! Across filesystems a rename fails, so it copies instead: to a temporary name next to the
+//! destination, synced, read back from disk and compared by full hash, renamed into place,
+//! and then the original goes to the trash, where undo and empty find it. A copy that doesn't
+//! match is removed and the file skipped. Undo puts a copied file's original back and removes
+//! the copy only if the copy is unchanged; empty deletes the original only while the copy
+//! still has the journaled hash.
+//!
+//! Re-running a plan resumes it: a file already in the trash, or already at its destination,
+//! counts as done.
 //!
 //! The hub talks to another machine's executor through `gfiles plan exec` over SSH, a
 //! newline-delimited JSON exchange:
 //!
 //! ```text
-//! machine → hub   {"gfiles_actions":1,"machine":"elrond"}       before reading anything
-//! hub → machine   {"gfiles_actions":1,"op":"apply","plan":"<id>","volumes":[..],"items":N}
-//! hub → machine   {"seq":0,"volume_id":..,"path":..,...}         × N (apply only), then EOF
+//! machine → hub   {"gfiles_actions":2,"machine":"elrond"}       before reading anything
+//! hub → machine   {"gfiles_actions":2,"op":"apply","plan":"<id>","volumes":[..],"items":N}
+//! hub → machine   {"seq":0,"action":"remove","volume_id":..,"path":..,"keep":{..}}
+//!                 {"seq":1,"action":"move",..,"dest":{"volume_id":..,"path":..}}
+//!                                                                × N (apply only), then EOF
 //! machine → hub   {"item":{"seq":0,"moved":true}}                × N, as each is done
 //! machine → hub   {"done":{...}}                                 the totals
 //! machine → hub   {"error":"..."}                                instead, when it refuses
@@ -52,7 +66,7 @@ use crate::{fingerprint, plan, platform, store};
 
 /// Bump when the exchange changes incompatibly; both machines must then be updated together.
 /// Separate from the catalog stream's `sync::PROTOCOL`.
-pub const PROTOCOL: u32 = 1;
+pub const PROTOCOL: u32 = 2;
 
 /// The trash folder at the top of each volume. Scans always skip it.
 pub const TRASH: &str = ".gfiles-trash";
@@ -65,18 +79,52 @@ pub enum Op {
     Empty,
 }
 
-/// A file to move to the trash, and the copy that must stay.
+/// What an item does with its file.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Action {
+    /// Move it to the trash, keeping another copy.
+    #[default]
+    Remove,
+    /// Move it to another path on this machine.
+    Move,
+}
+
+/// A file to remove (move to the trash, with the copy that must stay) or to move elsewhere.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Item {
     pub seq: i64,
+    pub action: Action,
     pub volume_id: String,
     pub path: String,
     pub size: i64,
     pub mtime: i64,
-    pub keep_volume_id: String,
-    pub keep_path: String,
-    pub keep_size: i64,
-    pub keep_mtime: i64,
+    /// A removal whose content the list's producer vouches for: it may differ from the kept
+    /// copy's, so apply only checks that both are unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub vouched: bool,
+    /// A removal's copy that must stay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep: Option<Kept>,
+    /// A move's destination.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dest: Option<Dest>,
+}
+
+/// The copy that stays, as the catalog saw it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Kept {
+    pub volume_id: String,
+    pub path: String,
+    pub size: i64,
+    pub mtime: i64,
+}
+
+/// Where a move puts its file: a path that must not exist yet.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Dest {
+    pub volume_id: String,
+    pub path: String,
 }
 
 /// What happened to one item.
@@ -221,20 +269,30 @@ struct Executor<'a> {
     hashes: HashMap<(String, String), String>,
     /// Full hashes read of files that stay where they are, for the catalog.
     learned: Vec<store::Hashed>,
-    /// Each trash folder's open journal. Synced once at the end: a line lost to a crash only
-    /// makes emptying keep that file.
+    /// Each trash folder's open journal. A move's line is synced before the file moves, since
+    /// undo finds moves only through it; removals are synced once at the end, since a removal's
+    /// line lost to a crash only makes emptying keep that file (undo finds it in the trash).
     journals: HashMap<PathBuf, File>,
 }
 
 /// Why a file was skipped.
 type Skip = String;
 
-impl Executor<'_> {
+impl<'a> Executor<'a> {
     fn apply(&mut self, item: &Item) -> std::result::Result<(), Skip> {
+        match (item.action, &item.keep, &item.dest) {
+            (Action::Remove, Some(keep), None) => self.remove(item, keep),
+            (Action::Move, None, Some(dest)) => self.relocate(item, dest),
+            _ => Err("the hub sent an entry whose fields don't match its action".into()),
+        }
+    }
+
+    /// Moves a file to the trash after checking the copy that stays.
+    fn remove(&mut self, item: &Item, kept: &Kept) -> std::result::Result<(), Skip> {
         let root = self.root(&item.volume_id)?;
-        let keep_root = self.root(&item.keep_volume_id)?;
+        let keep_root = self.root(&kept.volume_id)?;
         let src = checked_path(root, &item.path)?;
-        let keep = checked_path(keep_root, &item.keep_path)?;
+        let keep = checked_path(keep_root, &kept.path)?;
         let trash = trash_dir(root, self.id).map_err(|e| format!("trash folder: {e}"))?;
         let dest = trash.join("files").join(&item.path);
 
@@ -254,73 +312,69 @@ impl Executor<'_> {
         }
         let keep_meta =
             fs::symlink_metadata(&keep).map_err(|_| "the kept copy is gone".to_string())?;
-        if !unchanged(&keep_meta, item.keep_size, item.keep_mtime) {
+        if !unchanged(&keep_meta, kept.size, kept.mtime) {
             return Err("the kept copy changed since the scan".into());
         }
         if platform::same_file(&meta, &keep_meta) {
             return Err("it and the kept copy are the same file".into());
         }
 
-        let keep_hash = match self
-            .hashes
-            .get(&(item.keep_volume_id.clone(), item.keep_path.clone()))
-        {
-            Some(h) => h.clone(),
-            None => {
-                let h = full_hash(&keep, item.keep_size, item.keep_mtime)
-                    .map_err(|e| format!("the kept copy: {e}"))?;
-                self.hashes.insert(
-                    (item.keep_volume_id.clone(), item.keep_path.clone()),
-                    h.clone(),
-                );
+        // A vouched removal's content may differ from the kept copy's by design, so there's
+        // nothing to compare; the trash and undo are its safety net.
+        let hash = if item.vouched {
+            String::new()
+        } else {
+            let keep_hash = match self
+                .hashes
+                .get(&(kept.volume_id.clone(), kept.path.clone()))
+            {
+                Some(h) => h.clone(),
+                None => {
+                    let h = full_hash(&keep, kept.size, kept.mtime)
+                        .map_err(|e| format!("the kept copy: {e}"))?;
+                    self.hashes
+                        .insert((kept.volume_id.clone(), kept.path.clone()), h.clone());
+                    self.learned.push(store::Hashed {
+                        volume_id: kept.volume_id.clone(),
+                        path: kept.path.clone(),
+                        size: kept.size,
+                        mtime: kept.mtime,
+                        hash: h.clone(),
+                    });
+                    h
+                }
+            };
+            let hash = full_hash(&src, item.size, item.mtime)?;
+            if hash != keep_hash {
+                // Remembered, so the catalog stops calling the two duplicates.
                 self.learned.push(store::Hashed {
-                    volume_id: item.keep_volume_id.clone(),
-                    path: item.keep_path.clone(),
-                    size: item.keep_size,
-                    mtime: item.keep_mtime,
-                    hash: h.clone(),
+                    volume_id: item.volume_id.clone(),
+                    path: item.path.clone(),
+                    size: item.size,
+                    mtime: item.mtime,
+                    hash,
                 });
-                h
+                return Err("its content differs from the kept copy".into());
             }
+            hash
         };
-        let hash = full_hash(&src, item.size, item.mtime)?;
-        if hash != keep_hash {
-            // Remembered, so the catalog stops calling the two duplicates.
-            self.learned.push(store::Hashed {
-                volume_id: item.volume_id.clone(),
-                path: item.path.clone(),
-                size: item.size,
-                mtime: item.mtime,
-                hash,
-            });
-            return Err("its content differs from the kept copy".into());
-        }
         // Last look at the kept copy before the move.
         match fs::symlink_metadata(&keep) {
-            Ok(m) if unchanged(&m, item.keep_size, item.keep_mtime) => {}
+            Ok(m) if unchanged(&m, kept.size, kept.mtime) => {}
             _ => return Err("the kept copy changed while checking".into()),
         }
 
-        if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent).map_err(|e| format!("creating its trash folder: {e}"))?;
-        }
-        platform::rename_no_replace(&src, &dest).map_err(|e| match e.kind() {
-            io::ErrorKind::CrossesDevices => "the trash is on another filesystem".to_string(),
-            io::ErrorKind::AlreadyExists => {
-                "a file with its name is already in the trash".to_string()
-            }
-            _ => format!("moving it to the trash: {e}"),
-        })?;
+        to_trash(&src, &dest)?;
         let entry = JournalEntry {
             path: item.path.clone(),
             size: item.size,
             mtime: item.mtime,
             hash,
-            keep_volume_id: item.keep_volume_id.clone(),
-            keep_path: item.keep_path.clone(),
-            keep_size: item.keep_size,
-            keep_mtime: item.keep_mtime,
-            at: crate::scan::unix_secs(Some(std::time::SystemTime::now())),
+            keep_volume_id: kept.volume_id.clone(),
+            keep_path: kept.path.clone(),
+            keep_size: kept.size,
+            keep_mtime: kept.mtime,
+            ..JournalEntry::new(Action::Remove, item)
         };
         // The move happened even if the journal can't be written; emptying keeps any file
         // the journal doesn't vouch for.
@@ -330,23 +384,150 @@ impl Executor<'_> {
         Ok(())
     }
 
+    /// Moves a file to its destination on this machine: a rename that never replaces anything,
+    /// or, across filesystems, a verified copy and the original to the trash.
+    fn relocate(&mut self, item: &Item, dest: &Dest) -> std::result::Result<(), Skip> {
+        let root = self.root(&item.volume_id)?;
+        let dest_root = self.root(&dest.volume_id)?;
+        let src = checked_path(root, &item.path)?;
+        let to =
+            checked_path(dest_root, &dest.path).map_err(|e| format!("its destination: {e}"))?;
+        if crate::scan::ignored_by_default(&dest.path) {
+            return Err("its destination is somewhere scans skip".into());
+        }
+        let trash = trash_dir(root, self.id).map_err(|e| format!("trash folder: {e}"))?;
+        let in_trash = trash.join("files").join(&item.path);
+
+        let meta = match fs::symlink_metadata(&src) {
+            Ok(m) => m,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                // Moved by an earlier, interrupted run of this plan?
+                return match fs::symlink_metadata(&to) {
+                    Ok(m) if unchanged(&m, item.size, item.mtime) => {
+                        self.journal_once(&trash, item, in_trash.exists());
+                        Ok(())
+                    }
+                    _ => Err("gone since the scan".into()),
+                };
+            }
+            Err(e) => return Err(format!("can't read it: {e}")),
+        };
+        if !unchanged(&meta, item.size, item.mtime) {
+            return Err("changed since the scan".into());
+        }
+        if fs::symlink_metadata(&to).is_ok() {
+            return Err("something is already at its destination".into());
+        }
+        let created =
+            make_parents(dest_root, &dest.path).map_err(|e| format!("its destination: {e}"))?;
+        let undo_folders = |why: String| {
+            remove_folders(dest_root, &created);
+            why
+        };
+        // The journal is a move's only record for undo, so its line is on disk before the
+        // file moves. A line for a move that then fails is harmless: undo finds the file still
+        // at its old path.
+        let entry = JournalEntry {
+            created: created.clone(),
+            ..JournalEntry::new(Action::Move, item)
+        };
+        self.append_journal_synced(&trash, &entry)
+            .map_err(|e| undo_folders(format!("writing the trash journal: {e}")))?;
+
+        let renamed = if force_copy() {
+            Err(io::ErrorKind::CrossesDevices.into())
+        } else {
+            platform::rename_no_replace(&src, &to)
+        };
+        match renamed {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::CrossesDevices => {
+                let hash = copy_verified(&src, &to, item, self.id).map_err(&undo_folders)?;
+                after_copy(&src);
+                // Record the copy and its hash before the original goes to the trash.
+                let entry = JournalEntry {
+                    hash,
+                    copied: true,
+                    ..entry
+                };
+                if let Err(why) = self
+                    .append_journal_synced(&trash, &entry)
+                    .map_err(|e| format!("writing the trash journal: {e}"))
+                    .and_then(|()| fs::symlink_metadata(&src).map_err(|e| e.to_string()))
+                    .and_then(|m| {
+                        if unchanged(&m, item.size, item.mtime) {
+                            Ok(())
+                        } else {
+                            Err("it changed while copying".to_string())
+                        }
+                    })
+                    .and_then(|()| to_trash(&src, &in_trash))
+                {
+                    // Take back the copy (only ours, unchanged), so the file stays in one place.
+                    if fs::symlink_metadata(&to).is_ok_and(|m| unchanged(&m, item.size, item.mtime))
+                    {
+                        let _ = fs::remove_file(&to);
+                    }
+                    return Err(undo_folders(format!("after copying it: {why}")));
+                }
+                Ok(())
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(undo_folders(
+                "something is already at its destination".into(),
+            )),
+            Err(e) => Err(undo_folders(format!("moving it: {e}"))),
+        }
+    }
+
+    /// Records a move an earlier, interrupted run made, unless its journal already has it.
+    fn journal_once(&mut self, trash: &Path, item: &Item, copied: bool) {
+        if read_journal(trash).contains_key(&item.path) {
+            return;
+        }
+        // Its hash and created folders are unknown: emptying then keeps the original, and undo
+        // leaves the folders.
+        let entry = JournalEntry {
+            copied,
+            ..JournalEntry::new(Action::Move, item)
+        };
+        if let Err(e) = self.append_journal(trash, &entry) {
+            eprintln!("warning: writing the trash journal: {e}");
+        }
+    }
+
     fn append_journal(&mut self, trash: &Path, entry: &JournalEntry) -> io::Result<()> {
+        self.journal_line(trash, entry).map(|_| ())
+    }
+
+    /// Appends a line and syncs it to disk before returning, for a move about to happen.
+    fn append_journal_synced(&mut self, trash: &Path, entry: &JournalEntry) -> io::Result<()> {
+        self.journal_line(trash, entry)?.sync_data()
+    }
+
+    fn journal_line(&mut self, trash: &Path, entry: &JournalEntry) -> io::Result<&File> {
         let path = trash.join("journal.jsonl");
         let f = match self.journals.entry(path) {
             std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
             std::collections::hash_map::Entry::Vacant(v) => {
-                let f = fs::OpenOptions::new()
+                let mut f = fs::OpenOptions::new()
                     .create(true)
+                    .read(true)
                     .append(true)
                     .open(v.key())?;
+                // A crash can leave a last line without its newline; start on a fresh line so
+                // the next one isn't glued to it.
+                if ends_mid_line(&mut f)? {
+                    f.write_all(b"\n")?;
+                }
                 v.insert(f)
             }
         };
         // One write per line, so a line is never split by a later failure.
-        f.write_all(format!("{}\n", serde_json::to_string(entry)?).as_bytes())
+        f.write_all(format!("{}\n", serde_json::to_string(entry)?).as_bytes())?;
+        Ok(f)
     }
 
-    fn root(&self, volume_id: &str) -> std::result::Result<&Path, Skip> {
+    fn root(&self, volume_id: &str) -> std::result::Result<&'a Path, Skip> {
         volume_root(self.roots, volume_id)
     }
 }
@@ -428,19 +609,249 @@ fn trash_dir(root: &Path, id: &str) -> io::Result<PathBuf> {
     Ok(dir)
 }
 
-/// One move, as recorded in the plan's `journal.jsonl`.
-#[derive(Debug, Serialize, Deserialize)]
+/// One file the plan moved, as recorded in the plan's `journal.jsonl` in the trash of the
+/// file's volume. Fields added after the first version have defaults, so older journals read
+/// as removals.
+#[derive(Debug, Default, Serialize, Deserialize)]
 struct JournalEntry {
+    #[serde(default)]
+    action: Action,
     path: String,
     size: i64,
     /// The file's mtime, which the move keeps: emptying deletes it only while it's unchanged.
     mtime: i64,
+    /// The file's full hash, when apply read it (not for a vouched removal or a rename).
+    #[serde(default)]
     hash: String,
+    /// A removal's copy that stays.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     keep_volume_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     keep_path: String,
+    #[serde(default, skip_serializing_if = "is_zero")]
     keep_size: i64,
+    #[serde(default, skip_serializing_if = "is_zero")]
     keep_mtime: i64,
+    /// A move's destination.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dest_volume_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dest_path: Option<String>,
+    /// The move copied the file across filesystems and put the original in the trash.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    copied: bool,
+    /// Folders the move created for its destination (relative to the destination's volume),
+    /// outermost first, for undo to remove.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    created: Vec<String>,
     at: i64,
+}
+
+fn is_zero(n: &i64) -> bool {
+    *n == 0
+}
+
+impl JournalEntry {
+    fn new(action: Action, item: &Item) -> JournalEntry {
+        JournalEntry {
+            action,
+            path: item.path.clone(),
+            size: item.size,
+            mtime: item.mtime,
+            dest_volume_id: item.dest.as_ref().map(|d| d.volume_id.clone()),
+            dest_path: item.dest.as_ref().map(|d| d.path.clone()),
+            at: crate::scan::unix_secs(Some(std::time::SystemTime::now())),
+            ..JournalEntry::default()
+        }
+    }
+}
+
+/// Moves `src` to `dest` in the trash, creating its folders there.
+fn to_trash(src: &Path, dest: &Path) -> std::result::Result<(), Skip> {
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("creating its trash folder: {e}"))?;
+    }
+    platform::rename_no_replace(src, dest).map_err(|e| match e.kind() {
+        io::ErrorKind::CrossesDevices => "the trash is on another filesystem".to_string(),
+        io::ErrorKind::AlreadyExists => "a file with its name is already in the trash".to_string(),
+        _ => format!("moving it to the trash: {e}"),
+    })
+}
+
+/// Creates the missing folders above `rel` (a file's path) under an existing `root`, one level
+/// at a time, refusing a level that is a symlink or a file. Returns the folders it created,
+/// outermost first; on failure it removes them again.
+fn make_parents(root: &Path, rel: &str) -> std::result::Result<Vec<String>, Skip> {
+    let parts: Vec<&str> = rel.split('/').collect();
+    let mut created = Vec::new();
+    let mut path = root.to_path_buf();
+    for i in 0..parts.len().saturating_sub(1) {
+        path.push(parts[i]);
+        let fail = |created: &[String], why: String| {
+            remove_folders(root, created);
+            why
+        };
+        match fs::symlink_metadata(&path) {
+            Ok(m) if m.is_dir() => continue,
+            Ok(_) => {
+                return Err(fail(
+                    &created,
+                    format!("{} isn't a real folder", path.display()),
+                ));
+            }
+            Err(_) => {}
+        }
+        if let Err(e) = fs::create_dir(&path) {
+            return Err(fail(&created, format!("creating {}: {e}", path.display())));
+        }
+        if !fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir()) {
+            return Err(fail(
+                &created,
+                format!("{} isn't a real folder", path.display()),
+            ));
+        }
+        created.push(parts[..=i].join("/"));
+    }
+    Ok(created)
+}
+
+/// Removes folders `make_parents` created, deepest first, as long as they're empty.
+fn remove_folders(root: &Path, created: &[String]) {
+    for rel in created.iter().rev() {
+        let _ = fs::remove_dir(root.join(rel));
+    }
+}
+
+/// Copies `src` (a file on another filesystem) to `to`, which must not exist: into a hidden
+/// partial file next to it, read back from the disk and compared in full with the source,
+/// then renamed into place without replacing anything. Returns the content's full hash. On
+/// any doubt it removes its own copy.
+fn copy_verified(
+    src: &Path,
+    to: &Path,
+    item: &Item,
+    id: &str,
+) -> std::result::Result<String, Skip> {
+    let dir = to
+        .parent()
+        .ok_or_else(|| "its destination has no folder".to_string())?;
+    let partial = dir.join(format!(".gfiles-partial-{id}-{}", item.seq));
+    // Left by an earlier, interrupted run of this plan.
+    match fs::symlink_metadata(&partial) {
+        Ok(m) if m.is_file() => fs::remove_file(&partial)
+            .map_err(|e| format!("removing an earlier partial copy: {e}"))?,
+        Ok(_) => return Err(format!("{} isn't a file gfiles made", partial.display())),
+        Err(_) => {}
+    }
+    let checked = write_copy(src, &partial, item).and_then(|()| {
+        let source = full_hash(src, item.size, item.mtime)?;
+        let copy =
+            full_hash(&partial, item.size, item.mtime).map_err(|e| format!("its copy: {e}"))?;
+        if source != copy {
+            return Err("its copy doesn't match it (a disk or copy error)".to_string());
+        }
+        Ok(source)
+    });
+    let hash = match checked {
+        Ok(h) => h,
+        Err(why) => {
+            let _ = fs::remove_file(&partial);
+            return Err(why);
+        }
+    };
+    if let Err(e) = platform::rename_no_replace(&partial, to) {
+        let _ = fs::remove_file(&partial);
+        return Err(match e.kind() {
+            io::ErrorKind::AlreadyExists => "something is already at its destination".into(),
+            _ => format!("placing its copy: {e}"),
+        });
+    }
+    // The original goes to the trash next; make sure the copy's name survives a power cut.
+    if let Err(e) = platform::sync_dir(dir) {
+        let _ = fs::remove_file(to);
+        return Err(format!("saving its copy: {e}"));
+    }
+    Ok(hash)
+}
+
+/// Writes a copy of `src` to the new file `partial`, with its permissions and mtime, synced to
+/// disk and dropped from the cache so it's read back from the disk.
+fn write_copy(src: &Path, partial: &Path, item: &Item) -> std::result::Result<(), Skip> {
+    let mut from = platform::open_no_follow(src).map_err(|e| format!("can't read it: {e}"))?;
+    let meta = from.metadata().map_err(|e| format!("can't read it: {e}"))?;
+    if !unchanged(&meta, item.size, item.mtime) {
+        return Err("changed since the scan".into());
+    }
+    let mut out = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(partial)
+        .map_err(|e| format!("creating its copy: {e}"))?;
+    let mut write = |out: &mut File| -> io::Result<u64> {
+        let n = io::copy(&mut from, out)?;
+        damage_copy(out)?;
+        out.set_permissions(meta.permissions())?;
+        out.set_modified(meta.modified()?)?;
+        out.sync_all()?;
+        Ok(n)
+    };
+    match write(&mut out) {
+        Ok(n) if n == item.size as u64 => {}
+        Ok(_) => return Err("it changed while copying".into()),
+        Err(e) => return Err(format!("copying it: {e}")),
+    }
+    platform::drop_cache(&out);
+    Ok(())
+}
+
+/// Whether `f` (open for reading) is non-empty and doesn't end with a newline.
+fn ends_mid_line(f: &mut File) -> io::Result<bool> {
+    use std::io::{Read, Seek, SeekFrom};
+    if f.metadata()?.len() == 0 {
+        return Ok(false);
+    }
+    f.seek(SeekFrom::End(-1))?;
+    let mut last = [0u8];
+    f.read_exact(&mut last)?;
+    Ok(last[0] != b'\n')
+}
+
+/// Lets a test change a file between its copy and the check that it didn't change meanwhile.
+#[cfg(not(test))]
+fn after_copy(_: &Path) {}
+
+#[cfg(test)]
+fn after_copy(src: &Path) {
+    if tests::CHANGE_AFTER_COPY.with(|c| c.get()) {
+        fs::write(src, "changed while it was copied").unwrap();
+    }
+}
+
+/// Whether moves always copy, as across filesystems: tests can't make a second filesystem.
+#[cfg(not(test))]
+fn force_copy() -> bool {
+    false
+}
+
+#[cfg(test)]
+fn force_copy() -> bool {
+    tests::FORCE_COPY.with(|c| c.get())
+}
+
+/// Lets a test damage a copy before it's checked, as a disk error would.
+#[cfg(not(test))]
+fn damage_copy(_: &mut File) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+fn damage_copy(out: &mut File) -> io::Result<()> {
+    use std::io::{Seek, SeekFrom};
+    if tests::DAMAGE_COPY.with(|c| c.get()) {
+        out.seek(SeekFrom::Start(0))?;
+        out.write_all(b"X")?;
+    }
+    Ok(())
 }
 
 fn read_journal(trash: &Path) -> HashMap<String, JournalEntry> {
@@ -522,47 +933,169 @@ fn report_unlisted(files: &Path, unlisted: usize, left: &mut Vec<String>) {
     }
 }
 
-/// Puts a plan's files back where they were. A file whose original path is taken again stays
-/// in the trash.
+/// Puts a plan's files back where they were: files in the trash, and moved files from their
+/// destination. A file whose original path is taken again stays where it is. Folders a move
+/// created are removed afterwards, once every move is undone, if they're empty.
 fn undo(roots: &HashMap<&str, &Path>, volumes: &[String], id: &str) -> Done {
     let mut done = Done::default();
+    let mut created: Vec<(&Path, String)> = Vec::new();
     for (root, dir) in trash_folders(roots, volumes, id, &mut done.left_in_trash) {
         let files = dir.join("files");
+        let journal = read_journal(&dir);
+        for entry in journal.values().filter(|e| e.action == Action::Move) {
+            if let Some(dest_root) = undo_move(roots, root, &files, entry, &mut done) {
+                created.extend(entry.created.iter().map(|c| (dest_root, c.clone())));
+            }
+        }
         let (found, unlisted) = trashed_files(&files);
         report_unlisted(&files, unlisted, &mut done.left_in_trash);
         for (in_trash, rel) in found {
+            // A copied move's original: undo_move dealt with it.
+            if journal.get(&rel).is_some_and(|e| e.action == Action::Move) {
+                continue;
+            }
             let original = root.join(&rel);
-            let fail = |why: String| format!("{}: {why}", original.display());
-            if fs::symlink_metadata(&original).is_ok() {
-                done.left_in_trash
-                    .push(fail("something else is at its path now".into()));
-                continue;
-            }
-            if let Err(e) = checked_path(root, &rel) {
-                done.left_in_trash.push(fail(e));
-                continue;
-            }
-            if let Some(parent) = original.parent()
-                && let Err(e) = fs::create_dir_all(parent)
-            {
-                done.left_in_trash
-                    .push(fail(format!("recreating its folder: {e}")));
-                continue;
-            }
-            match platform::rename_no_replace(&in_trash, &original) {
+            match restore(root, &rel, &in_trash) {
                 Ok(()) => done.restored += 1,
-                Err(e) => done
+                Err(why) => done
                     .left_in_trash
-                    .push(fail(format!("moving it back: {e}"))),
+                    .push(format!("{}: {why}", original.display())),
             }
         }
+    }
+    // Deepest first, so a folder shared by several moves goes once all of them are undone.
+    created.sort_by_key(|(_, rel)| std::cmp::Reverse(rel.matches('/').count()));
+    for (root, rel) in created {
+        let _ = fs::remove_dir(root.join(rel));
     }
     done
 }
 
+/// Moves `from` back to `rel` under `root`, recreating its folders, unless something is at
+/// that path now.
+fn restore(root: &Path, rel: &str, from: &Path) -> std::result::Result<(), Skip> {
+    let original = root.join(rel);
+    if fs::symlink_metadata(&original).is_ok() {
+        return Err("something else is at its path now".into());
+    }
+    checked_path(root, rel)?;
+    if let Some(parent) = original.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("recreating its folder: {e}"))?;
+    }
+    platform::rename_no_replace(from, &original).map_err(|e| format!("moving it back: {e}"))
+}
+
+/// Undoes one move. A renamed file goes back to its old path. A copied move's original comes
+/// back from the trash, when its copy is gone or unchanged, and then the unchanged copy is
+/// removed; an edited copy keeps both where they are. Returns the destination's volume root
+/// when the move was undone, for removing the folders it created.
+fn undo_move<'a>(
+    roots: &HashMap<&str, &'a Path>,
+    root: &Path,
+    files: &Path,
+    entry: &JournalEntry,
+    done: &mut Done,
+) -> Option<&'a Path> {
+    let original = root.join(&entry.path);
+    let mut fail = |why: String| {
+        done.left_in_trash
+            .push(format!("{}: {why}", original.display()));
+        None
+    };
+    let (Some(dest_volume), Some(dest_path)) = (&entry.dest_volume_id, &entry.dest_path) else {
+        return fail("its journal entry has no destination".into());
+    };
+    let dest_root = match volume_root(roots, dest_volume) {
+        Ok(r) => r,
+        Err(why) => {
+            return fail(format!(
+                "its destination: {}",
+                why.trim_start_matches("its ")
+            ));
+        }
+    };
+    let at = match checked_path(dest_root, dest_path) {
+        Ok(p) => p,
+        Err(why) => return fail(format!("its destination: {why}")),
+    };
+    let copy = fs::symlink_metadata(&at);
+    if !entry.copied {
+        if !copy.as_ref().is_ok_and(|m| m.is_file()) {
+            // Gone from its destination: put back already, or removed since.
+            if fs::symlink_metadata(&original).is_ok() {
+                return Some(dest_root);
+            }
+            return fail(format!("it's no longer at {}", at.display()));
+        }
+        return match restore(root, &entry.path, &at) {
+            Ok(()) => {
+                done.restored += 1;
+                Some(dest_root)
+            }
+            Err(why) => fail(format!("{why}; it stays at {}", at.display())),
+        };
+    }
+    // The copy is ours to remove only while it still holds what was copied: same size and
+    // mtime, and the full hash the move recorded (an edit can keep both size and mtime).
+    let holds_copy = |m: &fs::Metadata| {
+        unchanged(m, entry.size, entry.mtime)
+            && !entry.hash.is_empty()
+            && full_hash(&at, entry.size, entry.mtime).is_ok_and(|h| h == entry.hash)
+    };
+    let copy_kept = |at: &Path| {
+        if entry.hash.is_empty() {
+            format!(
+                "the journal has no hash to check its copy at {} against, so both stay",
+                at.display()
+            )
+        } else {
+            format!(
+                "its copy at {} changed since the move, so both stay",
+                at.display()
+            )
+        }
+    };
+    let in_trash = files.join(&entry.path);
+    if fs::symlink_metadata(&in_trash).is_err() {
+        if fs::symlink_metadata(&original).is_err() {
+            return fail(format!(
+                "it's no longer in the trash; its copy stays at {}",
+                at.display()
+            ));
+        }
+        // Restored by an earlier undo, or the move stopped before the original left: remove
+        // the copy if it's still there and still ours.
+        return match &copy {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Some(dest_root),
+            Ok(m) if holds_copy(m) => match fs::remove_file(&at) {
+                Ok(()) => Some(dest_root),
+                Err(e) => fail(format!("removing its copy at {}: {e}", at.display())),
+            },
+            _ => fail(copy_kept(&at)),
+        };
+    }
+    let copy_unchanged = match &copy {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+        Ok(m) if holds_copy(m) => true,
+        _ => return fail(format!("{} (the original in the trash)", copy_kept(&at))),
+    };
+    if let Err(why) = restore(root, &entry.path, &in_trash) {
+        return fail(format!(
+            "{why}; it stays in the trash, its copy at {}",
+            at.display()
+        ));
+    }
+    done.restored += 1;
+    if copy_unchanged && let Err(e) = fs::remove_file(&at) {
+        return fail(format!("removing its copy at {}: {e}", at.display()));
+    }
+    Some(dest_root)
+}
+
 /// Deletes a plan's files from the trash, except any that changed since the move, whose kept
 /// copy is gone or changed, or that the journal doesn't vouch for: those stay, since they may
-/// be the last copy.
+/// be the last copy. A copied move's original is deleted only when its copy reads back with
+/// the original's full hash.
 fn empty(roots: &HashMap<&str, &Path>, volumes: &[String], id: &str) -> Done {
     let mut done = Done::default();
     for (_, dir) in trash_folders(roots, volumes, id, &mut done.left_in_trash) {
@@ -585,17 +1118,8 @@ fn empty(roots: &HashMap<&str, &Path>, volumes: &[String], id: &str) -> Done {
                     .push(keep("it changed after it was moved to the trash"));
                 continue;
             }
-            let kept_ok = roots.get(entry.keep_volume_id.as_str()).is_some_and(|r| {
-                checked_path(r, &entry.keep_path).is_ok_and(|p| {
-                    fs::symlink_metadata(p)
-                        .is_ok_and(|m| unchanged(&m, entry.keep_size, entry.keep_mtime))
-                })
-            });
-            if !kept_ok {
-                done.left_in_trash.push(keep(&format!(
-                    "its kept copy {} is gone or changed",
-                    entry.keep_path
-                )));
+            if let Err(why) = other_copy_holds(roots, entry) {
+                done.left_in_trash.push(keep(&why));
                 continue;
             }
             match fs::remove_file(&in_trash) {
@@ -618,6 +1142,52 @@ fn empty(roots: &HashMap<&str, &Path>, volumes: &[String], id: &str) -> Done {
         }
     }
     done
+}
+
+/// Whether the copy that makes a trashed file safe to delete is still there: a removal's kept
+/// copy, unchanged since the scan, or a copied move's copy, reading back with the original's
+/// full hash.
+fn other_copy_holds(
+    roots: &HashMap<&str, &Path>,
+    entry: &JournalEntry,
+) -> std::result::Result<(), Skip> {
+    let at = |volume_id: &str, path: &str| {
+        roots
+            .get(volume_id)
+            .and_then(|r| checked_path(r, path).ok())
+    };
+    match entry.action {
+        Action::Remove => {
+            let ok = at(&entry.keep_volume_id, &entry.keep_path).is_some_and(|p| {
+                fs::symlink_metadata(p)
+                    .is_ok_and(|m| unchanged(&m, entry.keep_size, entry.keep_mtime))
+            });
+            if ok {
+                Ok(())
+            } else {
+                Err(format!(
+                    "its kept copy {} is gone or changed",
+                    entry.keep_path
+                ))
+            }
+        }
+        Action::Move => {
+            let dest = entry.dest_path.as_deref().unwrap_or_default();
+            let copy = entry
+                .dest_volume_id
+                .as_deref()
+                .and_then(|v| at(v, dest))
+                .ok_or_else(|| format!("its copy {dest} isn't reachable"))?;
+            let hash = full_hash(&copy, entry.size, entry.mtime)
+                .map_err(|why| format!("its copy {dest}: {why}"))?;
+            if entry.hash.is_empty() || hash != entry.hash {
+                return Err(format!(
+                    "its copy {dest} doesn't match it, or the journal has no hash to check"
+                ));
+            }
+            Ok(())
+        }
+    }
 }
 
 /// Removes an emptied plan's trash folder: its journal, then each folder, deepest first.
@@ -1010,6 +1580,16 @@ fn exchange(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Makes this thread's moves copy, as across filesystems.
+        pub(super) static FORCE_COPY: Cell<bool> = const { Cell::new(false) };
+        /// Damages this thread's copies before they're checked.
+        pub(super) static DAMAGE_COPY: Cell<bool> = const { Cell::new(false) };
+        /// Changes the source of this thread's copies once they're placed.
+        pub(super) static CHANGE_AFTER_COPY: Cell<bool> = const { Cell::new(false) };
+    }
 
     const ID: &str = "20261116-120000-abcd";
 
@@ -1053,15 +1633,48 @@ mod tests {
             let (keep_size, keep_mtime) = self.stat(keep);
             Item {
                 seq,
+                action: Action::Remove,
                 volume_id: "v1".into(),
                 path: rel.into(),
                 size,
                 mtime,
-                keep_volume_id: "v1".into(),
-                keep_path: keep.into(),
-                keep_size,
-                keep_mtime,
+                vouched: false,
+                keep: Some(Kept {
+                    volume_id: "v1".into(),
+                    path: keep.into(),
+                    size: keep_size,
+                    mtime: keep_mtime,
+                }),
+                dest: None,
             }
+        }
+
+        /// An item moving `rel` to `to` (on the same volume), as of its current state.
+        fn mv(&self, seq: i64, rel: &str, to: &str) -> Item {
+            let (size, mtime) = self.stat(rel);
+            Item {
+                seq,
+                action: Action::Move,
+                volume_id: "v1".into(),
+                path: rel.into(),
+                size,
+                mtime,
+                vouched: false,
+                keep: None,
+                dest: Some(Dest {
+                    volume_id: "v1".into(),
+                    path: to.into(),
+                }),
+            }
+        }
+
+        fn read(&self, rel: &str) -> String {
+            fs::read_to_string(self.root.join(rel)).unwrap()
+        }
+
+        fn journal(&self) -> String {
+            fs::read_to_string(self.root.join(TRASH).join(ID).join("journal.jsonl"))
+                .unwrap_or_default()
         }
 
         fn run(&self, op: Op, items: &[Item]) -> (Done, Vec<Outcome>) {
@@ -1171,7 +1784,7 @@ mod tests {
         v.write("a/keep-changed.jpg", "same");
         v.write("k/keep-changed.jpg", "same");
         let mut keep_changed = v.item(8, "a/keep-changed.jpg", "k/keep-changed.jpg");
-        keep_changed.keep_mtime -= 10;
+        keep_changed.keep.as_mut().unwrap().mtime -= 10;
         let mut other_volume = v.item(6, "k/x.jpg", "a/differs.jpg");
         other_volume.volume_id = "elsewhere".into();
         let mut escape = v.item(7, "k/x.jpg", "a/differs.jpg");
@@ -1599,7 +2212,540 @@ mod tests {
         let pull_key = "{\"t\":\"hello\",\"protocol\":2,\"machine\":\"elrond\",\"volumes\":[]}\n";
         assert!(check(pull_key).contains("pull-only key"));
         assert!(check("{\"gfiles_actions\":99,\"machine\":\"elrond\"}\n").contains("deploy"));
-        assert!(check("{\"gfiles_actions\":1,\"machine\":\"bilbo\"}\n").contains("bilbo"));
+        assert!(
+            check(&format!(
+                "{{\"gfiles_actions\":{PROTOCOL},\"machine\":\"bilbo\"}}\n"
+            ))
+            .contains("bilbo")
+        );
+        // A machine still on the first protocol, before lists, is told to update.
+        assert!(check("{\"gfiles_actions\":1,\"machine\":\"elrond\"}\n").contains("deploy"));
         assert!(check("").contains("closed"));
+    }
+
+    /// Runs `f` with this thread's moves copying, as across filesystems.
+    fn copying<T>(damage: bool, f: impl FnOnce() -> T) -> T {
+        FORCE_COPY.with(|c| c.set(true));
+        DAMAGE_COPY.with(|c| c.set(damage));
+        let out = f();
+        FORCE_COPY.with(|c| c.set(false));
+        DAMAGE_COPY.with(|c| c.set(false));
+        out
+    }
+
+    fn vouched(mut item: Item) -> Item {
+        item.vouched = true;
+        item
+    }
+
+    #[test]
+    fn a_vouched_removal_goes_to_the_trash_without_comparing_content() {
+        let v = volume();
+        v.write("todo/a.NEF", "original");
+        v.write("photo/a.NEF", "original + xmp tags");
+        let (done, outcomes) = v.run(
+            Op::Apply,
+            &[vouched(v.item(0, "todo/a.NEF", "photo/a.NEF"))],
+        );
+        assert_eq!(reasons(&outcomes), vec!["moved"]);
+        assert!(v.exists(&v.trashed("todo/a.NEF")));
+        assert!(done.hashes.is_empty(), "{:?}", done.hashes);
+        assert!(v.journal().contains("\"keep_path\":\"photo/a.NEF\""));
+        // Unvouched, the same pair is skipped.
+        v.write("todo/b.NEF", "original");
+        let (_, outcomes) = v.run(Op::Apply, &[v.item(1, "todo/b.NEF", "photo/a.NEF")]);
+        assert_eq!(
+            reasons(&outcomes),
+            vec!["its content differs from the kept copy"]
+        );
+    }
+
+    #[test]
+    fn a_vouched_removal_still_needs_its_kept_copy_unchanged_and_apart() {
+        let v = volume();
+        v.write("todo/a.NEF", "a");
+        v.write("todo/b.NEF", "b");
+        v.write("todo/c.NEF", "c");
+        v.write("photo/a.NEF", "A");
+        v.write("photo/b.NEF", "B");
+        let gone = vouched(v.item(0, "todo/a.NEF", "photo/a.NEF"));
+        let changed = vouched(v.item(1, "todo/b.NEF", "photo/b.NEF"));
+        fs::remove_file(v.root.join("photo/a.NEF")).unwrap();
+        v.write("photo/b.NEF", "B, edited");
+        fs::hard_link(v.root.join("todo/c.NEF"), v.root.join("photo/c.NEF")).unwrap();
+        let same = vouched(v.item(2, "todo/c.NEF", "photo/c.NEF"));
+        let (_, outcomes) = v.run(Op::Apply, &[gone, changed, same]);
+        assert_eq!(
+            reasons(&outcomes),
+            vec![
+                "the kept copy is gone",
+                "the kept copy changed since the scan",
+                "it and the kept copy are the same file"
+            ]
+        );
+    }
+
+    #[test]
+    fn an_item_whose_fields_dont_match_its_action_is_skipped() {
+        let v = volume();
+        v.write("todo/a.jpg", "a");
+        v.write("Photos/a.jpg", "a");
+        let mut bad = v.item(0, "todo/a.jpg", "Photos/a.jpg");
+        bad.action = Action::Move;
+        let mut no_keep = v.item(1, "todo/a.jpg", "Photos/a.jpg");
+        no_keep.keep = None;
+        let (_, outcomes) = v.run(Op::Apply, &[bad, no_keep]);
+        assert!(
+            reasons(&outcomes)
+                .iter()
+                .all(|r| r.contains("don't match its action"))
+        );
+        assert!(v.exists("todo/a.jpg"));
+    }
+
+    #[test]
+    fn a_move_renames_and_creates_its_folders() {
+        let v = volume();
+        v.write("todo/a.jpg", "a");
+        fs::create_dir(v.root.join("photo")).unwrap();
+        let item = v.mv(0, "todo/a.jpg", "photo/2013/08/13/a.jpg");
+        let (done, outcomes) = v.run(Op::Apply, std::slice::from_ref(&item));
+        assert_eq!(reasons(&outcomes), vec!["moved"]);
+        assert_eq!(done.moved, 1);
+        assert!(!v.exists("todo/a.jpg"));
+        assert_eq!(v.read("photo/2013/08/13/a.jpg"), "a");
+        let journal = v.journal();
+        assert!(
+            journal.contains("\"created\":[\"photo/2013\",\"photo/2013/08\",\"photo/2013/08/13\"]"),
+            "{journal}"
+        );
+        assert!(!journal.contains("\"copied\""), "{journal}");
+        // A rerun counts it as moved and doesn't journal it twice.
+        let (_, outcomes) = v.run(Op::Apply, &[item]);
+        assert_eq!(reasons(&outcomes), vec!["moved"]);
+        assert_eq!(v.journal().lines().count(), 1);
+    }
+
+    #[test]
+    fn a_move_never_replaces_or_follows_anything() {
+        let v = volume();
+        v.write("todo/a.jpg", "a");
+        v.write("todo/b.jpg", "b");
+        v.write("todo/c.jpg", "c");
+        v.write("photo/a.jpg", "already here");
+        let taken = v.mv(0, "todo/a.jpg", "photo/a.jpg");
+        let changed = v.mv(1, "todo/b.jpg", "photo/b.jpg");
+        v.write("todo/b.jpg", "b, edited");
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), v.root.join("linked")).unwrap();
+        let through_link = v.mv(2, "todo/c.jpg", "linked/c.jpg");
+        let (_, outcomes) = v.run(Op::Apply, &[taken, changed, through_link]);
+        let r = reasons(&outcomes);
+        assert_eq!(r[0], "something is already at its destination");
+        assert_eq!(r[1], "changed since the scan");
+        assert!(r[2].contains("isn't a real folder"), "{r:?}");
+        assert_eq!(v.read("photo/a.jpg"), "already here");
+        assert!(v.exists("todo/a.jpg") && v.exists("todo/c.jpg"));
+        assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn a_move_across_filesystems_copies_checks_and_trashes_the_original() {
+        let v = volume();
+        v.write("todo/a.jpg", "photo bytes");
+        let mtime = v.stat("todo/a.jpg").1;
+        let (_, outcomes) = copying(false, || {
+            v.run(Op::Apply, &[v.mv(0, "todo/a.jpg", "photo/2013/a.jpg")])
+        });
+        assert_eq!(reasons(&outcomes), vec!["moved"]);
+        assert_eq!(v.read("photo/2013/a.jpg"), "photo bytes");
+        assert_eq!(v.stat("photo/2013/a.jpg").1, mtime);
+        assert!(!v.exists("todo/a.jpg"));
+        assert_eq!(v.read(&v.trashed("todo/a.jpg")), "photo bytes");
+        let partials: Vec<_> = fs::read_dir(v.root.join("photo/2013"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(partials, vec![std::ffi::OsString::from("a.jpg")]);
+        let journal = v.journal();
+        assert!(journal.contains("\"copied\":true"), "{journal}");
+        assert!(journal.contains("\"hash\":\"b3:"), "{journal}");
+    }
+
+    #[test]
+    fn a_copy_that_reads_back_wrong_is_removed_and_the_original_stays() {
+        let v = volume();
+        v.write("todo/a.jpg", "photo bytes");
+        let (_, outcomes) = copying(true, || {
+            v.run(Op::Apply, &[v.mv(0, "todo/a.jpg", "photo/a.jpg")])
+        });
+        assert_eq!(
+            reasons(&outcomes),
+            vec!["its copy doesn't match it (a disk or copy error)"]
+        );
+        assert_eq!(v.read("todo/a.jpg"), "photo bytes");
+        // Its copy, and the folder made for it, are gone.
+        assert!(!v.exists("photo"));
+    }
+
+    #[test]
+    fn a_copy_whose_original_cant_go_to_the_trash_is_taken_back() {
+        let v = volume();
+        v.write("todo/a.jpg", "photo bytes");
+        v.write(&v.trashed("todo/a.jpg"), "in the way");
+        let (_, outcomes) = copying(false, || {
+            v.run(Op::Apply, &[v.mv(0, "todo/a.jpg", "photo/a.jpg")])
+        });
+        assert_eq!(
+            reasons(&outcomes),
+            vec!["after copying it: a file with its name is already in the trash"]
+        );
+        assert_eq!(v.read("todo/a.jpg"), "photo bytes");
+        assert!(!v.exists("photo"));
+    }
+
+    #[test]
+    fn undo_of_moves_puts_files_back_and_removes_the_folders_they_made() {
+        let v = volume();
+        v.write("todo/a.jpg", "a");
+        v.write("todo/b.jpg", "b");
+        v.write("todo/c.jpg", "c");
+        fs::create_dir(v.root.join("photo")).unwrap();
+        let items = [
+            v.mv(0, "todo/a.jpg", "photo/2013/08/13/a.jpg"),
+            v.mv(1, "todo/b.jpg", "photo/2013/08/14/b.jpg"),
+            v.mv(2, "todo/c.jpg", "photo/2014/c.jpg"),
+        ];
+        v.run(Op::Apply, &items);
+        v.write("photo/2014/other.txt", "not the plan's");
+        let (done, _) = v.run(Op::Undo, &[]);
+        assert_eq!(done.restored, 3, "{:?}", done.left_in_trash);
+        assert!(done.left_in_trash.is_empty(), "{:?}", done.left_in_trash);
+        assert_eq!(v.read("todo/a.jpg"), "a");
+        assert_eq!(v.read("todo/b.jpg"), "b");
+        assert!(!v.exists("photo/2013"));
+        // A folder that existed before stays, and so does one that holds something else now.
+        assert!(v.exists("photo/2014/other.txt"));
+    }
+
+    #[test]
+    fn undo_of_a_rename_leaves_a_file_whose_old_path_is_taken() {
+        let v = volume();
+        v.write("todo/a.jpg", "a");
+        v.run(Op::Apply, &[v.mv(0, "todo/a.jpg", "photo/a.jpg")]);
+        v.write("todo/a.jpg", "new");
+        let (done, _) = v.run(Op::Undo, &[]);
+        assert_eq!(done.restored, 0);
+        assert!(
+            done.left_in_trash[0].contains("something else is at its path now"),
+            "{:?}",
+            done.left_in_trash
+        );
+        assert_eq!(v.read("photo/a.jpg"), "a");
+        assert_eq!(v.read("todo/a.jpg"), "new");
+    }
+
+    #[test]
+    fn undo_of_a_copied_move_never_loses_an_edited_copy() {
+        let v = volume();
+        for f in ["a", "b", "c"] {
+            v.write(&format!("todo/{f}.jpg"), f);
+        }
+        copying(false, || {
+            v.run(
+                Op::Apply,
+                &[
+                    v.mv(0, "todo/a.jpg", "photo/a.jpg"),
+                    v.mv(1, "todo/b.jpg", "photo/b.jpg"),
+                    v.mv(2, "todo/c.jpg", "photo/c.jpg"),
+                ],
+            )
+        });
+        v.write("photo/a.jpg", "a, edited after the move");
+        fs::remove_file(v.root.join("photo/c.jpg")).unwrap();
+        let (done, _) = v.run(Op::Undo, &[]);
+        // a: both stay; b: restored and its copy removed; c: copy gone, restored.
+        assert_eq!(done.restored, 2);
+        assert_eq!(done.left_in_trash.len(), 1, "{:?}", done.left_in_trash);
+        assert!(done.left_in_trash[0].contains("changed since the move, so both stay"));
+        assert_eq!(v.read("photo/a.jpg"), "a, edited after the move");
+        assert!(v.exists(&v.trashed("todo/a.jpg")) && !v.exists("todo/a.jpg"));
+        assert_eq!(v.read("todo/b.jpg"), "b");
+        assert!(!v.exists("photo/b.jpg"));
+        assert_eq!(v.read("todo/c.jpg"), "c");
+    }
+
+    #[test]
+    fn empty_deletes_a_copied_original_only_while_its_copy_holds() {
+        let v = volume();
+        for f in ["a", "b", "c"] {
+            v.write(&format!("todo/{f}.jpg"), &format!("{f}{f}{f}"));
+        }
+        copying(false, || {
+            v.run(
+                Op::Apply,
+                &[
+                    v.mv(0, "todo/a.jpg", "photo/a.jpg"),
+                    v.mv(1, "todo/b.jpg", "photo/b.jpg"),
+                    v.mv(2, "todo/c.jpg", "photo/c.jpg"),
+                ],
+            )
+        });
+        fs::remove_file(v.root.join("photo/a.jpg")).unwrap();
+        // Same size and mtime, different bytes: only reading it shows the damage.
+        let (_, mtime) = v.stat("photo/b.jpg");
+        v.write("photo/b.jpg", "BBB");
+        let f = fs::File::options()
+            .write(true)
+            .open(v.root.join("photo/b.jpg"))
+            .unwrap();
+        f.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(mtime as u64))
+            .unwrap();
+        let (done, _) = v.run(Op::Empty, &[]);
+        assert_eq!(done.deleted, 1);
+        assert!(!v.exists(&v.trashed("todo/c.jpg")));
+        assert!(v.exists(&v.trashed("todo/a.jpg")));
+        assert!(v.exists(&v.trashed("todo/b.jpg")));
+        assert_eq!(done.left_in_trash.len(), 2, "{:?}", done.left_in_trash);
+    }
+
+    #[test]
+    fn empty_keeps_a_vouched_file_whose_kept_copy_changed() {
+        let v = volume();
+        v.write("todo/a.NEF", "a");
+        v.write("photo/a.NEF", "a + xmp");
+        v.run(
+            Op::Apply,
+            &[vouched(v.item(0, "todo/a.NEF", "photo/a.NEF"))],
+        );
+        v.write("photo/a.NEF", "a + other xmp");
+        let (done, _) = v.run(Op::Empty, &[]);
+        assert_eq!(done.deleted, 0);
+        assert!(done.left_in_trash[0].contains("is gone or changed"));
+    }
+
+    #[test]
+    fn empty_and_undo_read_a_journal_from_before_moves() {
+        let v = volume();
+        v.write("todo/a.jpg", "same");
+        v.write("Photos/a.jpg", "same");
+        v.run(Op::Apply, &[v.item(0, "todo/a.jpg", "Photos/a.jpg")]);
+        // Rewrite the journal as the first version wrote it: no action field.
+        let journal = v.root.join(TRASH).join(ID).join("journal.jsonl");
+        let (size, mtime) = v.stat(&v.trashed("todo/a.jpg"));
+        let (keep_size, keep_mtime) = v.stat("Photos/a.jpg");
+        fs::write(
+            &journal,
+            format!(
+                "{{\"path\":\"todo/a.jpg\",\"size\":{size},\"mtime\":{mtime},\"hash\":\"b3:x\",\
+                 \"keep_volume_id\":\"v1\",\"keep_path\":\"Photos/a.jpg\",\
+                 \"keep_size\":{keep_size},\"keep_mtime\":{keep_mtime},\"at\":1}}\n"
+            ),
+        )
+        .unwrap();
+        let (done, _) = v.run(Op::Empty, &[]);
+        assert_eq!(done.deleted, 1, "{:?}", done.left_in_trash);
+    }
+
+    #[test]
+    fn undo_holds_back_while_a_destination_volume_is_missing() {
+        let v = volume();
+        let mut done = Done::default();
+        let roots: HashMap<&str, &Path> = [("v1", v.root.as_path())].into();
+        let found = trash_folders(
+            &roots,
+            &["v1".into(), "v2".into()],
+            ID,
+            &mut done.left_in_trash,
+        );
+        assert!(found.is_empty());
+        assert!(
+            done.left_in_trash[0].contains("volume v2"),
+            "{:?}",
+            done.left_in_trash
+        );
+    }
+
+    fn trash_journal(v: &Vol) -> PathBuf {
+        v.root.join(TRASH).join(ID).join("journal.jsonl")
+    }
+
+    #[test]
+    fn a_move_refuses_destinations_outside_plain_places() {
+        let v = volume();
+        v.write("todo/a.jpg", "a");
+        let items = [
+            v.mv(0, "todo/a.jpg", "../a.jpg"),
+            v.mv(1, "todo/a.jpg", ".gfiles-trash/a.jpg"),
+            v.mv(2, "todo/a.jpg", ".ssh/a.jpg"),
+            v.mv(3, "todo/a.jpg", "photo/#recycle/a.jpg"),
+            v.mv(4, "todo/a.jpg", "photo/@eaDir/a.jpg"),
+        ];
+        let (_, outcomes) = v.run(Op::Apply, &items);
+        let r = reasons(&outcomes);
+        assert!(
+            r[..2].iter().all(|r| r.starts_with("its destination: ")),
+            "{r:?}"
+        );
+        assert!(r[2..].iter().all(|r| r.contains("scans skip")), "{r:?}");
+        assert_eq!(v.read("todo/a.jpg"), "a");
+        assert!(!v.exists(".ssh") && !v.exists("photo"));
+        assert!(!v.root.parent().unwrap().join("a.jpg").exists());
+    }
+
+    #[test]
+    fn a_copy_whose_source_changes_while_copying_is_taken_back() {
+        let v = volume();
+        v.write("todo/a.jpg", "photo bytes");
+        let item = v.mv(0, "todo/a.jpg", "photo/2013/a.jpg");
+        CHANGE_AFTER_COPY.with(|c| c.set(true));
+        let (_, outcomes) = copying(false, || v.run(Op::Apply, &[item]));
+        CHANGE_AFTER_COPY.with(|c| c.set(false));
+        assert_eq!(
+            reasons(&outcomes),
+            vec!["after copying it: it changed while copying"]
+        );
+        assert_eq!(v.read("todo/a.jpg"), "changed while it was copied");
+        assert!(!v.exists("photo"));
+        assert!(!v.exists(&v.trashed("todo/a.jpg")));
+    }
+
+    #[test]
+    fn a_copy_keeps_the_mode_and_mtime_of_the_original() {
+        use std::os::unix::fs::PermissionsExt;
+        let v = volume();
+        v.write("todo/a.jpg", "photo bytes");
+        let src = v.root.join("todo/a.jpg");
+        fs::set_permissions(&src, fs::Permissions::from_mode(0o640)).unwrap();
+        let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+        fs::File::options()
+            .write(true)
+            .open(&src)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let item = v.mv(0, "todo/a.jpg", "photo/a.jpg");
+        let (_, outcomes) = copying(false, || v.run(Op::Apply, &[item]));
+        assert_eq!(reasons(&outcomes), vec!["moved"]);
+        let m = fs::metadata(v.root.join("photo/a.jpg")).unwrap();
+        assert_eq!(m.modified().unwrap(), old);
+        assert_eq!(m.permissions().mode() & 0o777, 0o640);
+    }
+
+    #[test]
+    fn a_rerun_journals_a_move_whose_journal_line_was_lost() {
+        let v = volume();
+        v.write("todo/a.jpg", "a");
+        v.write("todo/b.jpg", "b");
+        let renamed = v.mv(0, "todo/a.jpg", "photo/a.jpg");
+        let copied = v.mv(1, "todo/b.jpg", "photo/b.jpg");
+        v.run(Op::Apply, std::slice::from_ref(&renamed));
+        copying(false, || v.run(Op::Apply, std::slice::from_ref(&copied)));
+        fs::remove_file(trash_journal(&v)).unwrap();
+        let (_, outcomes) = v.run(Op::Apply, &[renamed, copied]);
+        assert_eq!(reasons(&outcomes), vec!["moved", "moved"]);
+        let journal = v.journal();
+        assert_eq!(journal.lines().count(), 2, "{journal}");
+        assert!(journal.contains("\"path\":\"todo/a.jpg\""), "{journal}");
+        assert!(
+            journal
+                .lines()
+                .any(|l| l.contains("todo/b.jpg") && l.contains("\"copied\":true")),
+            "{journal}"
+        );
+        // Undo puts the renamed file back. The copied one's journal line has no hash, so its
+        // copy can't be told unchanged: both stay.
+        let (done, _) = v.run(Op::Undo, &[]);
+        assert_eq!(v.read("todo/a.jpg"), "a");
+        assert_eq!(done.restored, 1, "{:?}", done.left_in_trash);
+        assert!(
+            done.left_in_trash[0].contains("no hash"),
+            "{:?}",
+            done.left_in_trash
+        );
+        assert!(v.exists("photo/b.jpg") && v.exists(&v.trashed("todo/b.jpg")));
+    }
+
+    #[test]
+    fn a_move_whose_journal_cant_be_written_is_skipped_before_it_moves() {
+        let v = volume();
+        v.write("todo/a.jpg", "a");
+        fs::create_dir_all(trash_journal(&v)).unwrap();
+        let (_, outcomes) = v.run(Op::Apply, &[v.mv(0, "todo/a.jpg", "photo/2013/a.jpg")]);
+        let r = reasons(&outcomes);
+        assert!(r[0].starts_with("writing the trash journal"), "{r:?}");
+        assert_eq!(v.read("todo/a.jpg"), "a");
+        assert!(!v.exists("photo"));
+    }
+
+    #[test]
+    fn undo_of_a_move_that_never_happened_changes_nothing() {
+        let v = volume();
+        v.write("todo/a.jpg", "a");
+        v.run(Op::Apply, &[v.mv(0, "todo/a.jpg", "photo/2013/a.jpg")]);
+        // As if the run stopped after its journal line, before the rename.
+        fs::rename(v.root.join("photo/2013/a.jpg"), v.root.join("todo/a.jpg")).unwrap();
+        let (done, _) = v.run(Op::Undo, &[]);
+        assert!(done.left_in_trash.is_empty(), "{:?}", done.left_in_trash);
+        assert_eq!(v.read("todo/a.jpg"), "a");
+        assert!(!v.exists("photo"));
+    }
+
+    #[test]
+    fn undo_keeps_a_copy_edited_without_changing_its_size_or_mtime() {
+        let v = volume();
+        v.write("todo/a.jpg", "photo bytes");
+        copying(false, || {
+            v.run(Op::Apply, &[v.mv(0, "todo/a.jpg", "photo/a.jpg")])
+        });
+        let (_, mtime) = v.stat("photo/a.jpg");
+        v.write("photo/a.jpg", "PHOTO BYTES");
+        fs::File::options()
+            .write(true)
+            .open(v.root.join("photo/a.jpg"))
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(mtime as u64))
+            .unwrap();
+        let (done, _) = v.run(Op::Undo, &[]);
+        assert_eq!(done.restored, 0);
+        assert!(
+            done.left_in_trash[0].contains("changed since the move, so both stay"),
+            "{:?}",
+            done.left_in_trash
+        );
+        assert_eq!(v.read("photo/a.jpg"), "PHOTO BYTES");
+        assert!(v.exists(&v.trashed("todo/a.jpg")));
+    }
+
+    #[test]
+    fn undo_removes_a_copy_whose_original_never_left() {
+        let v = volume();
+        v.write("todo/a.jpg", "photo bytes");
+        copying(false, || {
+            v.run(Op::Apply, &[v.mv(0, "todo/a.jpg", "photo/2013/a.jpg")])
+        });
+        // As if the run stopped after recording the copy, before the original went to the
+        // trash.
+        fs::rename(
+            v.root.join(v.trashed("todo/a.jpg")),
+            v.root.join("todo/a.jpg"),
+        )
+        .unwrap();
+        let (done, _) = v.run(Op::Undo, &[]);
+        assert!(done.left_in_trash.is_empty(), "{:?}", done.left_in_trash);
+        assert_eq!(v.read("todo/a.jpg"), "photo bytes");
+        assert!(!v.exists("photo"));
+    }
+
+    #[test]
+    fn a_torn_last_journal_line_doesnt_swallow_the_next() {
+        let v = volume();
+        v.write("todo/a.jpg", "a");
+        fs::create_dir_all(trash_journal(&v).parent().unwrap()).unwrap();
+        fs::write(trash_journal(&v), "{\"path\":\"todo/x").unwrap();
+        v.run(Op::Apply, &[v.mv(0, "todo/a.jpg", "photo/a.jpg")]);
+        let (done, _) = v.run(Op::Undo, &[]);
+        assert_eq!(done.restored, 1, "{:?}", done.left_in_trash);
+        assert_eq!(v.read("todo/a.jpg"), "a");
     }
 }

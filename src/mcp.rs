@@ -4,8 +4,8 @@
 //! The protocol layer is written by hand: newline-delimited JSON-RPC 2.0 with just the methods
 //! a tools-only server needs (`initialize`, `ping`, `tools/list`, `tools/call`). That keeps the
 //! crate synchronous, with no async runtime. Stdout carries protocol messages only; anything
-//! else goes to stderr. Every tool is read-only, except that `draft_cleanup_plan` saves a draft
-//! plan in the catalog. No tool touches files: only Darren applies a plan, at his terminal.
+//! else goes to stderr. Every tool is read-only, except that `draft_cleanup_plan` and
+//! `draft_plan_from_list` save a draft plan in the catalog. No tool touches files: only Darren applies a plan, at his terminal.
 
 use std::io::{BufRead, Write};
 
@@ -28,6 +28,10 @@ const SEARCH_MAX_LIMIT: usize = 500;
 const FOLDERS_DEFAULT_LIMIT: usize = 30;
 const GROUPS_DEFAULT_LIMIT: usize = 20;
 const MIRROR_LIST_LIMIT: usize = 50;
+/// Entries `draft_plan_from_list` takes inline; longer lists come as a file.
+const LIST_INLINE_MAX: usize = 1000;
+/// The biggest list file `draft_plan_from_list` reads.
+const LIST_FILE_MAX: u64 = 64 * 1024 * 1024;
 
 const INSTRUCTIONS: &str = "\
 gfiles is a catalog of the user's own files (not system files) across all their machines. \
@@ -47,7 +51,12 @@ are probable, and apply compares full contents before moving each. Use find_dupl
 wasted space, backup_coverage for files with no copy on another machine, and mirror_health to \
 see whether mirrors are in sync. To reclaim duplicate space on one machine: folder_overlaps finds folder \
 pairs holding the same files, drain_preview shows what emptying a folder would free and what \
-would stay, and draft_cleanup_plan saves a reviewable plan. Tools never move or delete files: \
+would stay, and draft_cleanup_plan saves a reviewable plan. When you have worked out what \
+should change yourself (files to file into another folder, or copies that hold the same thing \
+in different bytes, like a photo whose metadata a photo manager rewrote), draft_plan_from_list \
+saves your list of moves and removals as a plan, with any entry it rejects and why. Mark a \
+removal vouched, with a reason, only when you know the two files hold the same thing although \
+their bytes differ: apply then doesn't compare their content. Tools never move or delete files: \
 the user applies a plan themselves with `gfiles plan apply <id>` at a terminal. Applying moves \
 files to a trash folder on their volume, where `gfiles plan undo` can put them back until \
 `gfiles plan empty` deletes them for good. Plans go draft, applying, applied, then undone or \
@@ -136,6 +145,7 @@ const TOOLS: &[&str] = &[
     "folder_overlaps",
     "drain_preview",
     "draft_cleanup_plan",
+    "draft_plan_from_list",
     "list_cleanup_plans",
     "show_cleanup_plan",
 ];
@@ -188,6 +198,7 @@ fn handle_request(
                 "folder_overlaps" => folder_overlaps(conn, &args),
                 "drain_preview" => drain_preview(conn, &args),
                 "draft_cleanup_plan" => draft_cleanup_plan(conn, config, &args),
+                "draft_plan_from_list" => draft_plan_from_list(conn, config, &args),
                 "list_cleanup_plans" => Ok(json!({"plans": plan::list(conn)?})),
                 "show_cleanup_plan" => show_cleanup_plan(conn, &args),
                 _ => mirror_health(conn, &args),
@@ -375,6 +386,36 @@ fn tool_definitions() -> Value {
                 "idempotentHint": false},
         },
         {
+            "name": "draft_plan_from_list",
+            "title": "Draft a plan from a list of moves and removals",
+            "description": "Saves a draft plan from a list you worked out, for the user to \
+                review and apply; it moves no files. Each entry is either {\"remove\": file, \
+                \"keep\": file} (remove a file, naming the copy that stays) or {\"move\": file, \
+                \"to\": path} (move a file to a path that doesn't exist yet, on the same \
+                machine). Files are machine:volume/path, with the machine, volume and path \
+                search results give; all entries are on one machine. Add \"reason\" to say why. \
+                A removal is checked: unless \"vouched\": true (which needs a reason), the \
+                catalog must not show the two files differ, and apply compares their full \
+                content. Vouch only when you know they hold the same thing in different bytes. \
+                Entries that fail a check are counted in `rejected` and listed, with the \
+                reason, in `rejected_entries`; the rest make the plan. Pass `entries` (up to 1000) or, for a longer list, `file`: the \
+                path of a JSON-lines file (one entry per line) on this machine. Tell the user \
+                to review it with `gfiles plan show <id>` and apply it themselves with \
+                `gfiles plan apply <id>`; never run it for them.",
+            "inputSchema": {"type": "object", "properties": {
+                "entries": {"type": "array", "items": {"type": "object", "properties": {
+                    "remove": {"type": "string"}, "keep": {"type": "string"},
+                    "move": {"type": "string"}, "to": {"type": "string"},
+                    "vouched": {"type": "boolean"}, "reason": {"type": "string"}}},
+                    "description": "The moves and removals, in order."},
+                "file": {"type": "string",
+                    "description": "Absolute path of a JSON-lines list on this machine, \
+                        instead of entries."},
+            }},
+            "annotations": {"readOnlyHint": false, "destructiveHint": false,
+                "idempotentHint": false},
+        },
+        {
             "name": "list_cleanup_plans",
             "title": "List cleanup plans",
             "description": "Every cleanup plan, newest first, with its state (draft, \
@@ -483,6 +524,70 @@ fn draft_cleanup_plan(conn: &Connection, config: Option<&Config>, args: &Value) 
         _ => anyhow::bail!("pass either drain (a list of folders) or both keep and over"),
     };
     let built = plan::build(conn, spec, &except)?;
+    let not_synced = config
+        .map(Config::not_synced_folders)
+        .transpose()?
+        .unwrap_or_default();
+    plan::check_not_synced(conn, &built, &not_synced).map_err(|e| {
+        e.context(
+            "Only the user knows whether a sync tool manages these folders. Ask them; they \
+             edit the hub's config themselves. Don't change the config for them",
+        )
+    })?;
+    let now = crate::scan::unix_secs(Some(std::time::SystemTime::now()));
+    let id = plan::save(conn, &built, now)?;
+    let mut view = serde_json::to_value(plan::show(conn, &id, Some(SEARCH_DEFAULT_LIMIT), None)?)?;
+    view["next_step"] = json!(format!(
+        "Saved as a draft; nothing has moved. The user reviews it with `gfiles plan show {id}` \
+         and applies it themselves with `gfiles plan apply {id}`, or deletes it with \
+         `gfiles plan drop {id}`."
+    ));
+    Ok(view)
+}
+
+fn draft_plan_from_list(conn: &Connection, config: Option<&Config>, args: &Value) -> Result<Value> {
+    let list = match (args.get("entries"), string_arg(args, "file")?) {
+        (Some(Value::Array(entries)), None) => {
+            if entries.len() > LIST_INLINE_MAX {
+                anyhow::bail!(
+                    "{} entries is more than {LIST_INLINE_MAX} inline; write them to a JSON-lines \
+                     file (one entry per line) and pass its path as `file`",
+                    entries.len()
+                );
+            }
+            entries
+                .iter()
+                .map(|e| serde_json::to_string(e).map_err(Into::into))
+                .collect::<Result<Vec<_>>>()?
+                .join("\n")
+        }
+        (None, Some(file)) => {
+            let path = std::path::Path::new(&file);
+            if !path.is_absolute() {
+                anyhow::bail!("file must be an absolute path, got {file:?}");
+            }
+            let reading = |e: std::io::Error| anyhow::anyhow!("reading {file}: {e}");
+            if !std::fs::metadata(path).map_err(reading)?.is_file() {
+                anyhow::bail!("{file} isn't a regular file");
+            }
+            // The cap holds even if the file grows, or isn't what its size says, while it's read.
+            let mut text = String::new();
+            std::io::Read::read_to_string(
+                &mut std::io::Read::take(
+                    std::fs::File::open(path).map_err(reading)?,
+                    LIST_FILE_MAX + 1,
+                ),
+                &mut text,
+            )
+            .map_err(reading)?;
+            if text.len() as u64 > LIST_FILE_MAX {
+                anyhow::bail!("{file} is bigger than {} MB", LIST_FILE_MAX / 1024 / 1024);
+            }
+            text
+        }
+        _ => anyhow::bail!("pass either entries (a list) or file (a path), not both"),
+    };
+    let built = crate::listplan::build(conn, &list)?;
     let not_synced = config
         .map(Config::not_synced_folders)
         .transpose()?
@@ -702,6 +807,7 @@ mod tests {
                 "folder_overlaps",
                 "drain_preview",
                 "draft_cleanup_plan",
+                "draft_plan_from_list",
                 "list_cleanup_plans",
                 "show_cleanup_plan"
             ]
@@ -767,6 +873,76 @@ mod tests {
                 "{r}"
             );
         }
+    }
+
+    #[test]
+    fn a_plan_drafted_from_a_list() {
+        use crate::plan::tests::{A, B, put};
+        let conn = db::open_in_memory().unwrap();
+        put(
+            &conn,
+            "elrond",
+            "darren",
+            &[
+                ("todo/a.NEF", 10, Some(A)),
+                ("todo/new.JPG", 5, Some(B)),
+                ("photo/a.NEF", 12, Some(B)),
+            ],
+        );
+        let r = call_tool(
+            &conn,
+            "draft_plan_from_list",
+            json!({"entries": [
+                {"remove": "elrond:darren/todo/a.NEF", "keep": "elrond:darren/photo/a.NEF",
+                 "vouched": true, "reason": "same shot; XMP added"},
+                {"move": "elrond:darren/todo/new.JPG", "to": "elrond:darren/photo/2013/new.JPG"},
+                {"move": "elrond:darren/todo/gone.JPG", "to": "elrond:darren/photo/gone.JPG"},
+            ]}),
+        );
+        assert_eq!(r["isError"], false, "{r}");
+        let c = &r["structuredContent"];
+        assert_eq!(c["kind"], "list", "{r}");
+        assert_eq!(c["vouched"]["files"], 1);
+        assert_eq!(c["moves"]["files"], 1);
+        assert_eq!(c["rejected"], 1, "{r}");
+        assert_eq!(c["rejected_entries"][0]["line"], 3);
+        assert!(
+            c["next_step"]
+                .as_str()
+                .unwrap()
+                .contains("gfiles plan apply")
+        );
+
+        for (args, says) in [
+            (json!({}), "either entries"),
+            (json!({"file": "relative.jsonl"}), "absolute"),
+            (json!({"file": "/dev/zero"}), "isn't a regular file"),
+            (json!({"entries": vec![json!({}); 1001]}), "JSON-lines file"),
+            (
+                json!({"entries": [{"move": "elrond:darren/nope", "to": "elrond:darren/x"}]}),
+                "no entry of the list is valid",
+            ),
+        ] {
+            let r = call_tool(&conn, "draft_plan_from_list", args);
+            assert_eq!(r["isError"], true, "{r}");
+            assert!(
+                r["content"][0]["text"].as_str().unwrap().contains(says),
+                "{says}: {r}"
+            );
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("list.jsonl");
+        std::fs::write(
+            &file,
+            "{\"move\": \"elrond:darren/todo/new.JPG\", \"to\": \"elrond:darren/n.JPG\"}\n",
+        )
+        .unwrap();
+        let r = call_tool(
+            &conn,
+            "draft_plan_from_list",
+            json!({"file": file.to_str().unwrap()}),
+        );
+        assert_eq!(r["structuredContent"]["moves"]["files"], 1, "{r}");
     }
 
     #[test]

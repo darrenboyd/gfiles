@@ -330,6 +330,87 @@ fn plan_apply_undo_and_empty_on_this_machine() {
 
 #[test]
 #[cfg(target_os = "linux")]
+fn a_plan_from_a_list_moves_and_removes_then_undoes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("darren");
+    fs::create_dir_all(root.join("todo")).unwrap();
+    fs::create_dir_all(root.join("photo/2007")).unwrap();
+    fs::write(root.join("todo/a.NEF"), "raw a").unwrap();
+    fs::write(root.join("photo/2007/a.NEF"), "raw a, tagged").unwrap();
+    fs::write(root.join("todo/new.JPG"), "new photo").unwrap();
+    let envs = [
+        (
+            "GFILES_CONFIG",
+            tmp.path().join("config.toml").display().to_string(),
+        ),
+        (
+            "GFILES_DB",
+            tmp.path().join("catalog.db").display().to_string(),
+        ),
+    ];
+    let gfiles = || {
+        let mut cmd = Command::cargo_bin("gfiles").unwrap();
+        cmd.envs(envs.iter().map(|(k, v)| (*k, v.clone())));
+        cmd
+    };
+    fs::write(tmp.path().join("config.toml"), "machine = \"elrond\"\n").unwrap();
+    gfiles()
+        .args(["volume", "add"])
+        .arg(&root)
+        .assert()
+        .success();
+    gfiles().arg("scan").assert().success();
+
+    let list = r#"{"remove": "elrond:darren/todo/a.NEF", "keep": "elrond:darren/photo/2007/a.NEF", "vouched": true, "reason": "same shot, tagged"}
+{"move": "elrond:darren/todo/new.JPG", "to": "elrond:darren/photo/2013/08/new.JPG", "reason": "taken 2013-08"}
+{"move": "elrond:darren/todo/gone.JPG", "to": "elrond:darren/photo/gone.JPG"}
+"#;
+    let out = gfiles()
+        .args(["plan", "import", "-"])
+        .write_stdin(list)
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(text.contains("vouched"), "{text}");
+    assert!(text.contains("-> /"), "{text}");
+    assert!(
+        text.contains("line 3: elrond:darren/todo/gone.JPG is not in the catalog"),
+        "{text}"
+    );
+    let out = gfiles().args(["plan", "list", "--json"]).output().unwrap();
+    let plans: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let id = plans[0]["id"].as_str().unwrap().to_string();
+    assert_eq!(plans[0]["kind"], "list");
+
+    let out = under_pty(&envs, &format!("plan apply {id}"), &id);
+    assert!(out.contains("vouched for"), "{out}");
+    assert!(out.contains("Moved 2 files, skipped 0"), "{out}");
+    assert!(!root.join("todo/a.NEF").exists());
+    assert_eq!(
+        fs::read_to_string(root.join("photo/2013/08/new.JPG")).unwrap(),
+        "new photo"
+    );
+
+    let out = under_pty(&envs, &format!("plan undo {id}"), &id);
+    assert!(out.contains("Put back 2 files"), "{out}");
+    assert_eq!(
+        fs::read_to_string(root.join("todo/a.NEF")).unwrap(),
+        "raw a"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("todo/new.JPG")).unwrap(),
+        "new photo"
+    );
+    assert!(!root.join("photo/2013").exists());
+}
+
+#[test]
+#[cfg(target_os = "linux")]
 fn plan_apply_runs_on_a_remote_over_ssh() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -435,4 +516,25 @@ fn plan_apply_runs_on_a_remote_over_ssh() {
         )
         .unwrap();
     assert!(hash.is_some_and(|h| h.starts_with("b3:")));
+
+    // A list's move runs on the NAS the same way, creating its folders there.
+    fs::write(root.join("Photos/new.jpg"), "new").unwrap();
+    nas(&["scan"]).assert().success();
+    hub().arg("pull").assert().success();
+    hub()
+        .args(["plan", "import", "-"])
+        .write_stdin(
+            "{\"move\": \"elrond:darren/Photos/new.jpg\", \"to\": \"elrond:darren/Photos/2013/new.jpg\"}\n",
+        )
+        .assert()
+        .success();
+    let out = hub().args(["plan", "list", "--json"]).output().unwrap();
+    let plans: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let id = plans[0]["id"].as_str().unwrap().to_string();
+    let out = under_pty(&envs, &format!("plan apply {id}"), &id);
+    assert!(out.contains("Moved 1 files, skipped 0"), "{out}");
+    assert_eq!(
+        fs::read_to_string(root.join("Photos/2013/new.jpg")).unwrap(),
+        "new"
+    );
 }

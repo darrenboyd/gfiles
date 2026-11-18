@@ -5,6 +5,7 @@ pub mod db;
 pub mod dupes;
 pub mod fingerprint;
 pub mod fmt;
+pub mod listplan;
 pub mod mcp;
 pub mod mirror;
 pub mod overlap;

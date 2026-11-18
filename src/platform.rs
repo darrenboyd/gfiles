@@ -150,6 +150,37 @@ pub fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
     }
 }
 
+/// Asks the kernel to drop `file`'s cached pages, so the next read comes from the disk rather
+/// than from the buffers just written: a check that reads a copy back then sees what was
+/// stored. The file should be synced first (only clean pages are dropped). Linux only;
+/// elsewhere it does nothing, and the read-back may come from the cache.
+pub fn drop_cache(file: &File) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        // Advisory: a failure only means the read may come from the cache.
+        unsafe {
+            libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = file;
+}
+
+/// Makes the entries of folder `dir` (a file just renamed into it) durable. Unix only;
+/// elsewhere it does nothing.
+pub fn sync_dir(dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        File::open(dir)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
+    }
+}
+
 /// Takes an exclusive lock on `file`, without waiting. `Ok(false)` when another process
 /// holds it. The lock goes away with the process, so a crash never leaves it stuck.
 pub fn try_lock(file: &File) -> io::Result<bool> {

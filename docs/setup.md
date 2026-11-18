@@ -202,6 +202,39 @@ that look synced (ones `gfiles mirrors` suggests, or inside `Dropbox`, `OneDrive
   them expire.
 - Files owned by another DSM user can't be moved and are skipped.
 
+## Plans from a list
+
+When another tool (a script, or an AI agent using the MCP server) works out what should
+change, for reasons gfiles can't see, it can hand gfiles a list. Two cases gfiles can't
+decide alone: a photo whose metadata Digikam rewrote is the same shot in different bytes, and
+a new photo belongs in `photo/YYYY/MM/DD` by its capture date. The list is JSON lines, one
+entry per line, all on one machine:
+
+```text
+{"remove": "elrond:darren/todo/a.NEF", "keep": "elrond:photo/2007/12/31/a.NEF", "vouched": true, "reason": "same shot; XMP added"}
+{"remove": "elrond:darren/todo/b.JPG", "keep": "elrond:photo/2008/b.JPG"}
+{"move": "elrond:darren/todo/new.JPG", "to": "elrond:photo/2013/08/13/new.JPG", "reason": "taken 2013-08-13"}
+```
+
+```bash
+gfiles plan import list.jsonl        # or - for stdin; prints the draft and any rejected lines
+gfiles plan show <id> --all          # review it, then apply, undo and empty as above
+```
+
+A removal without `vouched` is checked like a drain: apply compares its full content with the
+copy that stays. A vouched removal (it needs a `reason`) skips only that comparison, so vouch
+only for pairs you trust; `plan show` and the apply prompt count them separately. Entries
+that fail a check (not cataloged, in a mirror, a destination that's taken or in a hidden or
+ignored folder, ...) are listed
+with their line and reason; the rest still make the plan.
+
+A move renames the file, creating the destination's folders. Across filesystems (two shares
+on the NAS are often one volume, but not always), it copies the file, reads the copy back to
+compare it, and then moves the original to the trash: the destination needs room for the
+copies until `empty`. Undo puts the originals back, keeping a copy you've edited since.
+
+Deploy both machines before the first list plan on the NAS (the plan protocol changed).
+
 ## Mirrors
 
 A mirror is a folder that a sync tool keeps the same on several machines, like Google Drive

@@ -81,7 +81,9 @@ Windows is out of scope for now, but don't make it impossible:
    together before the first NAS plan.
 6. **Classify and tag:** metadata extraction (EXIF, ID3, EPUB title and author) and Darren's own
    tags.
-7. **More actions:** move, rename and copy through plan, apply and undo.
+7. **More actions:** moves and vouched removals from a supplied list (`plan import`,
+   `draft_plan_from_list`): code done; deploy both machines together (`apply::PROTOCOL` 2).
+   Rename and copy through plan, apply and undo are still to come.
 
 ## Commands
 
@@ -104,6 +106,7 @@ gfiles overlaps [--machine M] [-n 30 | --all] [--json]   # folder pairs sharing 
 gfiles drain <machine:volume/dir> [--except <dir>]... [--json]              # what draining it would free (saves nothing)
 gfiles plan drain <folder>... [--except <dir>]... [--json]  # draft plan: remove files with a copy elsewhere
 gfiles plan keep <keeper> --over <folder> [--except <dir>]... [--json]      # draft plan: remove what keeper holds
+gfiles plan import <list.jsonl | -> [--json]  # draft plan from another tool's list of moves and removals
 gfiles plan list | show <id> [--under <folder>] [-n | --all] [--json]
 gfiles plan apply | undo | empty <id>   # Darren only: asks for the id on the terminal
 gfiles plan drop <id>                   # delete a draft
@@ -148,9 +151,12 @@ scratch directory, when trying the binary out, so experiments never touch the re
   exist (`copies`) and in how many places (`places`, as backup coverage counts them).
 - `src/overlap.rs`: folder pairs that share content on one machine, and drain previews.
 - `src/plan.rs`: building cleanup plans (which copy stays, what's left and why), the
-  synced-folder refusal, and plan storage (`plans`, `plan_items`, `plan_left`).
-- `src/apply.rs`: the only code that writes under a volume root: moves to the trash, undo,
-  empty, the per-machine lock, and the `plan exec` exchange the hub runs over SSH.
+  synced-folder refusal, and plan storage (`plans`, `plan_items`, `plan_left`,
+  `plan_rejected`).
+- `src/listplan.rs`: plans from a supplied list (JSON lines of removals and moves): parsing
+  and checking each entry against the catalog, and rejecting the ones that fail.
+- `src/apply.rs`: the only code that writes under a volume root: moves to the trash and to
+  a list's destinations, undo, empty, the per-machine lock, and the `plan exec` exchange the hub runs over SSH.
 - `src/fmt.rs`: sizes and dates for display (dates are UTC, computed without a date crate).
 - `src/tui/`: `app.rs` holds state and key handling, `ui.rs` draws it, `mod.rs` runs the loop.
   Test behavior through `App::handle_key` and layout through ratatui's `TestBackend`, not a
@@ -159,9 +165,9 @@ scratch directory, when trying the binary out, so experiments never touch the re
   runtime) because a tools-only server needs just `initialize`, `ping`, `tools/list` and
   `tools/call`. Tools: `catalog_overview`, `file_locations` (matches grouped by folder, for
   "where are my X?"), `search_files`, `find_duplicates`, `backup_coverage`, `mirror_health`,
-  `folder_overlaps`, `drain_preview`, `draft_cleanup_plan`, `list_cleanup_plans`,
-  `show_cleanup_plan`. All read-only, except that `draft_cleanup_plan` saves a draft plan in
-  the catalog; none touches files.
+  `folder_overlaps`, `drain_preview`, `draft_cleanup_plan`, `draft_plan_from_list`,
+  `list_cleanup_plans`, `show_cleanup_plan`. All read-only, except that the two draft tools
+  save a draft plan in the catalog; none touches files.
 
 ## Implementation notes
 
@@ -239,6 +245,19 @@ scratch directory, when trying the binary out, so experiments never touch the re
   volumes is missing. Undo leaves a file in the trash when its path is taken again. Empty
   keeps files that changed after the move, whose kept copy is gone or changed, or that the
   journal doesn't list, and removes the plan's trash folder only once nothing is left in it.
+- **Plans from a list:** another tool decides what should change (gfiles can't tell that a
+  photo whose metadata a photo manager rewrote is the same shot, or where a new photo
+  belongs) and hands `plan import` (or the MCP tool) JSON lines:
+  `{"remove": "m:vol/path", "keep": "m:vol/path"}`, optionally `"vouched": true` with a
+  `"reason"`, and `{"move": "m:vol/path", "to": "m:vol/path"}`. Valid entries make a draft
+  `list` plan on one machine; failing ones are stored as rejects with their line and reason,
+  and a list with nothing valid saves no plan. An unvouched removal must not differ by the
+  catalog (size, fingerprint, full hash) and is compared in full at apply; a vouched one
+  skips only that comparison. Moves rename, or across filesystems copy, verify by full hash,
+  then trash the original; undo and empty treat a copied move's original like a removal's
+  file, guarded by the copy's journaled hash. A move's journal line is synced before the file
+  moves, and destinations a scan would skip (hidden, `#recycle`, `@eaDir`, ...) are refused on
+  the hub and again by the executor.
 - **Agents never run `gfiles plan apply`, `undo`, `empty` or `exec`**, by any means (including
   tmux, a pseudo-terminal, or setting `SSH_CONNECTION`). `plan exec` refuses outside SSH, but
   anyone with an SSH login to a remote can still call it there without the confirmation. They may build and show plans; Darren applies them. To try the executor,

@@ -2,10 +2,14 @@
 //! Plans are built from the hub's catalog and stored there for Darren to review; `apply`
 //! carries them out on the machine holding the files.
 //!
-//! Two kinds:
+//! Three kinds:
 //! - **drain** empties folders of every file that has a copy elsewhere on the same machine.
 //!   When every copy is inside the drained folders, one of them stays.
 //! - **keep** (keep A over B) removes from B each file that A also holds.
+//! - **list** carries out a list another tool supplied (see `listplan`): moves, and removals
+//!   that name the copy that stays. The tool may vouch for a removal whose bytes differ from
+//!   the kept copy (a photo with edited metadata, say); apply then checks only that both files
+//!   are unchanged.
 //!
 //! Only same-machine copies count: a copy on another machine is a deliberate local copy, never a
 //! reason to remove one. Mirror files (see `mirror`) are never removed or kept, since a sync tool
@@ -36,20 +40,27 @@ macro_rules! moved_by {
 }
 
 /// SQL condition (on plan item `i`) for a removal whose file and kept copy, as the plan saw
-/// them, already have equal full hashes in the catalog: confirmed, not just probable.
+/// them, already have equal full hashes in the catalog: confirmed, not just probable. Vouched
+/// removals are neither: the producer says they match, whatever their bytes.
 macro_rules! confirmed {
     () => {
-        "EXISTS (SELECT 1 FROM entries a JOIN entries b ON b.content_hash = a.content_hash
+        "(i.action = 'remove' AND NOT i.vouched
+          AND EXISTS (SELECT 1 FROM entries a JOIN entries b ON b.content_hash = a.content_hash
                  WHERE a.volume_id = i.volume_id AND a.path = i.path AND a.size = i.size
                    AND a.mtime = i.mtime AND b.volume_id = i.keep_volume_id
                    AND b.path = i.keep_path AND b.size = i.keep_size
-                   AND b.mtime = i.keep_mtime)"
+                   AND b.mtime = i.keep_mtime))"
     };
 }
 
 /// SQL condition (on `e`) for an entry no applied plan has moved to the trash. Such entries
 /// stay in the catalog until the next scan, but they're gone from their folder.
 pub const NOT_MOVED: &str = concat!("NOT EXISTS (SELECT 1 ", moved_by!(), ")");
+
+/// FROM and WHERE (on `e`) for the plans that moved entry `e`, for `SELECT p.id` subqueries.
+pub fn moved_by_sql() -> &'static str {
+    moved_by!()
+}
 
 /// Folder names that sync tools own: a file removed there is removed from every other copy the
 /// tool keeps, so plans refuse them unless they're configured as mirrors or listed as not
@@ -66,6 +77,8 @@ pub enum Spec {
     Drain(Vec<FolderRef>),
     /// Remove from `over` every file that `keeper` also holds.
     Keep { keeper: FolderRef, over: FolderRef },
+    /// Carry out a supplied list; the folders are the ones it touches.
+    List(Vec<FolderRef>),
 }
 
 impl Spec {
@@ -73,12 +86,13 @@ impl Spec {
         match self {
             Spec::Drain(_) => "drain",
             Spec::Keep { .. } => "keep",
+            Spec::List(_) => "list",
         }
     }
 
     pub fn folders(&self) -> Vec<FolderRef> {
         match self {
-            Spec::Drain(f) => f.clone(),
+            Spec::Drain(f) | Spec::List(f) => f.clone(),
             Spec::Keep { keeper, over } => vec![keeper.clone(), over.clone()],
         }
     }
@@ -86,6 +100,7 @@ impl Spec {
     fn from_stored(kind: &str, folders: &[FolderRef]) -> Result<Spec> {
         Ok(match (kind, folders) {
             ("drain", f) => Spec::Drain(f.to_vec()),
+            ("list", f) => Spec::List(f.to_vec()),
             ("keep", [keeper, over]) => Spec::Keep {
                 keeper: keeper.clone(),
                 over: over.clone(),
@@ -103,12 +118,41 @@ pub struct Item {
     pub path: String,
     pub size: i64,
     pub mtime: i64,
-    pub fingerprint: String,
+    pub fingerprint: Option<String>,
     pub keep_volume_id: String,
     pub keep_volume: String,
     pub keep_path: String,
     pub keep_size: i64,
     pub keep_mtime: i64,
+    /// The list's producer vouches that the two hold the same thing, though their bytes may
+    /// differ.
+    pub vouched: bool,
+    /// The producer's reason.
+    pub note: Option<String>,
+}
+
+/// A file a list plan moves within its machine.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct Move {
+    pub volume_id: String,
+    pub volume: String,
+    pub path: String,
+    pub size: i64,
+    pub mtime: i64,
+    pub fingerprint: Option<String>,
+    pub dest_volume_id: String,
+    pub dest_volume: String,
+    pub dest_path: String,
+    pub note: Option<String>,
+}
+
+/// An entry of a supplied list that didn't make it into the plan, and why.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct Rejected {
+    /// 1-based line in the list.
+    pub line: i64,
+    pub entry: String,
+    pub reason: String,
 }
 
 /// A file in the plan's folders that it leaves alone, and why.
@@ -129,7 +173,11 @@ pub struct Built {
     /// Folders inside the plan's folders that it leaves out entirely (outermost only).
     pub except: Vec<FolderRef>,
     pub items: Vec<Item>,
+    /// Files a list plan moves.
+    pub moves: Vec<Move>,
     pub left: Vec<Left>,
+    /// Entries of a supplied list that were rejected.
+    pub rejected: Vec<Rejected>,
 }
 
 /// One catalog entry under a target folder.
@@ -196,6 +244,7 @@ pub fn build(conn: &Connection, spec: Spec, except: &[FolderRef]) -> Result<Buil
     let (targets, keeper): (Vec<&Resolved>, Option<&Resolved>) = match &spec {
         Spec::Drain(_) => (resolved.iter().collect(), None),
         Spec::Keep { .. } => (vec![&resolved[1]], Some(&resolved[0])),
+        Spec::List(_) => bail!("a list plan is made from its list (gfiles plan import)"),
     };
     let mut except: Vec<FolderRef> = except.to_vec();
     except.sort();
@@ -326,12 +375,14 @@ pub fn build(conn: &Connection, spec: Spec, except: &[FolderRef]) -> Result<Buil
                         path: m.path.clone(),
                         size: m.size,
                         mtime: m.mtime,
-                        fingerprint: fp.clone(),
+                        fingerprint: Some(fp.clone()),
                         keep_volume_id: kept.volume_id.clone(),
                         keep_volume: kept.volume.clone(),
                         keep_path: kept.path.clone(),
                         keep_size: kept.size,
                         keep_mtime: kept.mtime,
+                        vouched: false,
+                        note: None,
                     });
                 }
             }
@@ -374,7 +425,9 @@ pub fn build(conn: &Connection, spec: Spec, except: &[FolderRef]) -> Result<Buil
         spec,
         except: outer,
         items,
+        moves: Vec::new(),
         left,
+        rejected: Vec::new(),
     })
 }
 
@@ -485,6 +538,10 @@ pub fn check_not_synced(conn: &Connection, built: &Built, not_synced: &[FolderRe
         places.push(at(&i.volume, &i.path));
         places.push(at(&i.keep_volume, &i.keep_path));
     }
+    for m in &built.moves {
+        places.push(at(&m.volume, &m.path));
+        places.push(at(&m.dest_volume, &m.dest_path));
+    }
     let mut problems: Vec<String> = Vec::new();
     for p in &places {
         if not_synced.iter().any(|n| n.contains(p)) {
@@ -546,9 +603,9 @@ pub fn save(conn: &Connection, built: &Built, now: i64) -> Result<String> {
     )?;
     {
         let mut item = tx.prepare(
-            "INSERT INTO plan_items (plan_id, seq, volume_id, path, size, mtime, fingerprint,
-                 keep_volume_id, keep_path, keep_size, keep_mtime)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            "INSERT INTO plan_items (plan_id, seq, action, volume_id, path, size, mtime,
+                 fingerprint, vouched, note, keep_volume_id, keep_path, keep_size, keep_mtime)
+             VALUES (?1, ?2, 'remove', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         )?;
         for (seq, i) in built.items.iter().enumerate() {
             item.execute(params![
@@ -559,11 +616,38 @@ pub fn save(conn: &Connection, built: &Built, now: i64) -> Result<String> {
                 i.size,
                 i.mtime,
                 i.fingerprint,
+                i.vouched,
+                i.note,
                 i.keep_volume_id,
                 i.keep_path,
                 i.keep_size,
                 i.keep_mtime
             ])?;
+        }
+        let mut mv = tx.prepare(
+            "INSERT INTO plan_items (plan_id, seq, action, volume_id, path, size, mtime,
+                 fingerprint, note, dest_volume_id, dest_path)
+             VALUES (?1, ?2, 'move', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        )?;
+        for (n, m) in built.moves.iter().enumerate() {
+            mv.execute(params![
+                id,
+                (built.items.len() + n) as i64,
+                m.volume_id,
+                m.path,
+                m.size,
+                m.mtime,
+                m.fingerprint,
+                m.note,
+                m.dest_volume_id,
+                m.dest_path
+            ])?;
+        }
+        let mut rejected = tx.prepare(
+            "INSERT INTO plan_rejected (plan_id, line, entry, reason) VALUES (?1, ?2, ?3, ?4)",
+        )?;
+        for r in &built.rejected {
+            rejected.execute(params![id, r.line, r.entry, r.reason])?;
         }
         let mut left = tx.prepare(
             "INSERT INTO plan_left (plan_id, volume_id, path, size, reason)
@@ -623,22 +707,31 @@ pub struct Summary {
     /// Files the plan removes, and the bytes that frees once the trash is emptied.
     pub remove: Tally,
     /// Of those, the ones whose full hash already equals their kept copy's (`gfiles hash`
-    /// on the plan's machine). The rest matched by sampled fingerprint only: probable. Apply
-    /// compares full content either way and skips a file that differs.
+    /// on the plan's machine). The rest, except vouched ones, matched by sampled fingerprint
+    /// only: probable. Apply compares full content either way and skips a file that differs.
     pub confirmed: Tally,
+    /// Of the removals, the ones a list's producer vouched for: apply doesn't compare their
+    /// content, only that the file and its kept copy are unchanged.
+    pub vouched: Tally,
+    /// Files a list plan moves.
+    pub moves: Tally,
+    /// Entries of a supplied list that were rejected.
+    pub rejected: i64,
     /// Files left in the plan's folders.
     pub left: Tally,
     pub moved: Tally,
     pub skipped: Tally,
-    /// Bytes this plan has in the trash (reclaimable by emptying it).
+    /// Bytes of the files it removed that are in the trash (reclaimable by emptying it).
+    /// Originals of moves that had to copy across filesystems are in the trash too, but the hub
+    /// doesn't know which moves those were.
     pub in_trash: i64,
 }
 
 const SUMMARY_SQL: &str = concat!(
     "SELECT p.id, p.machine, p.kind, p.folders, p.state, p.created_at,
         p.updated_at,
-        (SELECT count(*) FROM plan_items WHERE plan_id = p.id),
-        (SELECT coalesce(sum(size), 0) FROM plan_items WHERE plan_id = p.id),
+        (SELECT count(*) FROM plan_items WHERE plan_id = p.id AND action = 'remove'),
+        (SELECT coalesce(sum(size), 0) FROM plan_items WHERE plan_id = p.id AND action = 'remove'),
         (SELECT count(*) FROM plan_left WHERE plan_id = p.id),
         (SELECT coalesce(sum(size), 0) FROM plan_left WHERE plan_id = p.id),
         (SELECT count(*) FROM plan_items WHERE plan_id = p.id AND outcome = 'moved'),
@@ -651,7 +744,15 @@ const SUMMARY_SQL: &str = concat!(
     "),
         (SELECT coalesce(sum(i.size), 0) FROM plan_items i WHERE i.plan_id = p.id AND ",
     confirmed!(),
-    ")
+    "),
+        (SELECT count(*) FROM plan_items WHERE plan_id = p.id AND action = 'remove' AND vouched),
+        (SELECT coalesce(sum(size), 0) FROM plan_items
+         WHERE plan_id = p.id AND action = 'remove' AND vouched),
+        (SELECT count(*) FROM plan_items WHERE plan_id = p.id AND action = 'move'),
+        (SELECT coalesce(sum(size), 0) FROM plan_items WHERE plan_id = p.id AND action = 'move'),
+        (SELECT count(*) FROM plan_rejected WHERE plan_id = p.id),
+        (SELECT coalesce(sum(size), 0) FROM plan_items
+         WHERE plan_id = p.id AND action = 'remove' AND outcome = 'moved')
     FROM plans p"
 );
 
@@ -669,7 +770,7 @@ fn read_summary(r: &rusqlite::Row) -> rusqlite::Result<Summary> {
         folders: serde_json::from_str(&folders).unwrap_or_default(),
         except: serde_json::from_str(&r.get::<_, String>(15)?).unwrap_or_default(),
         in_trash: if matches!(state.as_str(), "applying" | "applied") {
-            moved.bytes
+            r.get(23)?
         } else {
             0
         },
@@ -684,6 +785,15 @@ fn read_summary(r: &rusqlite::Row) -> rusqlite::Result<Summary> {
             files: r.get(16)?,
             bytes: r.get(17)?,
         },
+        vouched: Tally {
+            files: r.get(18)?,
+            bytes: r.get(19)?,
+        },
+        moves: Tally {
+            files: r.get(20)?,
+            bytes: r.get(21)?,
+        },
+        rejected: r.get(22)?,
         left: Tally {
             files: r.get(9)?,
             bytes: r.get(10)?,
@@ -727,18 +837,37 @@ pub fn spec(conn: &Connection, id: &str) -> Result<Spec> {
     Spec::from_stored(&s.kind, &folders)
 }
 
-/// A file a plan removes, for display.
+/// A file a plan removes or moves, for display.
 #[derive(Debug, Serialize)]
 pub struct ItemView {
+    /// `remove` or `move`.
+    pub action: String,
     pub volume: String,
     pub path: String,
     pub abs_path: String,
     pub size: i64,
-    pub keep_volume: String,
-    pub keep_path: String,
-    pub keep_abs_path: String,
+    /// A removal's copy that stays.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keep_volume: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keep_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keep_abs_path: Option<String>,
+    /// A move's destination.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to_volume: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to_abs_path: Option<String>,
     /// Its full hash already equals the kept copy's; otherwise the match is probable.
     pub confirmed: bool,
+    /// The list's producer vouched for this removal; apply doesn't compare content.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub vouched: bool,
+    /// The producer's reason.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outcome: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -781,6 +910,7 @@ pub struct LeftView {
 pub struct View {
     #[serde(flatten)]
     pub summary: Summary,
+    /// The files it removes and moves, removals first.
     pub items: Vec<ItemView>,
     /// How many files it removes (in `under`, when given), before the limit.
     pub items_total: i64,
@@ -794,6 +924,10 @@ pub struct View {
     pub left_folders_total: usize,
     /// The biggest leftover files, cut to the limit.
     pub left_files: Vec<LeftView>,
+    /// Rejected entries of a supplied list, in list order, cut to the limit (`rejected` in
+    /// the summary counts them all).
+    #[serde(rename = "rejected_entries", skip_serializing_if = "Vec::is_empty")]
+    pub rejected: Vec<Rejected>,
 }
 
 /// A plan in full. With `under` (a folder inside the plan), the files it removes and the
@@ -840,27 +974,53 @@ pub fn show(
         .prepare(&format!(
             "SELECT coalesce(v.name, i.volume_id), i.path, coalesce(v.root, ''), i.size,
                     coalesce(k.name, i.keep_volume_id), i.keep_path, coalesce(k.root, ''),
-                    i.outcome, i.reason, {confirmed}
+                    i.outcome, i.reason, {confirmed}, i.action, i.vouched, i.note,
+                    coalesce(d.name, i.dest_volume_id), i.dest_path, coalesce(d.root, '')
              FROM plan_items i
              LEFT JOIN volumes v ON v.id = i.volume_id
              LEFT JOIN volumes k ON k.id = i.keep_volume_id
-             WHERE i.plan_id = ?1 AND {under_sql} ORDER BY i.seq LIMIT ?2",
+             LEFT JOIN volumes d ON d.id = i.dest_volume_id
+             WHERE i.plan_id = ?1 AND {under_sql} ORDER BY i.action DESC, i.seq LIMIT ?2",
             confirmed = confirmed!()
         ))?
         .query_map(params![id, lim, under_volume, under_path], |r| {
             let (root, path): (String, String) = (r.get(2)?, r.get(1)?);
-            let (keep_root, keep_path): (String, String) = (r.get(6)?, r.get(5)?);
+            let (keep_root, keep_path): (String, Option<String>) = (r.get(6)?, r.get(5)?);
+            let (to_root, to_path): (String, Option<String>) = (r.get(15)?, r.get(14)?);
             Ok(ItemView {
+                action: r.get(10)?,
                 volume: r.get(0)?,
                 abs_path: crate::search::join_root(&root, &path),
                 path,
                 size: r.get(3)?,
                 keep_volume: r.get(4)?,
-                keep_abs_path: crate::search::join_root(&keep_root, &keep_path),
+                keep_abs_path: keep_path
+                    .as_ref()
+                    .map(|p| crate::search::join_root(&keep_root, p)),
                 keep_path,
+                to_volume: r.get(13)?,
+                to_abs_path: to_path
+                    .as_ref()
+                    .map(|p| crate::search::join_root(&to_root, p)),
+                to_path,
                 outcome: r.get(7)?,
                 reason: r.get(8)?,
                 confirmed: r.get(9)?,
+                vouched: r.get(11)?,
+                note: r.get(12)?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let rejected = conn
+        .prepare(
+            "SELECT line, entry, reason FROM plan_rejected WHERE plan_id = ?1
+             ORDER BY line LIMIT ?2",
+        )?
+        .query_map(params![id, lim], |r| {
+            Ok(Rejected {
+                line: r.get(0)?,
+                entry: r.get(1)?,
+                reason: r.get(2)?,
             })
         })?
         .collect::<rusqlite::Result<_>>()?;
@@ -957,6 +1117,7 @@ pub fn show(
         left_by_folder,
         left_folders_total,
         left_files: rows,
+        rejected,
     })
 }
 
@@ -983,34 +1144,57 @@ pub fn set_state(conn: &Connection, id: &str, state: &str, now: i64) -> Result<(
 
 /// The plan's items that have no outcome yet, as the applying machine receives them.
 pub fn exec_items(conn: &Connection, id: &str) -> Result<Vec<crate::apply::Item>> {
+    use crate::apply::{Action, Dest, Item, Kept};
     Ok(conn
         .prepare(
-            "SELECT seq, volume_id, path, size, mtime, keep_volume_id, keep_path, keep_size,
-                    keep_mtime
+            "SELECT seq, action, volume_id, path, size, mtime, vouched, keep_volume_id, keep_path,
+                    keep_size, keep_mtime, dest_volume_id, dest_path
              FROM plan_items WHERE plan_id = ?1 AND outcome IS NULL ORDER BY seq",
         )?
         .query_map([id], |r| {
-            Ok(crate::apply::Item {
+            let action: String = r.get(1)?;
+            let keep = match (r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?) {
+                (Some(volume_id), Some(path), Some(size), Some(mtime)) => Some(Kept {
+                    volume_id,
+                    path,
+                    size,
+                    mtime,
+                }),
+                _ => None,
+            };
+            let dest = match (r.get(11)?, r.get(12)?) {
+                (Some(volume_id), Some(path)) => Some(Dest { volume_id, path }),
+                _ => None,
+            };
+            Ok(Item {
                 seq: r.get(0)?,
-                volume_id: r.get(1)?,
-                path: r.get(2)?,
-                size: r.get(3)?,
-                mtime: r.get(4)?,
-                keep_volume_id: r.get(5)?,
-                keep_path: r.get(6)?,
-                keep_size: r.get(7)?,
-                keep_mtime: r.get(8)?,
+                action: if action == "move" {
+                    Action::Move
+                } else {
+                    Action::Remove
+                },
+                volume_id: r.get(2)?,
+                path: r.get(3)?,
+                size: r.get(4)?,
+                mtime: r.get(5)?,
+                vouched: r.get(6)?,
+                keep,
+                dest,
             })
         })?
         .collect::<rusqlite::Result<_>>()?)
 }
 
-/// The volumes that may hold the plan's files in the trash: those of every item not skipped.
+/// The volumes that may hold the plan's files in the trash (those of every item not skipped),
+/// and the volumes its moves went to: undo and empty need all of them mounted.
 pub fn trash_volumes(conn: &Connection, id: &str) -> Result<Vec<String>> {
     Ok(conn
         .prepare(
-            "SELECT DISTINCT volume_id FROM plan_items
-             WHERE plan_id = ?1 AND outcome IS NOT 'skipped' ORDER BY volume_id",
+            "SELECT volume_id FROM plan_items WHERE plan_id = ?1 AND outcome IS NOT 'skipped'
+             UNION
+             SELECT dest_volume_id FROM plan_items
+             WHERE plan_id = ?1 AND outcome IS NOT 'skipped' AND dest_volume_id IS NOT NULL
+             ORDER BY 1",
         )?
         .query_map([id], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?)
@@ -1429,7 +1613,7 @@ pub(crate) mod tests {
         assert!(err.to_string().contains("contain one another"), "{err}");
     }
 
-    fn with_drive(conn: &Connection) {
+    pub(crate) fn with_drive(conn: &Connection) {
         let config: Config = toml::from_str(
             "machine = \"gaffer\"\n[[mirror]]\nname = \"drive\"\nfolders = [\"gaffer:darren/Drive\", \"elrond:darren/Drive\"]\n",
         )
@@ -1628,7 +1812,10 @@ pub(crate) mod tests {
             }
         );
         assert_eq!(v.summary.left, Tally { files: 1, bytes: 5 });
-        assert_eq!(v.items[0].keep_abs_path, "/elrond/darren/Photos/a.jpg");
+        assert_eq!(
+            v.items[0].keep_abs_path.as_deref(),
+            Some("/elrond/darren/Photos/a.jpg")
+        );
         assert_eq!(v.left_by_reason[0].reason, "unique");
         assert_eq!(spec(&conn, &id).unwrap(), b.spec);
         assert_eq!(list(&conn).unwrap().len(), 1);

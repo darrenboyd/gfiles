@@ -99,6 +99,48 @@ CREATE INDEX plan_left_plan ON plan_left (plan_id);
 -- Folders inside a plan's folders that it leaves out entirely (JSON array, like folders).
 ALTER TABLE plans ADD COLUMN except_folders TEXT NOT NULL DEFAULT '[]';
 "#,
+    r#"
+-- Plans from a supplied list (kind 'list'): moves, and removals a producer vouches for.
+-- SQLite can't drop NOT NULL, so plan_items is rebuilt: a move has no kept copy, and a listed
+-- file may not be fingerprinted yet. Existing rows become plain removals.
+CREATE TABLE plan_items_new (
+    plan_id        TEXT NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
+    seq            INTEGER NOT NULL,
+    action         TEXT NOT NULL DEFAULT 'remove',  -- 'remove' or 'move'
+    volume_id      TEXT NOT NULL,       -- the file to remove or move
+    path           TEXT NOT NULL,
+    size           INTEGER NOT NULL,
+    mtime          INTEGER NOT NULL,
+    fingerprint    TEXT,
+    vouched        INTEGER NOT NULL DEFAULT 0,  -- removal the list's producer vouched for
+    note           TEXT,                -- the producer's reason
+    keep_volume_id TEXT,                -- removal: the copy that stays
+    keep_path      TEXT,
+    keep_size      INTEGER,
+    keep_mtime     INTEGER,
+    dest_volume_id TEXT,                -- move: where it goes
+    dest_path      TEXT,
+    outcome        TEXT,                -- NULL until applied: 'moved' or 'skipped'
+    reason         TEXT,                -- why it was skipped
+    PRIMARY KEY (plan_id, seq)
+);
+INSERT INTO plan_items_new (plan_id, seq, volume_id, path, size, mtime, fingerprint,
+    keep_volume_id, keep_path, keep_size, keep_mtime, outcome, reason)
+SELECT plan_id, seq, volume_id, path, size, mtime, fingerprint,
+    keep_volume_id, keep_path, keep_size, keep_mtime, outcome, reason
+FROM plan_items;
+DROP TABLE plan_items;
+ALTER TABLE plan_items_new RENAME TO plan_items;
+CREATE INDEX plan_items_file ON plan_items (volume_id, path);
+-- Entries of a supplied list that were rejected, and why.
+CREATE TABLE plan_rejected (
+    plan_id TEXT NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
+    line    INTEGER NOT NULL,           -- 1-based line in the list
+    entry   TEXT NOT NULL,              -- the line as given
+    reason  TEXT NOT NULL
+);
+CREATE INDEX plan_rejected_plan ON plan_rejected (plan_id);
+"#,
 ];
 
 pub fn open(path: &Path) -> Result<Connection> {
@@ -164,5 +206,72 @@ mod tests {
             )
             .unwrap();
         assert_eq!(row, ("a.txt".into(), None, None));
+    }
+
+    #[test]
+    fn plans_saved_before_lists_keep_their_items() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        for sql in &MIGRATIONS[..4] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 4).unwrap();
+        conn.execute_batch(
+            "INSERT INTO plans (id, machine, kind, folders, state, created_at, updated_at)
+                 VALUES ('p', 'm', 'drain', '[\"m:v/todo\"]', 'applied', 1, 2);
+             INSERT INTO plan_items (plan_id, seq, volume_id, path, size, mtime, fingerprint,
+                 keep_volume_id, keep_path, keep_size, keep_mtime, outcome, reason)
+                 VALUES ('p', 0, 'v', 'todo/a', 3, 4, 'p1:x', 'v', 'a', 3, 5, 'moved', NULL),
+                        ('p', 1, 'v', 'todo/b', 6, 7, 'p1:y', 'v', 'b', 6, 8, 'skipped', 'why');",
+        )
+        .unwrap();
+
+        setup(&mut conn).unwrap();
+        type Row = (i64, String, String, bool, Option<String>, Option<String>);
+        let rows: Vec<Row> = conn
+            .prepare(
+                "SELECT seq, action, keep_path, vouched, outcome, reason FROM plan_items
+                 WHERE plan_id = 'p' ORDER BY seq",
+            )
+            .unwrap()
+            .query_map([], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    0,
+                    "remove".into(),
+                    "a".into(),
+                    false,
+                    Some("moved".into()),
+                    None
+                ),
+                (
+                    1,
+                    "remove".into(),
+                    "b".into(),
+                    false,
+                    Some("skipped".into()),
+                    Some("why".into())
+                ),
+            ]
+        );
+        // Deleting the plan still deletes its items.
+        conn.execute("DELETE FROM plans", []).unwrap();
+        let n: i64 = conn
+            .query_row("SELECT count(*) FROM plan_items", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
     }
 }

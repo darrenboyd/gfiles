@@ -210,6 +210,16 @@ enum PlanCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Draft a plan from a list another tool made: JSON lines of
+    /// {"remove": "machine:volume/path", "keep": "machine:volume/path"} (add "vouched": true and
+    /// a "reason" when their bytes differ but they hold the same thing) and
+    /// {"move": "machine:volume/path", "to": "machine:volume/path"}
+    Import {
+        /// The list's file, or - for stdin
+        file: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// Every plan, newest first
     List {
         #[arg(long)]
@@ -588,6 +598,19 @@ fn plan_command(
             };
             make_plan(config_path, db_path, spec, &parse_folders(&except)?, json)
         }
+        PlanCommand::Import { file, json } => {
+            let list = if file == "-" {
+                std::io::read_to_string(std::io::stdin().lock())?
+            } else {
+                std::fs::read_to_string(&file)
+                    .map_err(|e| anyhow::anyhow!("reading {file}: {e}"))?
+            };
+            let config = Config::load(config_path)?;
+            let conn = open_for_queries(config_path, db_path)?;
+            let built = gfiles::listplan::build(&conn, &list)?;
+            plan::check_not_synced(&conn, &built, &config.not_synced_folders()?)?;
+            save_and_print(&conn, &built, json)
+        }
         PlanCommand::List { json } => {
             let conn = db::open(db_path)?;
             let plans = plan::list(&conn)?;
@@ -602,8 +625,8 @@ fn plan_command(
                         p.id,
                         p.state,
                         p.kind,
-                        p.remove.files,
-                        fmt::size(p.remove.bytes),
+                        p.remove.files + p.moves.files,
+                        fmt::size(p.remove.bytes + p.moves.bytes),
                         plan_scope(p)
                     );
                 }
@@ -680,9 +703,13 @@ fn make_plan(
     let conn = open_for_queries(config_path, db_path)?;
     let built = plan::build(&conn, spec, except)?;
     plan::check_not_synced(&conn, &built, &config.not_synced_folders()?)?;
-    let now = scan_now();
-    let id = plan::save(&conn, &built, now)?;
-    let view = plan::show(&conn, &id, Some(20), None)?;
+    save_and_print(&conn, &built, json)
+}
+
+/// Saves a built plan as a draft and shows it.
+fn save_and_print(conn: &rusqlite::Connection, built: &plan::Built, json: bool) -> Result<()> {
+    let id = plan::save(conn, built, scan_now())?;
+    let view = plan::show(conn, &id, Some(20), None)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&view)?);
     } else {
@@ -713,6 +740,12 @@ fn run_plan(
     let mut conn = db::open(db_path)?;
     let s = plan::summary(&conn, id)?;
     let what = match op {
+        Op::Apply if s.moves.files > 0 => format!(
+            "change {} files ({}) on {}: removals go to the trash, moves to their new place",
+            s.remove.files + s.moves.files - s.moved.files - s.skipped.files,
+            fmt::size(s.remove.bytes + s.moves.bytes - s.moved.bytes - s.skipped.bytes),
+            s.machine
+        ),
         Op::Apply => format!(
             "move {} files ({}) on {} to the trash",
             s.remove.files - s.moved.files - s.skipped.files,
@@ -736,6 +769,17 @@ fn run_plan(
     // Name the folders, so a plan drafted the wrong way round (by an agent, say) shows here.
     println!("Plan {id}: {}", plan_folders(&s));
     println!("This will {what}.");
+    if op == Op::Apply && s.moves.files + s.vouched.files > 0 {
+        // A supplied list's plan: say what isn't a plain duplicate removal.
+        println!(
+            "It moves {} files ({}) to new places, and removes {} files ({}) that the list's \
+             producer vouched for: apply doesn't compare their content with the copy that stays.",
+            s.moves.files,
+            fmt::size(s.moves.bytes),
+            s.vouched.files,
+            fmt::size(s.vouched.bytes)
+        );
+    }
     let typed = gfiles::platform::ask_terminal(&format!(
         "Type the plan id to {}: ",
         apply::op_name(op)
@@ -907,39 +951,71 @@ fn print_plan(v: &plan::View) {
         plan_folders(s)
     );
     println!("  removes {}", tally(&s.remove));
+    // Removals the list's producer didn't vouch for: matched by content.
     let probable = plan::Tally {
-        files: s.remove.files - s.confirmed.files,
-        bytes: s.remove.bytes - s.confirmed.bytes,
+        files: s.remove.files - s.vouched.files - s.confirmed.files,
+        bytes: s.remove.bytes - s.vouched.bytes - s.confirmed.bytes,
     };
-    if s.state == "draft" && s.remove.files > 0 {
+    if s.state == "draft" && s.remove.files > s.vouched.files {
         println!("    confirmed {} (full hashes agree)", tally(&s.confirmed));
         println!(
             "    probable  {} (sampled fingerprints agree)",
             tally(&probable)
         );
     }
-    println!("  leaves  {}", tally(&s.left));
+    if s.vouched.files > 0 {
+        println!(
+            "    vouched   {} (the list's producer says they match; content not compared)",
+            tally(&s.vouched)
+        );
+    }
+    if s.moves.files > 0 {
+        println!("  moves   {}", tally(&s.moves));
+    }
+    if s.kind != "list" {
+        // A list names only what changes; nothing is left behind by it.
+        println!("  leaves  {}", tally(&s.left));
+    }
     if s.moved.files + s.skipped.files > 0 {
         println!("  moved   {}", tally(&s.moved));
         println!("  skipped {}", tally(&s.skipped));
+    }
+    if s.rejected > 0 {
+        println!("  rejected {} entries of the list", s.rejected);
     }
     let scope = match &v.under {
         Some(u) => format!(" in {u}"),
         None => String::new(),
     };
     if !v.items.is_empty() {
-        println!(
-            "\nRemoves{scope}: {} files (the copy that stays below each):",
-            v.items_total
-        );
+        if s.moves.files > 0 {
+            println!(
+                "\nChanges{scope}: {} files (= the copy that stays, -> where a move goes):",
+                v.items_total
+            );
+        } else {
+            println!(
+                "\nRemoves{scope}: {} files (the copy that stays below each):",
+                v.items_total
+            );
+        }
         for i in &v.items {
             let status = match (&i.outcome, &i.reason) {
                 (Some(o), Some(r)) => format!("  [{o}: {r}]"),
                 (Some(o), None) => format!("  [{o}]"),
                 _ => String::new(),
             };
-            println!("{:>10}  {}{status}", fmt::size(i.size), i.abs_path);
-            println!("{:>10}  = {}", "", i.keep_abs_path);
+            let vouched = if i.vouched { "  (vouched)" } else { "" };
+            println!("{:>10}  {}{vouched}{status}", fmt::size(i.size), i.abs_path);
+            if let Some(keep) = &i.keep_abs_path {
+                println!("{:>10}  = {keep}", "");
+            }
+            if let Some(to) = &i.to_abs_path {
+                println!("{:>10}  -> {to}", "");
+            }
+            if let Some(note) = &i.note {
+                println!("{:>10}  why: {note}", "");
+            }
         }
         if v.items_total > v.items.len() as i64 {
             println!(
@@ -1000,6 +1076,18 @@ fn print_plan(v: &plan::View) {
         }
     } else if let Some(u) = &v.under {
         println!("\nThe plan leaves nothing in {u}.");
+    }
+    if !v.rejected.is_empty() {
+        println!("\nRejected entries of the list ({}):", s.rejected);
+        for r in &v.rejected {
+            println!("  line {}: {}", r.line, r.reason);
+        }
+        if s.rejected > v.rejected.len() as i64 {
+            println!(
+                "  ... and {} more (use -n or --all)",
+                s.rejected - v.rejected.len() as i64
+            );
+        }
     }
     if s.state == "draft" && probable.files > 0 {
         println!(

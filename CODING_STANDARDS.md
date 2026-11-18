@@ -13,17 +13,26 @@ review checks the diff against it. Commands, setup and anything `cargo clippy` o
 - **Only the apply executor touches the files in a volume.** No other code path writes,
   moves or deletes under a volume root, and the scanner never follows a symlink. The
   executor (`apply`) only creates and writes inside the volume's `.gfiles-trash` folder,
-  renames files into it and back out of it, recreates a restored file's missing parent
-  folders on undo, and deletes a plan's trash folder when emptying it. Its renames never
-  replace an existing file and never fall back to copy-and-delete. Before moving a file it
-  checks that the file and the copy that stays are unchanged since the scan, aren't the same
-  file, and have equal full content; any doubt skips the file. It never creates a volume
-  root, and creates each trash folder level only after checking the one above isn't a
-  symlink. Emptying keeps any file that changed since the move, whose kept copy is gone or
-  changed, or that the journal doesn't vouch for, and never deletes anything it didn't list
-  and check. Undo and empty don't count a plan done while one of its volumes is missing. Each
-  of these guarantees has a test that fails if it is removed, so a refactor can't drop one
-  quietly.
+  renames files into it and back out of it, moves a plan's files to their destination,
+  creates a destination's missing folders (and removes them again on undo when empty),
+  recreates a restored file's missing parent folders on undo, and deletes a plan's trash
+  folder when emptying it. Its renames never replace an existing file. A rename only falls
+  back to a copy for a move across filesystems: the copy goes to a temporary name, is synced,
+  read back and compared by full hash with the original, renamed into place without
+  replacing anything, and only then is the original moved to the trash (never deleted). A
+  move's journal line is on disk before the file moves (undo finds moves only through it),
+  and a move never goes where a scan wouldn't look (a hidden folder, `#recycle`, `@eaDir`, the
+  other built-in ignores).
+  Before removing a file it checks that the file and the copy that stays are unchanged since
+  the scan and aren't the same file, and, unless the plan's list vouched for the pair, that
+  they have equal full content; any doubt skips the file. It never creates a volume root, and
+  creates each folder level only after checking the one above isn't a symlink. Emptying keeps
+  any file that changed since the move, whose kept copy (or a move's copy, by full hash) is
+  gone or changed, or that the journal doesn't vouch for, and never deletes anything it
+  didn't list and check. Undo never deletes a copy that changed after the move: it removes a
+  copy only when it still has the full hash the move recorded. Undo and
+  empty don't count a plan done while one of its volumes is missing. Each of these
+  guarantees has a test that fails if it is removed, so a refactor can't drop one quietly.
 - **Only Darren applies a plan.** `plan apply`, `undo` and `empty` ask for the plan id on
   the controlling terminal (not stdin), refuse without one, and have no flag to skip the
   question. `plan exec`, which carries out a confirmed plan for the hub, refuses unless it
@@ -42,6 +51,13 @@ review checks the diff against it. Commands, setup and anything `cargo clippy` o
   config (the `[[remote]]` it pulled from), never from the stream, and refuses anything
   claiming another machine. Every entry and volume root is validated in `store` before it is
   written, so a stored path is always relative and inside its volume, whoever sent it.
+- **A supplied list is untrusted input.** `plan import` and `draft_plan_from_list` take a
+  list another tool wrote. Every entry is parsed strictly (unknown fields rejected), each
+  file must be a cataloged plain file on the list's one machine, outside mirrors and
+  repositories, and each destination a free, plain path inside a volume (not cataloged, not
+  in a cataloged folder or file, not in the trash, a mirror, or anywhere scans skip); entries that conflict with
+  each other are rejected. The machine checks every item again when it applies the plan.
+  Vouching only skips the content comparison; it never skips the other checks.
 - **User input never becomes SQL or FTS syntax.** Values are bound as parameters, and search
   words are quoted FTS prefix terms. The same holds for MCP tool arguments, which are
   type-checked and allowlisted where a fixed set of values exists.

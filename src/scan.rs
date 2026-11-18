@@ -338,6 +338,21 @@ pub fn hash_volume(
     Ok(stats)
 }
 
+/// Whether a scan of any volume would skip `rel` (a relative, `/`-separated path) or a folder
+/// above it by the built-in ignores: a hidden part, `#recycle`, `@eaDir`, and so on. A file
+/// moved there would drop out of the catalog (and from `#recycle`, be deleted by the NAS), so
+/// moves refuse such destinations. A volume's own patterns can bring back a hidden folder; moves
+/// don't follow them, which only refuses more.
+pub fn ignored_by_default(rel: &str) -> bool {
+    static IGNORES: std::sync::OnceLock<Gitignore> = std::sync::OnceLock::new();
+    let root = Path::new("/");
+    let ignores = IGNORES
+        .get_or_init(|| build_ignores(root, &[]).expect("the built-in ignore patterns are valid"));
+    ignores
+        .matched_path_or_any_parents(root.join(rel), false)
+        .is_ignore()
+}
+
 fn build_ignores(root: &Path, extra: &[String]) -> Result<Gitignore> {
     let mut builder = GitignoreBuilder::new(root);
     for pattern in DEFAULT_IGNORES
@@ -368,6 +383,23 @@ pub(crate) fn unix_secs(t: Option<SystemTime>) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paths_the_built_in_ignores_skip() {
+        for rel in [
+            ".ssh/x",
+            "a/.hidden/b.jpg",
+            "photo/#recycle/a.jpg",
+            "photo/@eaDir/a.jpg",
+            "code/node_modules/x/y.js",
+            "x.o",
+        ] {
+            assert!(ignored_by_default(rel), "{rel}");
+        }
+        for rel in ["photo/2013/08/a.jpg", "a.jpg", "notes/recycle/a.txt"] {
+            assert!(!ignored_by_default(rel), "{rel}");
+        }
+    }
     use crate::db;
     use std::fs;
 
