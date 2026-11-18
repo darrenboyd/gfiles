@@ -9,8 +9,10 @@
 //!
 //! Only same-machine copies count: a copy on another machine is a deliberate local copy, never a
 //! reason to remove one. Mirror files (see `mirror`) are never removed or kept, since a sync tool
-//! replicates deletes, and repositories are one cataloged item, never removed. Matching uses
-//! the sampled fingerprint; the machine applying a plan compares full content before moving
+//! replicates deletes, and repositories are one cataloged item, never removed. Copies match as
+//! duplicates do (see `dupes::content`): by sampled fingerprint, unless full hashes differ. A
+//! removal is "confirmed" when the file and its kept copy already have equal full hashes, else
+//! "probable"; either way, the machine applying a plan compares full content before moving
 //! anything.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -30,6 +32,18 @@ macro_rules! moved_by {
          WHERE pi.volume_id = e.volume_id AND pi.path = e.path AND pi.outcome = 'moved'
            AND pi.size = e.size AND pi.mtime = e.mtime AND pi.fingerprint IS e.fingerprint
            AND p.state IN ('applying', 'applied', 'emptied')"
+    };
+}
+
+/// SQL condition (on plan item `i`) for a removal whose file and kept copy, as the plan saw
+/// them, already have equal full hashes in the catalog: confirmed, not just probable.
+macro_rules! confirmed {
+    () => {
+        "EXISTS (SELECT 1 FROM entries a JOIN entries b ON b.content_hash = a.content_hash
+                 WHERE a.volume_id = i.volume_id AND a.path = i.path AND a.size = i.size
+                   AND a.mtime = i.mtime AND b.volume_id = i.keep_volume_id
+                   AND b.path = i.keep_path AND b.size = i.keep_size
+                   AND b.mtime = i.keep_mtime)"
     };
 }
 
@@ -126,6 +140,8 @@ struct TargetEntry {
     size: i64,
     kind: String,
     fingerprint: Option<String>,
+    /// What it matches others by (see `dupes::content`).
+    content: Option<String>,
     mirror: Option<String>,
     moved_by: Option<String>,
 }
@@ -204,7 +220,8 @@ pub fn build(conn: &Connection, spec: Spec, except: &[FolderRef]) -> Result<Buil
     let mut items = Vec::new();
     let mut left = Vec::new();
     let mut seen: HashSet<(String, String)> = HashSet::new();
-    let mut candidates: BTreeMap<(i64, String), ()> = BTreeMap::new();
+    // (size, fingerprint, content) of each removable file.
+    let mut candidates: BTreeMap<(i64, String, String), ()> = BTreeMap::new();
     for t in &targets {
         for e in target_entries(conn, t)? {
             if left_out(&e.volume_id, &e.path)
@@ -225,18 +242,18 @@ pub fn build(conn: &Connection, spec: Spec, except: &[FolderRef]) -> Result<Buil
             } else {
                 None
             };
-            match (reason, &e.fingerprint) {
-                (Some(reason), _) => left.push(Left {
+            match (reason, e.fingerprint, e.content) {
+                (Some(reason), _, _) => left.push(Left {
                     volume_id: e.volume_id,
                     volume: e.volume,
                     path: e.path,
                     size: e.size,
                     reason,
                 }),
-                (None, Some(fp)) => {
-                    candidates.insert((e.size, fp.clone()), ());
+                (None, Some(fp), Some(content)) => {
+                    candidates.insert((e.size, fp, content), ());
                 }
-                (None, None) => unreachable!("unfingerprinted entries have a reason"),
+                (None, _, _) => unreachable!("unfingerprinted entries have a reason"),
             }
         }
     }
@@ -244,24 +261,27 @@ pub fn build(conn: &Connection, spec: Spec, except: &[FolderRef]) -> Result<Buil
     let in_targets = |m: &Member| {
         targets.iter().any(|t| t.holds(&m.volume_id, &m.path)) && !left_out(&m.volume_id, &m.path)
     };
+    let content = crate::dupes::content("e");
     let mut members_stmt = conn.prepare(&format!(
         "SELECT e.volume_id, v.name, e.path, e.size, e.mtime
          FROM entries e JOIN volumes v ON v.id = e.volume_id{JOIN}
-         WHERE v.machine = ?1 AND e.size = ?2 AND e.fingerprint = ?3
+         WHERE v.machine = ?1 AND e.size = ?2 AND e.fingerprint = ?3 AND {content} = ?4
            AND mf.mirror IS NULL AND {NOT_MOVED}"
     ))?;
     let mut mirror_stmt = conn.prepare(&format!(
         "SELECT mf.mirror FROM entries e JOIN volumes v ON v.id = e.volume_id{JOIN}
-         WHERE v.machine = ?1 AND e.size = ?2 AND e.fingerprint = ?3 AND mf.mirror IS NOT NULL
+         WHERE v.machine = ?1 AND e.size = ?2 AND e.fingerprint = ?3 AND {content} = ?4
+           AND mf.mirror IS NOT NULL
          LIMIT 1"
     ))?;
-    let mut machines_stmt = conn.prepare(
+    let mut machines_stmt = conn.prepare(&format!(
         "SELECT DISTINCT v.machine FROM entries e JOIN volumes v ON v.id = e.volume_id
-         WHERE v.machine != ?1 AND e.size = ?2 AND e.fingerprint = ?3 ORDER BY v.machine",
-    )?;
-    for (size, fp) in candidates.keys() {
+         WHERE v.machine != ?1 AND e.size = ?2 AND e.fingerprint = ?3 AND {content} = ?4
+         ORDER BY v.machine"
+    ))?;
+    for (size, fp, content) in candidates.keys() {
         let members: Vec<Member> = members_stmt
-            .query_map(params![machine, size, fp], |r| {
+            .query_map(params![machine, size, fp, content], |r| {
                 Ok(Member {
                     volume_id: r.get(0)?,
                     volume: r.get(1)?,
@@ -319,13 +339,15 @@ pub fn build(conn: &Connection, spec: Spec, except: &[FolderRef]) -> Result<Buil
                 let reason = if let Some(k) = keeper {
                     format!("not in {}", k.folder)
                 } else if let Some(m) = mirror_stmt
-                    .query_row(params![machine, size, fp], |r| r.get::<_, String>(0))
+                    .query_row(params![machine, size, fp, content], |r| {
+                        r.get::<_, String>(0)
+                    })
                     .optional()?
                 {
                     format!("other copy only in mirror {m}")
                 } else {
                     let others: Vec<String> = machines_stmt
-                        .query_map(params![machine, size, fp], |r| r.get(0))?
+                        .query_map(params![machine, size, fp, content], |r| r.get(0))?
                         .collect::<rusqlite::Result<_>>()?;
                     if others.is_empty() {
                         "unique".to_string()
@@ -410,11 +432,12 @@ fn resolve(conn: &Connection, f: &FolderRef) -> Result<Resolved> {
 fn target_entries(conn: &Connection, t: &Resolved) -> Result<Vec<TargetEntry>> {
     let sql = format!(
         "SELECT e.volume_id, v.name, e.path, e.size, e.kind, e.fingerprint, mf.mirror,
-                (SELECT p.id {moved_by} LIMIT 1)
+                (SELECT p.id {moved_by} LIMIT 1), {content}
          FROM entries e JOIN volumes v ON v.id = e.volume_id{JOIN}
          WHERE e.volume_id = ?1
            AND (?2 = '' OR e.path = ?2 OR substr(e.path, 1, length(?2) + 1) = ?2 || '/')",
-        moved_by = moved_by!()
+        moved_by = moved_by!(),
+        content = crate::dupes::content("e")
     );
     Ok(conn
         .prepare(&sql)?
@@ -428,6 +451,7 @@ fn target_entries(conn: &Connection, t: &Resolved) -> Result<Vec<TargetEntry>> {
                 fingerprint: r.get(5)?,
                 mirror: r.get(6)?,
                 moved_by: r.get(7)?,
+                content: r.get(8)?,
             })
         })?
         .collect::<rusqlite::Result<_>>()?)
@@ -598,6 +622,10 @@ pub struct Summary {
     pub updated_at: i64,
     /// Files the plan removes, and the bytes that frees once the trash is emptied.
     pub remove: Tally,
+    /// Of those, the ones whose full hash already equals their kept copy's (`gfiles hash`
+    /// on the plan's machine). The rest matched by sampled fingerprint only: probable. Apply
+    /// compares full content either way and skips a file that differs.
+    pub confirmed: Tally,
     /// Files left in the plan's folders.
     pub left: Tally,
     pub moved: Tally,
@@ -606,7 +634,8 @@ pub struct Summary {
     pub in_trash: i64,
 }
 
-const SUMMARY_SQL: &str = "SELECT p.id, p.machine, p.kind, p.folders, p.state, p.created_at,
+const SUMMARY_SQL: &str = concat!(
+    "SELECT p.id, p.machine, p.kind, p.folders, p.state, p.created_at,
         p.updated_at,
         (SELECT count(*) FROM plan_items WHERE plan_id = p.id),
         (SELECT coalesce(sum(size), 0) FROM plan_items WHERE plan_id = p.id),
@@ -616,8 +645,15 @@ const SUMMARY_SQL: &str = "SELECT p.id, p.machine, p.kind, p.folders, p.state, p
         (SELECT coalesce(sum(size), 0) FROM plan_items WHERE plan_id = p.id AND outcome = 'moved'),
         (SELECT count(*) FROM plan_items WHERE plan_id = p.id AND outcome = 'skipped'),
         (SELECT coalesce(sum(size), 0) FROM plan_items WHERE plan_id = p.id AND outcome = 'skipped'),
-        p.except_folders
-    FROM plans p";
+        p.except_folders,
+        (SELECT count(*) FROM plan_items i WHERE i.plan_id = p.id AND ",
+    confirmed!(),
+    "),
+        (SELECT coalesce(sum(i.size), 0) FROM plan_items i WHERE i.plan_id = p.id AND ",
+    confirmed!(),
+    ")
+    FROM plans p"
+);
 
 fn read_summary(r: &rusqlite::Row) -> rusqlite::Result<Summary> {
     let folders: String = r.get(3)?;
@@ -643,6 +679,10 @@ fn read_summary(r: &rusqlite::Row) -> rusqlite::Result<Summary> {
         remove: Tally {
             files: r.get(7)?,
             bytes: r.get(8)?,
+        },
+        confirmed: Tally {
+            files: r.get(16)?,
+            bytes: r.get(17)?,
         },
         left: Tally {
             files: r.get(9)?,
@@ -697,6 +737,8 @@ pub struct ItemView {
     pub keep_volume: String,
     pub keep_path: String,
     pub keep_abs_path: String,
+    /// Its full hash already equals the kept copy's; otherwise the match is probable.
+    pub confirmed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outcome: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -798,11 +840,12 @@ pub fn show(
         .prepare(&format!(
             "SELECT coalesce(v.name, i.volume_id), i.path, coalesce(v.root, ''), i.size,
                     coalesce(k.name, i.keep_volume_id), i.keep_path, coalesce(k.root, ''),
-                    i.outcome, i.reason
+                    i.outcome, i.reason, {confirmed}
              FROM plan_items i
              LEFT JOIN volumes v ON v.id = i.volume_id
              LEFT JOIN volumes k ON k.id = i.keep_volume_id
-             WHERE i.plan_id = ?1 AND {under_sql} ORDER BY i.seq LIMIT ?2"
+             WHERE i.plan_id = ?1 AND {under_sql} ORDER BY i.seq LIMIT ?2",
+            confirmed = confirmed!()
         ))?
         .query_map(params![id, lim, under_volume, under_path], |r| {
             let (root, path): (String, String) = (r.get(2)?, r.get(1)?);
@@ -817,6 +860,7 @@ pub fn show(
                 keep_path,
                 outcome: r.get(7)?,
                 reason: r.get(8)?,
+                confirmed: r.get(9)?,
             })
         })?
         .collect::<rusqlite::Result<_>>()?;
@@ -1440,6 +1484,87 @@ pub(crate) mod tests {
         assert!(drain(&conn, &["elrond:media/todo"]).is_err());
         let err = drain(&conn, &["elrond:darren/todo", "gaffer:darren/todo"]).unwrap_err();
         assert!(err.to_string().contains("different machines"), "{err}");
+    }
+
+    /// Gives elrond:darren entries full hashes (their mtime is 7, as `put` writes).
+    fn hash(conn: &Connection, hashes: &[(&str, &str)]) {
+        let hashed: Vec<crate::store::Hashed> = hashes
+            .iter()
+            .map(|(path, hash)| crate::store::Hashed {
+                volume_id: "elrond-darren".into(),
+                path: path.to_string(),
+                size: 10,
+                mtime: 7,
+                hash: hash.to_string(),
+            })
+            .collect();
+        assert_eq!(
+            crate::store::record_hashes(conn, &hashed).unwrap(),
+            hashes.len()
+        );
+    }
+
+    #[test]
+    fn full_hashes_decide_what_matches_and_what_is_confirmed() {
+        const H1: &str = "b3:1111111111111111111111111111111111111111111111111111111111111111";
+        const H2: &str = "b3:2222222222222222222222222222222222222222222222222222222222222222";
+        let conn = crate::db::open_in_memory().unwrap();
+        put(
+            &conn,
+            "elrond",
+            "darren",
+            &[
+                ("todo/shot1.bmp", 10, Some(A)),
+                ("todo/shot2.bmp", 10, Some(A)),
+                ("todo/shot3.bmp", 10, Some(A)),
+                ("Photos/shot1.bmp", 10, Some(A)),
+                ("todo/x.jpg", 10, Some(B)),
+                ("Photos/x.jpg", 10, Some(B)),
+            ],
+        );
+        // shot1 and its copy agree; shot2 differs from both (a fingerprint collision, as
+        // apply would find); shot3 isn't hashed, so it can't be told apart. x.jpg is probable.
+        hash(
+            &conn,
+            &[
+                ("todo/shot1.bmp", H1),
+                ("Photos/shot1.bmp", H1),
+                ("todo/shot2.bmp", H2),
+            ],
+        );
+        let b = drain(&conn, &["elrond:darren/todo"]).unwrap();
+        assert_eq!(
+            removed(&b),
+            vec![
+                pair("todo/shot1.bmp", "Photos/shot1.bmp"),
+                pair("todo/x.jpg", "Photos/x.jpg"),
+            ]
+        );
+        assert_eq!(
+            left(&b),
+            vec![
+                pair("todo/shot2.bmp", "unique"),
+                pair("todo/shot3.bmp", "unique"),
+            ]
+        );
+        let id = save(&conn, &b, 0).unwrap();
+        let v = show(&conn, &id, None, None).unwrap();
+        assert_eq!(
+            v.summary.confirmed,
+            Tally {
+                files: 1,
+                bytes: 10
+            }
+        );
+        let confirmed: Vec<(&str, bool)> = v
+            .items
+            .iter()
+            .map(|i| (i.path.as_str(), i.confirmed))
+            .collect();
+        assert_eq!(
+            confirmed,
+            vec![("todo/shot1.bmp", true), ("todo/x.jpg", false)]
+        );
     }
 
     #[test]

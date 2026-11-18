@@ -3,7 +3,8 @@
 //!
 //! Two entries hold the same content when their size and fingerprint match (see
 //! `fingerprint`). That's "probable" until full hashes of every copy agree ("confirmed");
-//! repositories match by HEAD commit, which is exact. Mirror replicas (see `mirror`) are one
+//! repositories match by HEAD commit, which is exact. Full hashes that differ always win: files
+//! whose sampled fingerprints collide split by full hash (see `content`). Mirror replicas (see `mirror`) are one
 //! logical file: never duplicates of each other, and one place for coverage.
 //!
 //! A file is covered when copies of its content are in at least two places and on at least two
@@ -89,6 +90,22 @@ pub struct Duplicates {
 /// other empty file) unless it's a repository, which matches by commit.
 const ELIGIBLE: &str = "e.fingerprint IS NOT NULL AND (e.size > 0 OR e.fingerprint LIKE 'git:%')";
 
+/// SQL for what entry `e` (named by `alias`) matches others by, besides its size: its sampled
+/// fingerprint, unless full hashes show that files with its size and fingerprint differ. Then
+/// it's the entry's full hash, so only copies with that hash match it; an entry with no full
+/// hash keeps its fingerprint and matches only the others with none (each could be either).
+/// Rare, so the check looks only at entries that have a hash.
+pub fn content(alias: &str) -> String {
+    format!(
+        "(CASE WHEN {a}.content_hash IS NOT NULL AND EXISTS (
+             SELECT 1 FROM entries hx_ WHERE hx_.size = {a}.size
+               AND hx_.fingerprint = {a}.fingerprint
+               AND hx_.content_hash IS NOT NULL AND hx_.content_hash != {a}.content_hash)
+         THEN {a}.content_hash ELSE {a}.fingerprint END)",
+        a = alias
+    )
+}
+
 /// The entry columns `read_row` reads, with the mirror join. `conditions` adds to the WHERE.
 fn rows_sql(conditions: &str) -> String {
     format!(
@@ -133,13 +150,15 @@ fn read_row(r: &rusqlite::Row) -> rusqlite::Result<Row> {
 /// Groups of files with the same content, largest wasted space first. A group matches the
 /// filters when any of its copies does.
 pub fn duplicates(conn: &Connection, f: &Filters) -> Result<Duplicates> {
+    let content = content("e");
     let groups_sql = format!(
-        "SELECT size, fp, count(DISTINCT key) AS n FROM (
-             SELECT e.size AS size, e.fingerprint AS fp, {KEY} AS key, e.kind AS kind,
+        "SELECT size, fp, content, count(DISTINCT key) AS n FROM (
+             SELECT e.size AS size, e.fingerprint AS fp, {content} AS content, {KEY} AS key,
+                    e.kind AS kind,
                     v.machine AS machine, v.name AS volume
              FROM entries e JOIN volumes v ON v.id = e.volume_id{JOIN}
              WHERE e.fingerprint IS NOT NULL AND (e.size > 0 OR e.fingerprint LIKE 'git:%'))
-         GROUP BY size, fp
+         GROUP BY size, fp, content
          HAVING n >= 2 AND size >= ?1
             AND (?2 IS NULL OR max(kind = ?2)) AND (?3 IS NULL OR max(machine = ?3))
             AND (?4 IS NULL OR max(volume = ?4))"
@@ -149,22 +168,23 @@ pub fn duplicates(conn: &Connection, f: &Filters) -> Result<Duplicates> {
         conn.query_row(&format!("SELECT count(*) FROM ({groups_sql})"), args, |r| {
             r.get(0)
         })?;
-    let mut sql = format!("{groups_sql} ORDER BY size * (n - 1) DESC, size DESC, fp");
+    let mut sql = format!("{groups_sql} ORDER BY size * (n - 1) DESC, size DESC, fp, content");
     if let Some(limit) = f.limit {
         sql.push_str(&format!(" LIMIT {limit}"));
     }
-    let page: Vec<(i64, String)> = conn
+    let page: Vec<(i64, String, String)> = conn
         .prepare(&sql)?
-        .query_map(args, |r| Ok((r.get(0)?, r.get(1)?)))?
+        .query_map(args, |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
         .collect::<rusqlite::Result<_>>()?;
 
-    let mut members = conn.prepare(&rows_sql(
-        " AND e.size = ?1 AND e.fingerprint = ?2 ORDER BY v.machine, v.name, e.path",
-    ))?;
+    let mut members = conn.prepare(&rows_sql(&format!(
+        " AND e.size = ?1 AND e.fingerprint = ?2 AND {content} = ?3
+         ORDER BY v.machine, v.name, e.path"
+    )))?;
     let mut groups = Vec::new();
-    for (size, fp) in page {
+    for (size, fp, content) in page {
         let rows: Vec<Row> = members
-            .query_map(params![size, fp], read_row)?
+            .query_map(params![size, fp, content], read_row)?
             .collect::<rusqlite::Result<_>>()?;
         let copies = collapse(&rows);
         groups.push(Group {
@@ -282,20 +302,22 @@ pub fn coverage(conn: &Connection, f: &Filters, folder: Option<&str>) -> Result<
     // Where each content is (places, machines, whether full hashes agree) is aggregated in
     // SQL over the whole catalog, since a copy outside the filters still counts as a backup.
     // Only the filtered rows come back, one at a time, each with its status.
+    let content = content("e");
     let sql = format!(
         "WITH spread AS (
-             SELECT e.size, e.fingerprint,
+             SELECT e.size, e.fingerprint, {content} AS content,
                     count(DISTINCT {PLACE}) >= 2 AND count(DISTINCT v.machine) >= 2 AS covered,
                     e.fingerprint LIKE 'git:%'
                         OR (count(e.content_hash) = count(*)
                             AND min(e.content_hash) = max(e.content_hash)) AS sure
              FROM entries e JOIN volumes v ON v.id = e.volume_id{JOIN}
              WHERE {ELIGIBLE}
-             GROUP BY e.size, e.fingerprint)
+             GROUP BY e.size, e.fingerprint, content)
          SELECT e.size, e.fingerprint, e.content_hash, e.kind, v.machine, v.name, v.root, e.path,
                 mf.mirror, {MIRROR_PATH}, {KEY}, s.covered, s.sure
          FROM entries e JOIN volumes v ON v.id = e.volume_id{JOIN}
          JOIN spread s ON s.size = e.size AND s.fingerprint = e.fingerprint
+           AND s.content = {content}
          WHERE {ELIGIBLE} AND e.size >= ?1 AND (?2 IS NULL OR e.kind = ?2)
            AND (?3 IS NULL OR v.machine = ?3) AND (?4 IS NULL OR v.name = ?4)"
     );
@@ -599,6 +621,49 @@ mod tests {
         let c = coverage(&conn, &all(), None).unwrap();
         assert_eq!((c.covered.files, c.probably_covered.files), (2, 0));
         assert!(c.folders.is_empty());
+    }
+
+    #[test]
+    fn files_whose_full_hashes_differ_never_match() {
+        const OTHER: &str = "b3:2222222222222222222222222222222222222222222222222222222222222222";
+        let conn = crate::db::open_in_memory().unwrap();
+        // Same size and sampled fingerprint, but two different contents by full hash, and
+        // one file not hashed yet, which could be either.
+        put(
+            &conn,
+            "elrond",
+            "darren",
+            &[
+                ("a.bmp", 10, Some(A), Some(HASH)),
+                ("b.bmp", 10, Some(A), Some(OTHER)),
+                ("c.bmp", 10, Some(A), None),
+                ("d.bmp", 10, Some(A), Some(HASH)),
+            ],
+        );
+        put(
+            &conn,
+            "gaffer",
+            "darren",
+            &[("b.bmp", 10, Some(A), Some(OTHER))],
+        );
+        let d = duplicates(&conn, &all()).unwrap();
+        let groups: Vec<(Vec<String>, bool)> = d
+            .groups
+            .iter()
+            .map(|g| (g.copies.iter().flat_map(paths).collect(), g.confirmed))
+            .collect();
+        assert_eq!(
+            groups,
+            vec![
+                (vec!["elrond:a.bmp".into(), "elrond:d.bmp".into()], true),
+                (vec!["elrond:b.bmp".into(), "gaffer:b.bmp".into()], true),
+            ]
+        );
+        let c = coverage(&conn, &all(), None).unwrap();
+        // b.bmp on both machines is covered; a.bmp and d.bmp are only on elrond, and c.bmp
+        // matches nothing.
+        assert_eq!(c.covered.files, 2);
+        assert_eq!(c.uncovered.files, 3);
     }
 
     #[test]

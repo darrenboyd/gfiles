@@ -14,7 +14,9 @@
 //!
 //! Before moving a file, the executor checks that it and the copy that stays are unchanged
 //! since the scan (size and mtime), aren't the same file, and have the same full content. Any
-//! doubt skips the file. Re-running a plan resumes it: a file already in the trash counts as
+//! doubt skips the file. The full hashes it reads of files that stay (kept copies, and files
+//! whose content differs) go into this machine's catalog afterwards (`record_hashes`), so the
+//! catalog stops matching files apply found different. Re-running a plan resumes it: a file already in the trash counts as
 //! moved.
 //!
 //! The hub talks to another machine's executor through `gfiles plan exec` over SSH, a
@@ -97,6 +99,11 @@ pub struct Done {
     /// Files (or whole volumes' trash folders) left in the trash by undo or empty, each with
     /// why.
     pub left_in_trash: Vec<String>,
+    /// Full hashes apply read of files that stay (kept copies, and files it skipped), for this
+    /// machine's catalog (see `store::record_hashes`). Not sent to the hub: its next pull
+    /// brings them.
+    #[serde(skip)]
+    pub hashes: Vec<store::Hashed>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -171,6 +178,7 @@ pub fn run(
                 roots: &roots,
                 id,
                 hashes: HashMap::new(),
+                learned: Vec::new(),
                 journals: HashMap::new(),
             };
             for item in items {
@@ -198,6 +206,7 @@ pub fn run(
                     eprintln!("warning: saving {}: {e}", path.display());
                 }
             }
+            done.hashes = ex.learned;
             Ok(done)
         }
         Op::Undo => Ok(undo(&roots, volumes, id)),
@@ -210,6 +219,8 @@ struct Executor<'a> {
     id: &'a str,
     /// Full hashes of kept copies, by (volume id, path): many removed files can share one.
     hashes: HashMap<(String, String), String>,
+    /// Full hashes read of files that stay where they are, for the catalog.
+    learned: Vec<store::Hashed>,
     /// Each trash folder's open journal. Synced once at the end: a line lost to a crash only
     /// makes emptying keep that file.
     journals: HashMap<PathBuf, File>,
@@ -262,11 +273,26 @@ impl Executor<'_> {
                     (item.keep_volume_id.clone(), item.keep_path.clone()),
                     h.clone(),
                 );
+                self.learned.push(store::Hashed {
+                    volume_id: item.keep_volume_id.clone(),
+                    path: item.keep_path.clone(),
+                    size: item.keep_size,
+                    mtime: item.keep_mtime,
+                    hash: h.clone(),
+                });
                 h
             }
         };
         let hash = full_hash(&src, item.size, item.mtime)?;
         if hash != keep_hash {
+            // Remembered, so the catalog stops calling the two duplicates.
+            self.learned.push(store::Hashed {
+                volume_id: item.volume_id.clone(),
+                path: item.path.clone(),
+                size: item.size,
+                mtime: item.mtime,
+                hash,
+            });
             return Err("its content differs from the kept copy".into());
         }
         // Last look at the kept copy before the move.
@@ -613,13 +639,15 @@ fn remove_emptied(dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// `gfiles plan exec`: the machine side of the exchange, on stdin/stdout.
+/// `gfiles plan exec`: the machine side of the exchange, on stdin/stdout. Returns the full
+/// hashes apply read, for the caller to store in this machine's catalog (see
+/// `record_hashes`).
 pub fn serve(
     config: &Config,
     lock_path: &Path,
     input: impl BufRead,
     output: impl Write,
-) -> Result<()> {
+) -> Result<Vec<store::Hashed>> {
     let mut out = BufWriter::new(output);
     let hello = Hello {
         gfiles_actions: PROTOCOL,
@@ -627,10 +655,10 @@ pub fn serve(
     };
     writeln!(out, "{}", serde_json::to_string(&hello)?)?;
     out.flush()?;
-    let refuse = |out: &mut BufWriter<_>, msg: String| -> Result<()> {
+    let refuse = |out: &mut BufWriter<_>, msg: String| -> Result<Vec<store::Hashed>> {
         writeln!(out, "{}", serde_json::to_string(&Reply::Error(msg))?)?;
         out.flush()?;
-        Ok(())
+        Ok(Vec::new())
     };
     // Read everything before working, so the hub can finish sending first.
     let lines: Vec<String> = input.lines().collect::<io::Result<_>>()?;
@@ -684,16 +712,42 @@ pub fn serve(
         out.flush()?;
         Ok(())
     });
-    match result {
-        Ok(done) => writeln!(out, "{}", serde_json::to_string(&Reply::Done(done))?)?,
-        Err(e) => writeln!(
-            out,
-            "{}",
-            serde_json::to_string(&Reply::Error(format!("{e:#}")))?
-        )?,
-    }
+    let hashes = match result {
+        Ok(mut done) => {
+            let hashes = std::mem::take(&mut done.hashes);
+            writeln!(out, "{}", serde_json::to_string(&Reply::Done(done))?)?;
+            hashes
+        }
+        Err(e) => {
+            writeln!(
+                out,
+                "{}",
+                serde_json::to_string(&Reply::Error(format!("{e:#}")))?
+            )?;
+            Vec::new()
+        }
+    };
     out.flush()?;
-    Ok(())
+    Ok(hashes)
+}
+
+/// Stores the full hashes a plan run read in this machine's catalog, so the files apply found
+/// different stop matching as duplicates (and kept copies count as confirmed) from the next
+/// pull on. Never fails the run: a busy or missing catalog only means `gfiles hash` would
+/// have to read them again.
+pub fn record_hashes(conn: &Connection, hashes: &[store::Hashed]) {
+    if hashes.is_empty() {
+        return;
+    }
+    // A scan holds the catalog for its whole walk; don't keep the hub waiting that long.
+    let _ = conn.busy_timeout(std::time::Duration::from_secs(30));
+    if let Err(e) = store::record_hashes(conn, hashes) {
+        eprintln!(
+            "warning: couldn't store {} full hashes in the catalog ({e:#}); the files are \
+             fine, `gfiles hash` can compute them again",
+            hashes.len()
+        );
+    }
 }
 
 /// Where `plan apply/undo/empty` runs a plan: in this process, or over SSH on its machine.
@@ -768,7 +822,8 @@ pub fn execute(conn: &mut Connection, route: &Route, op: Op, id: &str) -> Result
         };
         match route {
             Route::Local { config, lock_path } => Lock::take(lock_path)
-                .and_then(|_lock| run(config, op, id, &items, &volumes, |o| record(o, conn))),
+                .and_then(|_lock| run(config, op, id, &items, &volumes, |o| record(o, conn)))
+                .inspect(|done| record_hashes(conn, &done.hashes)),
             Route::Ssh { host, gfiles } => over_ssh(
                 host,
                 gfiles,
@@ -1056,6 +1111,37 @@ mod tests {
         // Running it again (an interrupted apply resuming) counts it as moved.
         let (_, outcomes) = v.run(Op::Apply, &items);
         assert_eq!(reasons(&outcomes), vec!["moved"]);
+    }
+
+    #[test]
+    fn apply_keeps_the_full_hashes_of_files_that_stay() {
+        let v = volume();
+        v.write("k/a.bmp", "same");
+        v.write("t/a.bmp", "same");
+        v.write("t/a copy.bmp", "same");
+        v.write("t/b.bmp", "diff");
+        let items = [
+            v.item(0, "t/a.bmp", "k/a.bmp"),
+            v.item(1, "t/a copy.bmp", "k/a.bmp"),
+            v.item(2, "t/b.bmp", "k/a.bmp"),
+        ];
+        let (done, outcomes) = v.run(Op::Apply, &items);
+        assert_eq!(
+            reasons(&outcomes),
+            vec!["moved", "moved", "its content differs from the kept copy"]
+        );
+        // The kept copy once, and the file that differs; not the files moved away.
+        let hashed: Vec<(&str, bool)> = done
+            .hashes
+            .iter()
+            .map(|h| (h.path.as_str(), h.hash.starts_with("b3:")))
+            .collect();
+        assert_eq!(hashed, vec![("k/a.bmp", true), ("t/b.bmp", true)]);
+        assert_ne!(done.hashes[0].hash, done.hashes[1].hash);
+        assert_eq!(
+            (done.hashes[1].size, done.hashes[1].mtime),
+            v.stat("t/b.bmp")
+        );
     }
 
     #[test]

@@ -425,4 +425,14 @@ fn plan_apply_runs_on_a_remote_over_ssh() {
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["state"], "applied");
     assert_eq!(v["moved"]["files"], 20_000);
+    // The NAS stored the full hash it read of the kept copy, for the hub's next pull.
+    let hash: Option<String> = rusqlite::Connection::open(tmp.path().join("nas.db"))
+        .unwrap()
+        .query_row(
+            "SELECT content_hash FROM entries WHERE path = 'Photos/keep.jpg'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(hash.is_some_and(|h| h.starts_with("b3:")));
 }

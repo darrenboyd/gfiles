@@ -135,15 +135,18 @@ pub fn search(conn: &Connection, q: &Query) -> Result<Vec<Hit>> {
     let rank = if filter.fts { "f.rank" } else { "0" };
     // Files outside a mirror are their own logical file; only mirror rows need the window
     // that keeps one replica of each.
+    let content = crate::dupes::content("e");
     let mut sql = format!(
         "SELECT v.machine, v.name, v.root, e.path, e.kind, e.size, e.mtime, NULL AS mirror,
-                NULL AS mpath, e.fingerprint, {rank} AS rank
+                NULL AS mpath, e.fingerprint, {content} AS content, {rank} AS rank
          {outside}
          UNION ALL
-         SELECT machine, name, root, path, kind, size, mtime, mirror, mpath, fingerprint, rank
+         SELECT machine, name, root, path, kind, size, mtime, mirror, mpath, fingerprint,
+                content, rank
          FROM (
              SELECT v.machine, v.name, v.root, e.path, e.kind, e.size, e.mtime, mf.mirror,
-                    {MIRROR_PATH} AS mpath, e.fingerprint, {rank} AS rank,
+                    {MIRROR_PATH} AS mpath, e.fingerprint, {content} AS content,
+                    {rank} AS rank,
                     row_number() OVER (PARTITION BY {KEY}
                         ORDER BY e.fingerprint IS NULL, v.machine, v.name, e.path) AS rn
              {inside})
@@ -167,14 +170,17 @@ pub fn search(conn: &Connection, q: &Query) -> Result<Vec<Hit>> {
         let mirror: Option<String> = r.get(7)?;
         let mirror_path: Option<String> = r.get(8)?;
         let fingerprint: Option<String> = r.get(9)?;
+        let content: Option<String> = r.get(10)?;
         let replicas = match (&mirror, &mirror_path) {
             (Some(m), Some(mp)) => {
                 details.replicas(m, mp, &r.get::<_, String>(0)?, &r.get::<_, String>(1)?)?
             }
             _ => Vec::new(),
         };
-        let copies = match fingerprint {
-            Some(fp) if size > 0 || fp.starts_with("git:") => Some(details.copies(size, &fp)?),
+        let copies = match (fingerprint, content) {
+            (Some(fp), Some(content)) if size > 0 || fp.starts_with("git:") => {
+                Some(details.copies(size, &fp, &content)?)
+            }
             _ => None,
         };
         hits.push(Hit {
@@ -206,7 +212,8 @@ impl<'c> Details<'c> {
             copies: conn.prepare(&format!(
                 "SELECT count(DISTINCT {PLACE})
                  FROM entries e JOIN volumes v ON v.id = e.volume_id{JOIN}
-                 WHERE e.size = ?1 AND e.fingerprint = ?2"
+                 WHERE e.size = ?1 AND e.fingerprint = ?2 AND {content} = ?3",
+                content = crate::dupes::content("e")
             ))?,
             folders: conn.prepare(
                 "SELECT mf.volume_id, mf.prefix, v.machine, v.name, v.root
@@ -217,10 +224,10 @@ impl<'c> Details<'c> {
         })
     }
 
-    fn copies(&mut self, size: i64, fingerprint: &str) -> Result<i64> {
+    fn copies(&mut self, size: i64, fingerprint: &str, content: &str) -> Result<i64> {
         Ok(self
             .copies
-            .query_row(params![size, fingerprint], |r| r.get(0))?)
+            .query_row(params![size, fingerprint, content], |r| r.get(0))?)
     }
 
     /// The replicas of a mirror file other than the one on `machine`'s `volume`.

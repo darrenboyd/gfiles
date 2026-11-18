@@ -11,7 +11,8 @@
 //! toward any pair.
 //!
 //! Only same-machine copies count, and only files a plan could remove: fingerprinted, not
-//! empty, not a repository, not in a mirror, and not already moved by an applied plan.
+//! empty, not a repository, not in a mirror, and not already moved by an applied plan. Copies
+//! match as duplicates do (see `dupes::content`).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -19,6 +20,7 @@ use anyhow::Result;
 use rusqlite::{Connection, params};
 use serde::Serialize;
 
+use crate::dupes::content;
 use crate::mirror::{FolderRef, JOIN};
 use crate::plan::{self, NOT_MOVED, Tally};
 
@@ -99,15 +101,17 @@ pub fn pairs(conn: &Connection, machine: Option<&str>, limit: Option<usize>) -> 
             ..Default::default()
         },
     )?;
+    let (content, o_content) = (content("e"), content("o"));
     let sql = format!(
-        "SELECT v.machine, v.name, e.path, e.size, e.fingerprint
+        "SELECT v.machine, v.name, e.path, e.size, {content} AS content
          FROM entries e JOIN volumes v ON v.id = e.volume_id{JOIN}
          WHERE e.size > 0 AND e.fingerprint LIKE 'p1:%' AND e.kind != 'repo'
            AND mf.mirror IS NULL AND (?1 IS NULL OR v.machine = ?1) AND {NOT_MOVED}
            AND EXISTS (SELECT 1 FROM entries o JOIN volumes ov ON ov.id = o.volume_id
                        WHERE o.size = e.size AND o.fingerprint = e.fingerprint
+                         AND {o_content} = {content}
                          AND ov.machine = v.machine AND o.id != e.id)
-         ORDER BY v.machine, e.size, e.fingerprint"
+         ORDER BY v.machine, e.size, content"
     );
     let mut stmt = conn.prepare(&sql)?;
     let mut rows = stmt.query(params![machine])?;

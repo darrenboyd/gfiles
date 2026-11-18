@@ -319,6 +319,36 @@ pub fn forget_volume(conn: &Connection, volume_id: &str) -> Result<usize> {
     Ok(conn.execute("DELETE FROM volumes WHERE id = ?1", [volume_id])?)
 }
 
+/// A full content hash read from a file outside a scan (by `plan apply`), with the size and
+/// mtime the file had when it was read.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Hashed {
+    pub volume_id: String,
+    pub path: String,
+    pub size: i64,
+    pub mtime: i64,
+    pub hash: String,
+}
+
+/// Stores full hashes on the entries they were read from, only where the entry still has the
+/// same size and mtime (a file that changed since is left alone, as `gfiles hash` does).
+/// Returns how many were stored.
+pub fn record_hashes(conn: &Connection, hashes: &[Hashed]) -> Result<usize> {
+    let tx = conn.unchecked_transaction()?;
+    let mut stored = 0;
+    {
+        let mut update = tx.prepare(
+            "UPDATE entries SET content_hash = ?5
+             WHERE volume_id = ?1 AND path = ?2 AND size = ?3 AND mtime = ?4",
+        )?;
+        for h in hashes {
+            stored += update.execute(params![h.volume_id, h.path, h.size, h.mtime, h.hash])?;
+        }
+    }
+    tx.commit()?;
+    Ok(stored)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -474,5 +504,63 @@ mod tests {
         assert!(is_within("a", "a"));
         assert!(!is_within("ab/c", "a"));
         assert!(!is_within("b", "a"));
+    }
+
+    #[test]
+    fn hashes_are_stored_only_on_unchanged_entries() {
+        let conn = crate::db::open_in_memory().unwrap();
+        let vol = Volume {
+            id: "v1".into(),
+            name: "darren".into(),
+            machine: "elrond".into(),
+            root: "/elrond/darren".into(),
+            last_scan_at: None,
+        };
+        let mut w = VolumeWriter::begin(&conn, &vol).unwrap();
+        for path in ["same.bmp", "changed.bmp"] {
+            w.put(&Entry {
+                path: path.into(),
+                name: path.into(),
+                ext: Some("bmp".into()),
+                kind: "photo".into(),
+                size: 10,
+                mtime: 7,
+                fingerprint: None,
+                content_hash: None,
+            })
+            .unwrap();
+        }
+        w.finish(0, &[]).unwrap();
+        let hashed = |path: &str, mtime: i64| Hashed {
+            volume_id: "v1".into(),
+            path: path.into(),
+            size: 10,
+            mtime,
+            hash: HASH.into(),
+        };
+        let stored = record_hashes(
+            &conn,
+            &[
+                hashed("same.bmp", 7),
+                hashed("changed.bmp", 8),
+                hashed("gone.bmp", 7),
+            ],
+        )
+        .unwrap();
+        assert_eq!(stored, 1);
+        let hashes: Vec<(String, Option<String>)> = conn
+            .prepare("SELECT path, content_hash FROM entries ORDER BY path")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            hashes,
+            vec![
+                ("changed.bmp".to_string(), None),
+                ("same.bmp".to_string(), Some(HASH.to_string()))
+            ]
+        );
     }
 }

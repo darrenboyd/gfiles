@@ -69,6 +69,9 @@ confirm, hash a volume (or one folder of it) on the machine that holds it, then 
 ~/.local/bin/gfiles hash Media Photos/2019   # reads every byte: slow on big folders
 ```
 
+Applying a cleanup plan also stores the full hashes it reads of kept copies, and of files it
+skipped because their content differed, so those stop showing as duplicates after the next pull.
+
 ## 3. The hub
 
 On `gaffer`, add local folders:

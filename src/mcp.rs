@@ -41,9 +41,11 @@ A mirror is a folder kept the same on several machines by a sync tool (like Goog
 its files appear once, with their other replicas, and a mirror counts as one place for \
 backups, since the sync tool copies deletes too. Files match by a sampled fingerprint of \
 their content: 'probable' or 'probably covered' means the full content wasn't compared yet \
-(the user can run `gfiles hash` to confirm). Use find_duplicates for wasted space, \
-backup_coverage for files with no copy on another machine, and mirror_health to see whether \
-mirrors are in sync. To reclaim duplicate space on one machine: folder_overlaps finds folder \
+(the user can run `gfiles hash` to confirm); files whose full hashes differ never match. \
+A cleanup plan's 'confirmed' total counts removals whose full hashes already agree; the rest \
+are probable, and apply compares full contents before moving each. Use find_duplicates for \
+wasted space, backup_coverage for files with no copy on another machine, and mirror_health to \
+see whether mirrors are in sync. To reclaim duplicate space on one machine: folder_overlaps finds folder \
 pairs holding the same files, drain_preview shows what emptying a folder would free and what \
 would stay, and draft_cleanup_plan saves a reviewable plan. Tools never move or delete files: \
 the user applies a plan themselves with `gfiles plan apply <id>` at a terminal. Applying moves \

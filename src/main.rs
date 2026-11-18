@@ -645,12 +645,21 @@ fn plan_command(
                 );
             }
             let config = Config::load(config_path)?;
-            apply::serve(
+            let hashes = apply::serve(
                 &config,
                 &lock_path,
                 std::io::stdin().lock(),
                 std::io::stdout().lock(),
-            )
+            )?;
+            if !hashes.is_empty() {
+                match db::open(db_path) {
+                    Ok(conn) => apply::record_hashes(&conn, &hashes),
+                    Err(e) => {
+                        eprintln!("warning: couldn't open the catalog to store hashes: {e:#}")
+                    }
+                }
+            }
+            Ok(())
         }
     }
 }
@@ -897,6 +906,17 @@ fn print_plan(v: &plan::View) {
         plan_folders(s)
     );
     println!("  removes {}", tally(&s.remove));
+    let probable = plan::Tally {
+        files: s.remove.files - s.confirmed.files,
+        bytes: s.remove.bytes - s.confirmed.bytes,
+    };
+    if s.state == "draft" && s.remove.files > 0 {
+        println!("    confirmed {} (full hashes agree)", tally(&s.confirmed));
+        println!(
+            "    probable  {} (sampled fingerprints agree)",
+            tally(&probable)
+        );
+    }
     println!("  leaves  {}", tally(&s.left));
     if s.moved.files + s.skipped.files > 0 {
         println!("  moved   {}", tally(&s.moved));
@@ -979,6 +999,15 @@ fn print_plan(v: &plan::View) {
         }
     } else if let Some(u) = &v.under {
         println!("\nThe plan leaves nothing in {u}.");
+    }
+    if s.state == "draft" && probable.files > 0 {
+        println!(
+            "\nApply compares each probable file's full contents with its kept copy and skips it \
+             if they differ. To confirm them now, run `gfiles hash <volume> <folder>` on {} for \
+             the plan's folders and the folders holding the kept copies (another machine's \
+             hashes arrive with its next `gfiles pull`).",
+            s.machine
+        );
     }
 }
 

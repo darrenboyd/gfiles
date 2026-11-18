@@ -180,7 +180,10 @@ scratch directory, when trying the binary out, so experiments never touch the re
 - **Repos** are one `repo` row with size 0. Their size isn't computed yet. They match each
   other by HEAD commit.
 - **Duplicates and coverage:** same size + sampled fingerprint is a "probable" match; equal
-  full hashes on every copy (`gfiles hash`) make it confirmed. Zero-byte files never match.
+  full hashes on every copy (`gfiles hash`) make it confirmed. Full hashes that differ always
+  win: when files sharing a size and fingerprint have different full hashes, they match only
+  by full hash, and one without a hash matches only others without one (`dupes::content`,
+  used by duplicates, coverage, search, overlaps and plans). Zero-byte files never match.
   A file is covered when its content is in at least two places and on at least two machines,
   where a place is a machine, or a whole mirror (the sync tool replicates deletes, so a
   mirror's replicas aren't backups of each other). Mirrors live in the hub's config and
@@ -222,7 +225,11 @@ scratch directory, when trying the binary out, so experiments never touch the re
   repos never removed. The copy that stays is outside the plan's folders when one exists, else
   the shortest path, then alphabetical; a keep-over plan only keeps copies in its keeper.
   `--except` folders (inside the folders files are removed from) are left out entirely, and
-  count as outside, so a copy there can be the one that stays. Plans are stored on the hub; `apply` runs in-process for this machine and as
+  count as outside, so a copy there can be the one that stays. A removal is confirmed when
+  the file and its kept copy already have equal full hashes in the catalog, else probable;
+  `plan show` counts both for a draft. Apply stores the full hashes it reads of files that
+  stay (kept copies, and files it skipped as different) in that machine's own catalog,
+  guarded by size and mtime, so the hub learns them at its next pull. Plans are stored on the hub; `apply` runs in-process for this machine and as
   `ssh <apply_host> gfiles plan exec` for a remote (format in `apply`'s module doc, versioned
   by `apply::PROTOCOL`). Files go to `<volume root>/.gfiles-trash/<plan id>/files/`, which scans
   always skip; the catalog forgets them at the next scan, and until then overlaps and new plans
