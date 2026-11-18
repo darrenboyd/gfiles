@@ -10,13 +10,13 @@
 //! └─────────────┘└───────────────────────────────────────┘
 //! ┌ Details ─────────────────────────────────────────────┐
 //! │ gaffer:/home/darren/Books/Tolkien/The Hobbit.epub    │
-//! │ book · 1.1 MB · modified 2025-03-02 · in 2 places    │
+//! │ book · 1.1 MB · modified 2025-03-02 · 2 copies in 2 p…│
 //! │ mirror books, also at elrond:/volume1/darren/Books/… │
 //! └──────────────────────────────────────────────────────┘
 //!  type to search  ↑↓ move  Tab kind  Enter print path  Esc clear/quit
 //! ```
 //!
-//! The copies column counts places holding the same content, where a place is a machine or a
+//! The ×N column counts places holding the same content, where a place is a machine or a
 //! whole mirror (as backup coverage counts them): ×1, in yellow, means no copy on another
 //! machine; blank means not fingerprinted yet.
 
@@ -140,7 +140,7 @@ fn draw_results(frame: &mut Frame, app: &mut App, area: Rect) {
         Row::new(vec![
             Cell::from(h.kind.as_str()),
             Cell::from(Line::from(fmt::size(h.size)).right_aligned()),
-            copies_cell(h.copies),
+            copies_cell(h.places),
             Cell::from(truncate_left(
                 &format!("{}:{}", h.machine, h.volume),
                 loc_width as usize,
@@ -178,10 +178,13 @@ fn draw_details(frame: &mut Frame, app: &App, area: Rect) {
     let width = area.width.saturating_sub(2) as usize;
     let lines = match app.selected() {
         Some(h) => {
-            let copies = match h.copies {
-                None => "not fingerprinted yet".to_string(),
-                Some(1) => "in 1 place".to_string(),
-                Some(n) => format!("in {n} places"),
+            let copies = match (h.copies, h.places) {
+                (Some(c), Some(p)) => format!(
+                    "{c} {} in {p} {}",
+                    if c == 1 { "copy" } else { "copies" },
+                    if p == 1 { "place" } else { "places" }
+                ),
+                _ => "not fingerprinted yet".to_string(),
             };
             let mut lines = vec![
                 Line::from(truncate_left(

@@ -32,11 +32,15 @@ pub struct Hit {
     /// The mirror file's other replicas.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub replicas: Vec<Replica>,
-    /// Places in the catalog holding this content, this one included, where a place is a
-    /// machine or a whole mirror (as `dupes::coverage` counts them); absent until the file is
-    /// fingerprinted. 1 means no copy on another machine or outside its mirror.
+    /// Copies of this content in the catalog, this one included (a mirror file counts once,
+    /// as `dupes` counts copies); absent until the file is fingerprinted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub copies: Option<i64>,
+    /// Places holding those copies, where a place is a machine or a whole mirror (as
+    /// `dupes::coverage` counts them). 1 means no copy on another machine or outside its
+    /// mirror: no backup.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub places: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -177,11 +181,12 @@ pub fn search(conn: &Connection, q: &Query) -> Result<Vec<Hit>> {
             }
             _ => Vec::new(),
         };
-        let copies = match (fingerprint, content) {
+        let (copies, places) = match (fingerprint, content) {
             (Some(fp), Some(content)) if size > 0 || fp.starts_with("git:") => {
-                Some(details.copies(size, &fp, &content)?)
+                let (copies, places) = details.copies(size, &fp, &content)?;
+                (Some(copies), Some(places))
             }
-            _ => None,
+            _ => (None, None),
         };
         hits.push(Hit {
             machine: r.get(0)?,
@@ -194,6 +199,7 @@ pub fn search(conn: &Connection, q: &Query) -> Result<Vec<Hit>> {
             mirror,
             replicas,
             copies,
+            places,
         });
     }
     Ok(hits)
@@ -210,7 +216,7 @@ impl<'c> Details<'c> {
     fn new(conn: &'c Connection) -> Result<Details<'c>> {
         Ok(Details {
             copies: conn.prepare(&format!(
-                "SELECT count(DISTINCT {PLACE})
+                "SELECT count(DISTINCT {KEY}), count(DISTINCT {PLACE})
                  FROM entries e JOIN volumes v ON v.id = e.volume_id{JOIN}
                  WHERE e.size = ?1 AND e.fingerprint = ?2 AND {content} = ?3",
                 content = crate::dupes::content("e")
@@ -224,10 +230,13 @@ impl<'c> Details<'c> {
         })
     }
 
-    fn copies(&mut self, size: i64, fingerprint: &str, content: &str) -> Result<i64> {
+    /// Copies of a content, and the places holding them.
+    fn copies(&mut self, size: i64, fingerprint: &str, content: &str) -> Result<(i64, i64)> {
         Ok(self
             .copies
-            .query_row(params![size, fingerprint, content], |r| r.get(0))?)
+            .query_row(params![size, fingerprint, content], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?)
     }
 
     /// The replicas of a mirror file other than the one on `machine`'s `volume`.
@@ -489,13 +498,17 @@ mod tests {
         );
         assert_eq!(hit.replicas.len(), 1);
         assert_eq!(hit.replicas[0].machine, "gaffer");
-        assert_eq!(hit.copies, Some(1), "a mirror is one place");
+        assert_eq!(
+            (hit.copies, hit.places),
+            (Some(1), Some(1)),
+            "a mirror file is one copy in one place"
+        );
 
         let hits = search(&conn, &q("essay")).unwrap();
         assert_eq!(hits.len(), 2);
         assert!(
             hits.iter()
-                .all(|h| h.copies == Some(2) && h.replicas.is_empty())
+                .all(|h| h.copies == Some(2) && h.places == Some(2) && h.replicas.is_empty())
         );
 
         let folders = folders(&conn, &q("hobbit")).unwrap();
@@ -546,8 +559,9 @@ mod tests {
         let hits = search(&conn, &q).unwrap();
         assert_eq!(hits.len(), 2);
         assert!(
-            hits.iter().all(|h| h.copies == Some(1)),
-            "no backup elsewhere"
+            hits.iter()
+                .all(|h| h.copies == Some(2) && h.places == Some(1)),
+            "two copies, but no backup elsewhere"
         );
     }
 

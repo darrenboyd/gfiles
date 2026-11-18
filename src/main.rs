@@ -415,7 +415,8 @@ fn main() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&out)?);
             } else {
                 for h in &hits {
-                    let copies = h.copies.map_or(String::new(), |n| format!("×{n}"));
+                    // Places, as in the TUI: ×1 means no backup elsewhere.
+                    let copies = h.places.map_or(String::new(), |n| format!("×{n}"));
                     println!(
                         "{:<9}{:>9} {:>3}  {}:{}",
                         h.kind,

@@ -144,8 +144,8 @@ scratch directory, when trying the binary out, so experiments never touch the re
 - `src/platform.rs`: the OS-specific bits (no-follow open, network filesystem detection).
 - `src/search.rs`: queries shared by every interface (CLI, TUI and MCP). Interfaces
   stay thin and call into it (and `dupes`, `mirror`), so they can't drift apart. A mirror
-  file is one hit, listing its other replicas; each hit says how many places hold its
-  content.
+  file is one hit, listing its other replicas; each hit says how many copies of its content
+  exist (`copies`) and in how many places (`places`, as backup coverage counts them).
 - `src/overlap.rs`: folder pairs that share content on one machine, and drain previews.
 - `src/plan.rs`: building cleanup plans (which copy stays, what's left and why), the
   synced-folder refusal, and plan storage (`plans`, `plan_items`, `plan_left`).

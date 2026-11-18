@@ -273,7 +273,9 @@ fn tool_definitions() -> Value {
             "description": "List individual files matching words in their name or path, \
                 optionally limited to a kind, volume or machine. Results are ranked by \
                 relevance when words are given. Each result has the machine, volume, \
-                absolute path, kind, size in bytes and modification time (unix seconds). \
+                absolute path, kind, size in bytes and modification time (unix seconds), and \
+                once fingerprinted, `copies` (files with the same content, a mirror file \
+                once) and `places` (machines or mirrors holding them; 1 means no backup). \
                 Also returns the total number of matches, which can exceed the limit.",
             "inputSchema": {
                 "type": "object",
