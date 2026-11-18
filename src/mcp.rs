@@ -17,7 +17,7 @@ use crate::config::Config;
 use crate::dupes::{self, Filters};
 use crate::plan::{self, Spec};
 use crate::search::{self, Query};
-use crate::{classify, mirror, overlap};
+use crate::{classify, mirror, overlap, plantree};
 
 /// Protocol versions this server can speak; it answers with the client's if listed, else the
 /// newest. Tools-only servers behave the same under all of them.
@@ -429,7 +429,14 @@ fn tool_definitions() -> Value {
             "description": "A cleanup plan's totals, the files it removes with the copy that \
                 stays for each (and, once applied, whether each moved), and what it leaves: \
                 by reason, by folder one level below the plan's folders, and the biggest \
-                files. Pass `under` to drill into one folder.",
+                files. Pass `under` to drill into one folder. Pass `folders: true` instead for \
+                a tree of the folders the plan changes: for each, the files leaving (`out`), \
+                arriving (`in`) and staying (`stays`), each as {files, bytes}, and whether it \
+                `empties`. Numbers include everything below it. `folder` is the folder itself; \
+                `name` is its label below its parent, several levels when a folder holding only \
+                one changed subfolder shares its node. `has_left_out` means it holds a folder \
+                the plan leaves out, whose files `stays` doesn't count. `cut_at_depth` says \
+                deeper folders were counted in their ancestor; `depth` null means every level.",
             "inputSchema": {"type": "object", "required": ["id"], "properties": {
                 "id": {"type": "string"},
                 "limit": limit_prop(SEARCH_DEFAULT_LIMIT),
@@ -439,6 +446,19 @@ fn tool_definitions() -> Value {
                         a left_by_folder entry). Limits the files it removes and the leftovers \
                         to it, and groups the leftovers one level below it. Totals stay the \
                         whole plan's."
+                },
+                "folders": {
+                    "type": "boolean",
+                    "description": "Return the folder tree instead (see above); `under` roots it."
+                },
+                "depth": {
+                    "type": "integer", "minimum": 0,
+                    "description": "With `folders`: levels below each top folder (default 3). \
+                        Deeper folders count in their ancestor's numbers."
+                },
+                "all": {
+                    "type": "boolean",
+                    "description": "With `folders`: every level, however deep."
                 },
             }},
             "annotations": {"readOnlyHint": true},
@@ -615,6 +635,40 @@ fn show_cleanup_plan(conn: &Connection, args: &Value) -> Result<Value> {
     let under = string_arg(args, "under")?
         .map(|u| mirror::parse_folder(&u))
         .transpose()?;
+    let flag = |key: &str| -> Result<bool> {
+        match args.get(key) {
+            None | Some(Value::Null) => Ok(false),
+            Some(Value::Bool(b)) => Ok(*b),
+            Some(other) => anyhow::bail!("{key} must be true or false, got {other}"),
+        }
+    };
+    let depth = match args.get("depth") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(
+            v.as_u64()
+                .ok_or_else(|| anyhow::anyhow!("depth must be a whole number, 0 or more"))?
+                as usize,
+        ),
+    };
+    let (folders, all) = (flag("folders")?, flag("all")?);
+    if !folders && (depth.is_some() || all) {
+        anyhow::bail!("depth and all apply to the folder tree: pass folders: true");
+    }
+    if depth.is_some() && all {
+        anyhow::bail!("pass depth or all, not both");
+    }
+    if folders && !matches!(args.get("limit"), None | Some(Value::Null)) {
+        anyhow::bail!("limit doesn't apply to the folder tree; use depth to make it smaller");
+    }
+    if folders {
+        let depth = (!all).then(|| depth.unwrap_or(plantree::DEFAULT_DEPTH));
+        return Ok(serde_json::to_value(plantree::build(
+            conn,
+            &id,
+            depth,
+            under.as_ref(),
+        )?)?);
+    }
     Ok(serde_json::to_value(plan::show(
         conn,
         &id,
@@ -993,6 +1047,23 @@ mod tests {
             r["structuredContent"]["items"][0]["keep_path"],
             "Photos/a.jpg"
         );
+        let r = call_tool(
+            &conn,
+            "show_cleanup_plan",
+            json!({"id": id, "folders": true, "depth": 0}),
+        );
+        let tree = &r["structuredContent"];
+        assert_eq!(tree["folders"][0]["folder"], "elrond:darren/todo", "{r}");
+        assert_eq!(tree["folders"][0]["out"]["files"], plan["remove"]["files"]);
+        assert!(tree["folders"][0].get("children").is_none(), "{r}");
+        for bad in [
+            json!({"id": id, "depth": 2}),
+            json!({"id": id, "folders": true, "depth": 1, "all": true}),
+            json!({"id": id, "folders": true, "limit": 5}),
+        ] {
+            let r = call_tool(&conn, "show_cleanup_plan", bad);
+            assert_eq!(r["isError"], true, "{r}");
+        }
         let r = call_tool(&conn, "list_cleanup_plans", json!({}));
         assert_eq!(r["structuredContent"]["plans"][0]["id"], id);
         // Drafting moved nothing: the catalog still sees both copies.

@@ -10,7 +10,7 @@ use gfiles::config::{self, Config};
 use gfiles::dupes::{self, Filters};
 use gfiles::plan::{self, Spec};
 use gfiles::search::{self, Query};
-use gfiles::{classify, db, fmt, mirror, overlap, scan, store};
+use gfiles::{classify, db, fmt, mirror, overlap, plantree, scan, store};
 
 /// Catalog and organize your files across all your machines.
 ///
@@ -237,6 +237,13 @@ enum PlanCommand {
         /// down what's left in it one level down, and list its biggest leftover files
         #[arg(long)]
         under: Option<String>,
+        /// Show the folders the plan changes, as a tree: what leaves each, what arrives, and
+        /// what stays (or that it empties)
+        #[arg(long, conflicts_with = "limit")]
+        folders: bool,
+        /// Levels of the --folders tree below each top folder (default 3; --all for every level)
+        #[arg(long, requires = "folders", conflicts_with = "all")]
+        depth: Option<usize>,
         #[arg(long)]
         json: bool,
     },
@@ -638,10 +645,26 @@ fn plan_command(
             limit,
             all,
             under,
+            folders,
+            depth,
             json,
         } => {
             let conn = db::open(db_path)?;
             let under = under.as_deref().map(mirror::parse_folder).transpose()?;
+            if folders {
+                let depth = if all {
+                    None
+                } else {
+                    Some(depth.unwrap_or(plantree::DEFAULT_DEPTH))
+                };
+                let tree = plantree::build(&conn, &id, depth, under.as_ref())?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&tree)?);
+                } else {
+                    print_folder_tree(&tree);
+                }
+                return Ok(());
+            }
             let view = plan::show(&conn, &id, (!all).then_some(limit), under.as_ref())?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&view)?);
@@ -939,6 +962,90 @@ fn plan_scope(s: &plan::Summary) -> String {
         text.push_str(&format!(" except {}", s.except.join(", ")));
     }
     text
+}
+
+/// A plan's folder tree, one folder a line: what leaves it, what arrives, what stays.
+fn print_folder_tree(t: &plantree::FolderTree) {
+    let s = &t.summary;
+    println!(
+        "Plan {} ({}, {}): {}",
+        s.id,
+        s.state,
+        fmt::date_time(s.created_at),
+        plan_folders(s)
+    );
+    if t.folders.is_empty() {
+        let place = match &t.under {
+            Some(u) => u.to_string(),
+            None => "its folders".to_string(),
+        };
+        println!("\nIt changes nothing in {place}.");
+        return;
+    }
+    // Columns: indented name, files and bytes leaving, files and bytes arriving, what stays.
+    let mut rows: Vec<[String; 6]> = Vec::new();
+    fn walk(n: &plantree::FolderNode, level: usize, rows: &mut Vec<[String; 6]>) {
+        let signed = |sign: char, t: plan::Tally| {
+            if t.files == 0 {
+                [String::new(), String::new()]
+            } else {
+                [
+                    format!("{sign}{} files", t.files),
+                    format!("{sign}{}", fmt::size(t.bytes)),
+                ]
+            }
+        };
+        let mut stays = if n.empties {
+            "empties".to_string()
+        } else if n.stays.files == 0 {
+            // Only new arrivals: nothing was there before.
+            String::new()
+        } else {
+            format!(
+                "stays {} files, {}",
+                n.stays.files,
+                fmt::size(n.stays.bytes)
+            )
+        };
+        if n.has_left_out {
+            stays.push_str(" (and a folder the plan leaves out)");
+            stays = stays.trim_start().to_string();
+        }
+        let [out_files, out_bytes] = signed('-', n.out);
+        let [in_files, in_bytes] = signed('+', n.into);
+        rows.push([
+            format!("{}{}", "  ".repeat(level), n.name),
+            out_files,
+            out_bytes,
+            in_files,
+            in_bytes,
+            stays,
+        ]);
+        for c in &n.children {
+            walk(c, level + 1, rows);
+        }
+    }
+    for n in &t.folders {
+        walk(n, 0, &mut rows);
+    }
+    let w: Vec<usize> = (0..5)
+        .map(|i| rows.iter().map(|r| r[i].chars().count()).max().unwrap_or(0))
+        .collect();
+    println!();
+    for r in &rows {
+        let pad = w[0] - r[0].chars().count();
+        let mut line = format!("{}{:pad$}", r[0], "");
+        for i in 1..5 {
+            if w[i] > 0 {
+                line.push_str(&format!("  {:>width$}", r[i], width = w[i]));
+            }
+        }
+        line.push_str(&format!("  {}", r[5]));
+        println!("{}", line.trim_end());
+    }
+    if t.cut_at_depth {
+        println!("\nDeeper folders are counted in the folder above them (use --depth N or --all).");
+    }
 }
 
 fn print_plan(v: &plan::View) {

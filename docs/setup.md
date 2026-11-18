@@ -175,6 +175,7 @@ gfiles plan drain elrond:darren/todo --except elrond:darren/todo/Pictures   # bu
 gfiles plan keep elrond:darren/Photos --over elrond:darren/todo   # remove what Photos also holds
 gfiles plan show <id> --all                                  # review every file
 gfiles plan show <id> --under elrond:darren/todo/Incoming    # what it leaves there, by folder
+gfiles plan show <id> --folders                              # each folder it changes: what leaves, what stays
 gfiles plan apply <id>                                       # asks you to type the id
 gfiles plan undo <id>                                        # put everything back
 gfiles plan empty <id>                                       # free the space for good
@@ -219,6 +220,7 @@ entry per line, all on one machine:
 ```bash
 gfiles plan import list.jsonl        # or - for stdin; prints the draft and any rejected lines
 gfiles plan show <id> --all          # review it, then apply, undo and empty as above
+gfiles plan show <id> --folders      # where moves go, and what leaves and stays in each folder
 ```
 
 A removal without `vouched` is checked like a drain: apply compares its full content with the

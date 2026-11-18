@@ -10,6 +10,7 @@ pub mod mcp;
 pub mod mirror;
 pub mod overlap;
 pub mod plan;
+pub mod plantree;
 pub mod platform;
 pub mod scan;
 pub mod search;

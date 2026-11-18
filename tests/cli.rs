@@ -387,6 +387,42 @@ fn a_plan_from_a_list_moves_and_removes_then_undoes() {
     let id = plans[0]["id"].as_str().unwrap().to_string();
     assert_eq!(plans[0]["kind"], "list");
 
+    // The folder tree shows both ends of the move.
+    let out = gfiles()
+        .args(["plan", "show", &id, "--folders"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    let line = |name: &str| {
+        text.lines()
+            .find(|l| l.trim_start().starts_with(name))
+            .unwrap_or_else(|| panic!("no {name} line in {text}"))
+            .to_string()
+    };
+    assert!(line("elrond:darren ").contains("-2 files"), "{text}");
+    assert!(line("todo").contains("-2 files"), "{text}");
+    assert!(line("todo").contains("empties"), "{text}");
+    let dest = line("2013/08");
+    assert!(dest.contains("+1 files") && !dest.contains("-1"), "{text}");
+    let out = gfiles()
+        .args(["plan", "show", &id, "--folders", "--json"])
+        .output()
+        .unwrap();
+    let tree: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(tree["folders"][0]["folder"], "elrond:darren");
+    assert_eq!(tree["folders"][0]["out"]["files"], 2);
+    assert_eq!(tree["folders"][0]["in"]["files"], 1);
+    for bad in [
+        vec!["--folders", "--depth", "1", "--all"],
+        vec!["--depth", "1"],
+    ] {
+        gfiles()
+            .args(["plan", "show", &id])
+            .args(bad)
+            .assert()
+            .failure();
+    }
+
     let out = under_pty(&envs, &format!("plan apply {id}"), &id);
     assert!(out.contains("vouched for"), "{out}");
     assert!(out.contains("Moved 2 files, skipped 0"), "{out}");

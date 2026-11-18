@@ -108,6 +108,7 @@ gfiles plan drain <folder>... [--except <dir>]... [--json]  # draft plan: remove
 gfiles plan keep <keeper> --over <folder> [--except <dir>]... [--json]      # draft plan: remove what keeper holds
 gfiles plan import <list.jsonl | -> [--json]  # draft plan from another tool's list of moves and removals
 gfiles plan list | show <id> [--under <folder>] [-n | --all] [--json]
+gfiles plan show <id> --folders [--depth N | --all] [--under <folder>]  # tree: what leaves, arrives, stays per folder
 gfiles plan apply | undo | empty <id>   # Darren only: asks for the id on the terminal
 gfiles plan drop <id>                   # delete a draft
 gfiles hash <volume> [folder]           # full BLAKE3 hashes, to confirm duplicates (slow)
@@ -155,6 +156,8 @@ scratch directory, when trying the binary out, so experiments never touch the re
   `plan_rejected`).
 - `src/listplan.rs`: plans from a supplied list (JSON lines of removals and moves): parsing
   and checking each entry against the catalog, and rejecting the ones that fail.
+- `src/plantree.rs`: a plan's folder tree (`plan show --folders`, and the MCP tool with
+  `folders: true`): what leaves, arrives and stays in each folder it changes.
 - `src/apply.rs`: the only code that writes under a volume root: moves to the trash and to
   a list's destinations, undo, empty, the per-machine lock, and the `plan exec` exchange the hub runs over SSH.
 - `src/fmt.rs`: sizes and dates for display (dates are UTC, computed without a date crate).
