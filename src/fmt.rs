@@ -1,12 +1,13 @@
 //! Human-readable formatting shared by the CLI and TUI.
 
-/// `1536` → `"1.5 KB"`. Binary units, one decimal.
+/// `1500` → `"1.5 KB"`. Decimal units (1 KB = 1000 bytes, as drive makers and most file
+/// managers count), one decimal.
 pub fn size(bytes: i64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut size = bytes as f64;
     let mut unit = 0;
-    while size >= 1024.0 && unit < UNITS.len() - 1 {
-        size /= 1024.0;
+    while size >= 1000.0 && unit < UNITS.len() - 1 {
+        size /= 1000.0;
         unit += 1;
     }
     if unit == 0 {
@@ -16,7 +17,7 @@ pub fn size(bytes: i64) -> String {
     }
 }
 
-/// `"100M"`, `"1.5G"`, `"512"` → bytes (binary units, as `size` prints them).
+/// `"100M"`, `"1.5G"`, `"512"` → bytes (decimal units, as `size` prints them).
 pub fn parse_size(s: &str) -> Result<i64, String> {
     let s = s.trim();
     let split = s
@@ -26,15 +27,15 @@ pub fn parse_size(s: &str) -> Result<i64, String> {
     let number: f64 = number
         .parse()
         .map_err(|_| format!("{s:?} isn't a size like 500K, 100M or 2G"))?;
-    let shift = match unit.trim().to_ascii_uppercase().trim_end_matches('B') {
+    let power = match unit.trim().to_ascii_uppercase().trim_end_matches('B') {
         "" => 0,
-        "K" => 10,
-        "M" => 20,
-        "G" => 30,
-        "T" => 40,
+        "K" => 1,
+        "M" => 2,
+        "G" => 3,
+        "T" => 4,
         _ => return Err(format!("{s:?} isn't a size like 500K, 100M or 2G")),
     };
-    Ok((number * (1u64 << shift) as f64) as i64)
+    Ok((number * 1000f64.powi(power)) as i64)
 }
 
 /// Unix seconds → `"YYYY-MM-DD"` (UTC), without pulling in a date library.
@@ -70,8 +71,8 @@ mod tests {
     #[test]
     fn parses_sizes() {
         assert_eq!(parse_size("512"), Ok(512));
-        assert_eq!(parse_size("100M"), Ok(100 << 20));
-        assert_eq!(parse_size("1.5gb"), Ok(3 << 29));
+        assert_eq!(parse_size("100M"), Ok(100_000_000));
+        assert_eq!(parse_size("1.5gb"), Ok(1_500_000_000));
         assert!(parse_size("lots").is_err());
         assert!(parse_size("5X").is_err());
     }
@@ -79,9 +80,9 @@ mod tests {
     #[test]
     fn sizes() {
         assert_eq!(size(0), "0 B");
-        assert_eq!(size(1023), "1023 B");
-        assert_eq!(size(1536), "1.5 KB");
-        assert_eq!(size(5 * 1024 * 1024 * 1024), "5.0 GB");
+        assert_eq!(size(999), "999 B");
+        assert_eq!(size(1500), "1.5 KB");
+        assert_eq!(size(107_056_950_876), "107.1 GB");
     }
 
     #[test]

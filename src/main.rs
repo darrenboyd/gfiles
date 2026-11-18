@@ -603,7 +603,7 @@ fn plan_command(
                         p.kind,
                         p.remove.files,
                         fmt::size(p.remove.bytes),
-                        p.folders.join(" ")
+                        plan_scope(p)
                     );
                 }
             }
@@ -873,12 +873,14 @@ fn print_drain(p: &overlap::Preview) {
 
 /// A plan's kind and folders, as `drain a b` or `keep a over b`.
 fn plan_folders(s: &plan::Summary) -> String {
-    let mut text = format!(
-        "{} {}",
-        s.kind,
-        s.folders
-            .join(if s.kind == "keep" { " over " } else { " " })
-    );
+    format!("{} {}", s.kind, plan_scope(s))
+}
+
+/// A plan's folders, as `a b`, `a over b`, plus `except c` for the folders it leaves out.
+fn plan_scope(s: &plan::Summary) -> String {
+    let mut text = s
+        .folders
+        .join(if s.kind == "keep" { " over " } else { " " });
     if !s.except.is_empty() {
         text.push_str(&format!(" except {}", s.except.join(", ")));
     }
