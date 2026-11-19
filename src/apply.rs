@@ -32,6 +32,13 @@
 //! the copy only if the copy is unchanged; empty deletes the original only while the copy
 //! still has the journaled hash.
 //!
+//! Empty deletes a removed file only while a copy outside the trash holds its content: the
+//! kept copy, unchanged where apply left it, or else another file on this machine that the
+//! catalog says may match (same size and fingerprint) and that reads back with the journal's
+//! full hash. A file in a synced folder never counts, since its sync tool may delete it (the
+//! hub sends those folders, as plan building treats them). Undo and empty finish by measuring
+//! what's left in the plan's trash, for the hub's `in_trash`.
+//!
 //! Re-running a plan resumes it: a file already in the trash, or already at its destination,
 //! counts as done.
 //!
@@ -39,8 +46,9 @@
 //! newline-delimited JSON exchange:
 //!
 //! ```text
-//! machine → hub   {"gfiles_actions":2,"machine":"elrond"}       before reading anything
-//! hub → machine   {"gfiles_actions":2,"op":"apply","plan":"<id>","volumes":[..],"items":N}
+//! machine → hub   {"gfiles_actions":3,"machine":"elrond"}       before reading anything
+//! hub → machine   {"gfiles_actions":3,"op":"apply","plan":"<id>","volumes":[..],"items":N,
+//!                  "synced":{"folders":[[volume name,path],..],"not_synced":[..]}}
 //! hub → machine   {"seq":0,"action":"remove","volume_id":..,"path":..,"keep":{..}}
 //!                 {"seq":1,"action":"move",..,"dest":{"volume_id":..,"path":..}}
 //!                                                                × N (apply only), then EOF
@@ -70,7 +78,7 @@ use crate::{fingerprint, plan, platform, store};
 
 /// Bump when the exchange changes incompatibly; both machines must then be updated together.
 /// Separate from the catalog stream's `sync::PROTOCOL`.
-pub const PROTOCOL: u32 = 2;
+pub const PROTOCOL: u32 = 3;
 
 /// The trash folder at the top of each volume. Scans always skip it.
 pub const TRASH: &str = ".gfiles-trash";
@@ -151,6 +159,10 @@ pub struct Done {
     /// Files (or whole volumes' trash folders) left in the trash by undo or empty, each with
     /// why.
     pub left_in_trash: Vec<String>,
+    /// Bytes in the plan's trash folders when undo or empty finished.
+    pub trash_bytes: u64,
+    /// Whether some of the trash couldn't be measured (a volume missing, entries unlisted).
+    pub trash_partial: bool,
 }
 
 /// What a plan run learned for this machine's catalog (see `record_learned`). It stays on
@@ -168,6 +180,60 @@ impl Learned {
     pub fn is_empty(&self) -> bool {
         self.hashes.is_empty() && self.carried.is_empty()
     }
+}
+
+/// Folders on a machine that a sync tool may manage, by (volume name, path), as plan building
+/// treats them (`plan::synced_folders`), with the folders Darren said no tool syncs. Folders
+/// named like a sync tool's count too, checked where the files are.
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Synced {
+    /// `[[mirror]]` folders: always synced, whatever `not_synced` says.
+    pub mirrors: Vec<(String, String)>,
+    /// Folders `gfiles mirrors` suggests.
+    pub suggested: Vec<(String, String)>,
+    /// Folders Darren said no tool syncs: they waive suggested folders and sync tool names.
+    pub not_synced: Vec<(String, String)>,
+}
+
+impl Synced {
+    /// Whether a file at `path` on the volume named `volume` (rooted at `root`) is in a synced
+    /// folder, as plan building treats it. A volume without a name here is treated as synced.
+    fn holds(&self, volume: Option<&str>, root: &Path, path: &str) -> bool {
+        let Some(volume) = volume else {
+            return true;
+        };
+        let under = |list: &[(String, String)]| {
+            list.iter()
+                .any(|(v, dir)| v == volume && store::is_within(path, dir))
+        };
+        if under(&self.mirrors) {
+            return true;
+        }
+        if under(&self.not_synced) {
+            return false;
+        }
+        under(&self.suggested) || plan::sync_tool_folder(root, path).is_some()
+    }
+
+    /// Whether every volume these folders name is one of this machine's. One that isn't (a
+    /// volume renamed since the hub's last pull, say) could hide a synced folder.
+    fn names_only(&self, volumes: &HashMap<&str, &str>) -> bool {
+        self.mirrors
+            .iter()
+            .chain(&self.suggested)
+            .chain(&self.not_synced)
+            .all(|(v, _)| volumes.values().any(|n| n == v))
+    }
+}
+
+/// What a run gets besides the plan: what the catalog knew of the files apply moves, this
+/// machine's catalog (for empty to find another copy of a file whose kept copy moved), and the
+/// synced folders such a copy must not be in.
+#[derive(Default)]
+pub struct RunInputs<'a> {
+    pub known: Known,
+    pub catalog: Option<&'a Connection>,
+    pub synced: Synced,
 }
 
 /// What the catalog knew of each file an apply moves, by (volume id, path): its fingerprint
@@ -208,6 +274,8 @@ struct Request {
     volumes: Vec<String>,
     /// How many item lines follow.
     items: usize,
+    /// For empty: folders a copy of a trashed file must not be in.
+    synced: Synced,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -241,9 +309,9 @@ impl Lock {
 
 /// Runs `op` for plan `id` on this machine. `items` are the files to move (apply only);
 /// `volumes` are the plan's volumes that may hold its files in the trash (undo and empty);
-/// `known` is what the catalog knew of the files apply moves (`known_before`); `report`
-/// receives each item's outcome as it's decided. What the run learned for this machine's
-/// catalog goes into `learned`, also when the run stops early. The caller holds the lock.
+/// `inputs` is what the run needs from the catalog and the hub; `report` receives each item's
+/// outcome as it's decided. What the run learned for this machine's catalog goes into
+/// `learned`, also when the run stops early. The caller holds the lock.
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     config: &Config,
@@ -251,7 +319,7 @@ pub fn run(
     id: &str,
     items: &[Item],
     volumes: &[String],
-    known: &Known,
+    inputs: &RunInputs,
     learned: &mut Learned,
     mut report: impl FnMut(&Outcome) -> Result<()>,
 ) -> Result<Done> {
@@ -269,7 +337,7 @@ pub fn run(
             let mut ex = Executor {
                 roots: &roots,
                 id,
-                known,
+                known: &inputs.known,
                 hashes: HashMap::new(),
                 learned: Learned::default(),
                 journals: HashMap::new(),
@@ -311,9 +379,28 @@ pub fn run(
                 None => Ok(done),
             }
         }
-        Op::Undo => Ok(undo(&roots, volumes, id, learned)),
-        Op::Empty => Ok(empty(&roots, volumes, id)),
+        Op::Undo => Ok(measured(
+            undo(&roots, volumes, id, learned),
+            &roots,
+            volumes,
+            id,
+        )),
+        Op::Empty => {
+            let names: HashMap<&str, &str> = config
+                .volumes
+                .iter()
+                .map(|v| (v.id.as_str(), v.name.as_str()))
+                .collect();
+            let done = empty(&roots, &names, volumes, id, inputs);
+            Ok(measured(done, &roots, volumes, id))
+        }
     }
+}
+
+/// `done` with what's left in the plan's trash.
+fn measured(mut done: Done, roots: &HashMap<&str, &Path>, volumes: &[String], id: &str) -> Done {
+    (done.trash_bytes, done.trash_partial) = measure_trash(roots, volumes, id);
+    done
 }
 
 struct Executor<'a> {
@@ -1195,12 +1282,40 @@ fn undo_move<'a>(
     Some(dest_root)
 }
 
-/// Deletes a plan's files from the trash, except any that changed since the move, whose kept
-/// copy is gone or changed, or that the journal doesn't vouch for: those stay, since they may
-/// be the last copy. A copied move's original is deleted only when its copy reads back with
-/// the original's full hash.
-fn empty(roots: &HashMap<&str, &Path>, volumes: &[String], id: &str) -> Done {
+/// Bytes in a plan's trash folders, and whether some couldn't be measured: a volume that isn't
+/// there, or entries that couldn't be listed.
+fn measure_trash(roots: &HashMap<&str, &Path>, volumes: &[String], id: &str) -> (u64, bool) {
+    let mut missing = Vec::new();
+    let mut partial = false;
+    let mut bytes = 0;
+    for (_, _, dir) in trash_folders(roots, volumes, id, &mut missing) {
+        let (found, unlisted) = trashed_files(&dir.join("files"));
+        partial |= unlisted > 0;
+        for (path, _) in found {
+            match fs::symlink_metadata(&path) {
+                Ok(m) => bytes += m.len(),
+                Err(_) => partial = true,
+            }
+        }
+    }
+    (bytes, partial || !missing.is_empty())
+}
+
+/// Deletes a plan's files from the trash, except any that changed since the move, that the
+/// journal doesn't vouch for, or with no copy left outside the trash: those stay, since they
+/// may be the last copy. A removed file's copy is its kept copy, or another file on this
+/// machine with its content (`another_copy`). A copied move's original is deleted only when
+/// its copy reads back with the original's full hash.
+fn empty(
+    roots: &HashMap<&str, &Path>,
+    names: &HashMap<&str, &str>,
+    volumes: &[String],
+    id: &str,
+    inputs: &RunInputs,
+) -> Done {
     let mut done = Done::default();
+    // Full hashes read of other copies, by (volume id, path): many trashed files can share one.
+    let mut read = HashMap::new();
     for (_, _, dir) in trash_folders(roots, volumes, id, &mut done.left_in_trash) {
         let files = dir.join("files");
         let journal = read_journal(&dir);
@@ -1221,7 +1336,9 @@ fn empty(roots: &HashMap<&str, &Path>, volumes: &[String], id: &str) -> Done {
                     .push(keep("it changed after it was moved to the trash"));
                 continue;
             }
-            if let Err(why) = other_copy_holds(roots, entry) {
+            if let Err(why) = other_copy_holds(roots, entry)
+                && !another_copy(roots, names, inputs, &mut read, &in_trash, entry)
+            {
                 done.left_in_trash.push(keep(&why));
                 continue;
             }
@@ -1245,6 +1362,59 @@ fn empty(roots: &HashMap<&str, &Path>, volumes: &[String], id: &str) -> Done {
         }
     }
     done
+}
+
+/// Whether another file on this machine holds a removed file's content now that its kept copy
+/// is gone or changed: one the catalog says may match (same size and fingerprint), outside a
+/// synced folder and the trash, that reads back with the full hash the journal recorded. A
+/// vouched removal has no hash to check, so it never has one. Nor does any file while the
+/// synced folders name a volume this machine doesn't have.
+fn another_copy(
+    roots: &HashMap<&str, &Path>,
+    names: &HashMap<&str, &str>,
+    inputs: &RunInputs,
+    read: &mut HashMap<(String, String), Option<String>>,
+    in_trash: &Path,
+    entry: &JournalEntry,
+) -> bool {
+    let Some(catalog) = inputs.catalog else {
+        return false;
+    };
+    if entry.action != Action::Remove || entry.hash.is_empty() {
+        return false;
+    }
+    if !inputs.synced.names_only(names) {
+        return false;
+    }
+    let Ok(Some(fp)) = fingerprint::file(in_trash, entry.size, entry.mtime) else {
+        return false;
+    };
+    let candidates = match store::same_content_candidates(catalog, entry.size, &fp, &entry.hash) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("warning: couldn't look for other copies in the catalog: {e:#}");
+            return false;
+        }
+    };
+    candidates.iter().any(|c| {
+        let Some(root) = roots.get(c.volume_id.as_str()) else {
+            return false;
+        };
+        let synced = inputs
+            .synced
+            .holds(names.get(c.volume_id.as_str()).copied(), root, &c.path);
+        if synced {
+            return false;
+        }
+        let hash = read
+            .entry((c.volume_id.clone(), c.path.clone()))
+            .or_insert_with(|| {
+                checked_path(root, &c.path)
+                    .ok()
+                    .and_then(|p| full_hash(&p, c.size, c.mtime).ok())
+            });
+        hash.as_deref() == Some(entry.hash.as_str())
+    })
 }
 
 /// Whether the copy that makes a trashed file safe to delete is still there: a removal's kept
@@ -1376,9 +1546,13 @@ pub fn serve(
         Ok(l) => l,
         Err(e) => return refuse(&mut out, e.to_string()),
     };
-    let known = match catalog {
-        Some(conn) if req.op == Op::Apply => known_before(conn, &items),
-        _ => Known::new(),
+    let context = RunInputs {
+        known: match catalog {
+            Some(conn) if req.op == Op::Apply => known_before(conn, &items),
+            _ => Known::new(),
+        },
+        catalog,
+        synced: req.synced,
     };
     let total = items.len();
     let mut n = 0;
@@ -1388,7 +1562,7 @@ pub fn serve(
         &req.plan,
         &items,
         &req.volumes,
-        &known,
+        &context,
         learned,
         |o| {
             n += 1;
@@ -1473,8 +1647,15 @@ impl<'a> Route<'a> {
 }
 
 /// Runs `op` for a saved plan through `route`, recording outcomes and state in the catalog as
-/// they arrive. The caller has confirmed with Darren.
-pub fn execute(conn: &mut Connection, route: &Route, op: Op, id: &str) -> Result<Done> {
+/// they arrive. `synced` is the plan machine's synced folders (`plan::synced_folders`), which
+/// empty never relies on. The caller has confirmed with Darren.
+pub fn execute(
+    conn: &Connection,
+    route: &Route,
+    op: Op,
+    id: &str,
+    synced: &Synced,
+) -> Result<Done> {
     let summary = plan::summary(conn, id)?;
     let allowed = match op {
         Op::Apply => ["draft", "applying"].as_slice(),
@@ -1499,10 +1680,12 @@ pub fn execute(conn: &mut Connection, route: &Route, op: Op, id: &str) -> Result
     let now = || crate::scan::unix_secs(Some(std::time::SystemTime::now()));
     if op == Op::Apply {
         plan::set_state(conn, id, "applying", now())?;
+        // New removals may join the trash: measure it again at the next undo or empty.
+        plan::set_trash(conn, id, None, false)?;
     }
     let mut pending: Vec<Outcome> = Vec::new();
     let done = {
-        let mut record = |o: &Outcome, conn: &mut Connection| -> Result<()> {
+        let mut record = |o: &Outcome, conn: &Connection| -> Result<()> {
             pending.push(o.clone());
             if pending.len() >= 500 {
                 plan::record(conn, id, &pending)?;
@@ -1512,10 +1695,14 @@ pub fn execute(conn: &mut Connection, route: &Route, op: Op, id: &str) -> Result
         };
         match route {
             Route::Local { config, lock_path } => Lock::take(lock_path).and_then(|_lock| {
-                let known = if op == Op::Apply {
-                    known_before(conn, &items)
-                } else {
-                    Known::new()
+                let context = RunInputs {
+                    known: if op == Op::Apply {
+                        known_before(conn, &items)
+                    } else {
+                        Known::new()
+                    },
+                    catalog: Some(conn),
+                    synced: synced.clone(),
                 };
                 let mut learned = Learned::default();
                 let done = run(
@@ -1524,7 +1711,7 @@ pub fn execute(conn: &mut Connection, route: &Route, op: Op, id: &str) -> Result
                     id,
                     &items,
                     &volumes,
-                    &known,
+                    &context,
                     &mut learned,
                     |o| record(o, conn),
                 );
@@ -1539,6 +1726,7 @@ pub fn execute(conn: &mut Connection, route: &Route, op: Op, id: &str) -> Result
                 id,
                 &items,
                 &volumes,
+                synced,
                 |o| record(o, conn),
             ),
         }
@@ -1557,6 +1745,9 @@ pub fn execute(conn: &mut Connection, route: &Route, op: Op, id: &str) -> Result
         }
     }
     let done = done?;
+    if op != Op::Apply {
+        plan::set_trash(conn, id, Some(done.trash_bytes as i64), done.trash_partial)?;
+    }
     let new_state = match op {
         Op::Apply => {
             let unrecorded: i64 = conn.query_row(
@@ -1596,6 +1787,7 @@ fn over_ssh(
     id: &str,
     items: &[Item],
     volumes: &[String],
+    synced: &Synced,
     mut report: impl FnMut(&Outcome) -> Result<()>,
 ) -> Result<Done> {
     // No BatchMode: Darren is at the terminal and may need to unlock a key. Progress from the
@@ -1624,6 +1816,7 @@ fn over_ssh(
         id,
         items,
         volumes,
+        synced,
         stdin,
         BufReader::new(stdout),
         &mut report,
@@ -1649,6 +1842,7 @@ fn exchange(
     id: &str,
     items: &[Item],
     volumes: &[String],
+    synced: &Synced,
     input: impl Write,
     mut output: impl BufRead,
     report: &mut impl FnMut(&Outcome) -> Result<()>,
@@ -1689,6 +1883,7 @@ fn exchange(
             plan: id.to_string(),
             volumes: volumes.to_vec(),
             items: items.len(),
+            synced: synced.clone(),
         };
         writeln!(input, "{}", serde_json::to_string(&req)?)?;
         for i in items {
@@ -1829,7 +2024,7 @@ mod tests {
                 ID,
                 items,
                 &["v1".into()],
-                &Known::new(),
+                &RunInputs::default(),
                 &mut learned,
                 |o| {
                     outcomes.push(o.clone());
@@ -2121,6 +2316,7 @@ mod tests {
         for op in [Op::Undo, Op::Empty] {
             let (done, _) = v.run(op, &[]);
             assert!(done.left_in_trash[0].contains("not mounted"), "{done:?}");
+            assert!(done.trash_partial, "its trash couldn't be measured");
             assert!(!v.root.exists());
         }
         // A volume this machine doesn't have holds the plan back too.
@@ -2130,7 +2326,7 @@ mod tests {
             ID,
             &[],
             &["gone".into()],
-            &Known::new(),
+            &RunInputs::default(),
             &mut Learned::default(),
             |_| Ok(()),
         )
@@ -2211,7 +2407,7 @@ mod tests {
     fn a_failed_start_leaves_the_plan_a_draft() {
         use crate::plan::tests::{A, put};
         let v = volume();
-        let mut conn = crate::db::open_in_memory().unwrap();
+        let conn = crate::db::open_in_memory().unwrap();
         put(
             &conn,
             "elrond",
@@ -2227,7 +2423,7 @@ mod tests {
             config: &v.config,
             lock_path: &lock,
         };
-        assert!(execute(&mut conn, &route, Op::Apply, &id).is_err());
+        assert!(execute(&conn, &route, Op::Apply, &id, &Synced::default()).is_err());
         assert_eq!(plan::summary(&conn, &id).unwrap().state, "draft");
         plan::drop(&conn, &id).unwrap();
     }
@@ -2264,6 +2460,7 @@ mod tests {
             ID,
             items,
             &[],
+            &Synced::default(),
             &mut sent,
             answer.as_slice(),
             &mut |o| {
@@ -2284,6 +2481,7 @@ mod tests {
                 plan: ID.into(),
                 volumes: vec!["v1".into()],
                 items: items.len(),
+                synced: Synced::default(),
             })
             .unwrap()
         );
@@ -2381,6 +2579,7 @@ mod tests {
                 ID,
                 &[],
                 &[],
+                &Synced::default(),
                 &mut sent,
                 answer.as_bytes(),
                 &mut |_| Ok(()),
@@ -2671,7 +2870,10 @@ mod tests {
             ID,
             &[item],
             &["v1".into()],
-            &known,
+            &RunInputs {
+                known,
+                ..RunInputs::default()
+            },
             &mut learned,
             |_| Ok(()),
         )
@@ -2724,7 +2926,7 @@ mod tests {
             ID,
             &items,
             &["v1".into()],
-            &Known::new(),
+            &RunInputs::default(),
             &mut learned,
             |_| bail!("the hub went away"),
         );
@@ -2764,11 +2966,11 @@ mod tests {
             config: &v.config,
             lock_path: &lock,
         };
-        execute(&mut conn, &route, Op::Apply, &id).unwrap();
+        execute(&conn, &route, Op::Apply, &id, &Synced::default()).unwrap();
         crate::scan::scan_volume(&mut conn, vol, "elrond").unwrap();
         assert_eq!(known(&conn, "Documents/a.png"), before);
 
-        execute(&mut conn, &route, Op::Undo, &id).unwrap();
+        execute(&conn, &route, Op::Undo, &id, &Synced::default()).unwrap();
         crate::scan::scan_volume(&mut conn, vol, "elrond").unwrap();
         assert_eq!(known(&conn, "todo/a.png"), before);
     }
@@ -2852,6 +3054,201 @@ mod tests {
         assert!(v.exists(&v.trashed("todo/a.jpg")));
         assert!(v.exists(&v.trashed("todo/b.jpg")));
         assert_eq!(done.left_in_trash.len(), 2, "{:?}", done.left_in_trash);
+    }
+
+    #[test]
+    fn empty_never_looks_for_another_copy_of_a_moves_original() {
+        let v = volume();
+        v.write("todo/a.jpg", "aaa");
+        copying(false, || {
+            v.run(Op::Apply, &[v.mv(0, "todo/a.jpg", "photo/a.jpg")])
+        });
+        v.write("other/a.jpg", "aaa");
+        fs::remove_file(v.root.join("photo/a.jpg")).unwrap();
+        let conn = scanned(&v);
+        assert_eq!(empty_with(&v, &conn, Synced::default()).deleted, 0);
+        assert!(v.exists(&v.trashed("todo/a.jpg")));
+    }
+
+    #[test]
+    fn the_hub_stores_what_undo_and_empty_measure_and_apply_forgets_it() {
+        let v = volume();
+        v.write("todo/a.jpg", "same");
+        v.write("todo/b.jpg", "bbbbb");
+        v.write("Photos/a.jpg", "same");
+        v.write("Photos/b.jpg", "bbbbb");
+        let mut conn = scanned(&v);
+        let list = [
+            r#"{"remove": "elrond:darren/todo/a.jpg", "keep": "elrond:darren/Photos/a.jpg"}"#,
+            r#"{"remove": "elrond:darren/todo/b.jpg", "keep": "elrond:darren/Photos/b.jpg"}"#,
+        ]
+        .join("\n");
+        let built = crate::listplan::build(&conn, &list).unwrap();
+        let id = plan::save(&conn, &built, 0).unwrap();
+        let lock = v._tmp.path().join("actions.lock");
+        let route = Route::Local {
+            config: &v.config,
+            lock_path: &lock,
+        };
+        let trash = |conn: &Connection| {
+            let s = plan::summary(conn, &id).unwrap();
+            (s.state, s.in_trash, s.in_trash_partial)
+        };
+        // A stale figure from before is forgotten when apply runs.
+        plan::set_trash(&conn, &id, Some(1), true).unwrap();
+        execute(&conn, &route, Op::Apply, &id, &Synced::default()).unwrap();
+        assert_eq!(trash(&conn), ("applied".into(), 9, false));
+
+        fs::remove_file(v.root.join("Photos/b.jpg")).unwrap();
+        crate::scan::scan_volume(&mut conn, &v.config.volumes[0], "elrond").unwrap();
+        execute(&conn, &route, Op::Empty, &id, &Synced::default()).unwrap();
+        assert_eq!(trash(&conn), ("applied".into(), 5, false));
+
+        v.write("Photos/b.jpg", "bbbbb");
+        crate::scan::scan_volume(&mut conn, &v.config.volumes[0], "elrond").unwrap();
+        execute(&conn, &route, Op::Empty, &id, &Synced::default()).unwrap();
+        assert_eq!(trash(&conn), ("emptied".into(), 0, false));
+    }
+
+    #[test]
+    fn undo_and_empty_measure_what_they_leave_in_the_trash() {
+        let v = volume();
+        v.write("todo/a.jpg", "same");
+        v.write("todo/b.jpg", "bbbbb");
+        v.write("Photos/a.jpg", "same");
+        v.write("Photos/b.jpg", "bbbbb");
+        v.run(
+            Op::Apply,
+            &[
+                v.item(0, "todo/a.jpg", "Photos/a.jpg"),
+                v.item(1, "todo/b.jpg", "Photos/b.jpg"),
+            ],
+        );
+        fs::remove_file(v.root.join("Photos/b.jpg")).unwrap();
+        let (done, _) = v.run(Op::Empty, &[]);
+        assert_eq!((done.trash_bytes, done.trash_partial), (5, false));
+        // Undo puts it back, leaving nothing.
+        let (done, _) = v.run(Op::Undo, &[]);
+        assert_eq!((done.restored, done.trash_bytes), (1, 0));
+    }
+
+    /// Catalogs the volume as a scan would, for empty to look for other copies in.
+    fn scanned(v: &Vol) -> Connection {
+        let mut conn = crate::db::open_in_memory().unwrap();
+        crate::scan::scan_volume(&mut conn, &v.config.volumes[0], "elrond").unwrap();
+        conn
+    }
+
+    fn empty_with(v: &Vol, conn: &Connection, synced: Synced) -> Done {
+        run(
+            &v.config,
+            Op::Empty,
+            ID,
+            &[],
+            &["v1".into()],
+            &RunInputs {
+                catalog: Some(conn),
+                synced,
+                ..RunInputs::default()
+            },
+            &mut Learned::default(),
+            |_| Ok(()),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn empty_finds_a_kept_copy_that_moved() {
+        let v = volume();
+        v.write("todo/a.jpg", "same");
+        v.write("Photos/a.jpg", "same");
+        v.run(Op::Apply, &[v.item(0, "todo/a.jpg", "Photos/a.jpg")]);
+        fs::create_dir_all(v.root.join("photo/2012")).unwrap();
+        fs::rename(v.root.join("Photos/a.jpg"), v.root.join("photo/2012/a.jpg")).unwrap();
+        // The catalog has the renamed copy with a fingerprint but no full hash.
+        let conn = scanned(&v);
+        let done = empty_with(&v, &conn, Synced::default());
+        assert_eq!(done.deleted, 1, "{done:?}");
+        assert!(!v.exists(&v.trashed("todo/a.jpg")));
+        assert!(v.exists("photo/2012/a.jpg"));
+        assert_eq!(done.trash_bytes, 0);
+    }
+
+    #[test]
+    fn empty_never_relies_on_a_copy_it_cant_confirm() {
+        let setup = |copy: &str| {
+            let v = volume();
+            v.write("todo/a.jpg", "same");
+            v.write("Photos/a.jpg", "same");
+            v.run(Op::Apply, &[v.item(0, "todo/a.jpg", "Photos/a.jpg")]);
+            fs::create_dir_all(v.root.join(copy).parent().unwrap()).unwrap();
+            fs::rename(v.root.join("Photos/a.jpg"), v.root.join(copy)).unwrap();
+            v
+        };
+        let kept = |v: &Vol, done: &Done| {
+            assert_eq!(done.deleted, 0, "{done:?}");
+            assert!(v.exists(&v.trashed("todo/a.jpg")));
+            assert!(done.left_in_trash[0].contains("is gone or changed"));
+        };
+
+        // No catalog to look in.
+        let v = setup("photo/a.jpg");
+        let (done, _) = v.run(Op::Empty, &[]);
+        kept(&v, &done);
+
+        // The copy changed after the catalog saw it (same size, so it's still a candidate).
+        let v = setup("photo/a.jpg");
+        let conn = scanned(&v);
+        v.write("photo/a.jpg", "sAme");
+        kept(&v, &empty_with(&v, &conn, Synced::default()));
+
+        // The copy is in a synced folder: a mirror, a suggested one, or one named like a sync
+        // tool's.
+        let v = setup("Drive/a.jpg");
+        let conn = scanned(&v);
+        let drive = vec![("darren".to_string(), "Drive".to_string())];
+        let mirror = Synced {
+            mirrors: drive.clone(),
+            ..Synced::default()
+        };
+        kept(&v, &empty_with(&v, &conn, mirror.clone()));
+        // Saying nothing syncs a mirror changes nothing: plan building never waives one.
+        let waived_mirror = Synced {
+            not_synced: drive.clone(),
+            ..mirror
+        };
+        kept(&v, &empty_with(&v, &conn, waived_mirror));
+        let suggested = Synced {
+            suggested: drive.clone(),
+            ..Synced::default()
+        };
+        kept(&v, &empty_with(&v, &conn, suggested.clone()));
+        // A hub naming a volume this machine doesn't have stops the search.
+        let unknown = Synced {
+            mirrors: vec![("renamed".into(), "Drive".into())],
+            ..Synced::default()
+        };
+        kept(&v, &empty_with(&v, &conn, unknown));
+        // Unless Darren said nothing syncs a suggested folder.
+        let waived = Synced {
+            not_synced: drive,
+            ..suggested
+        };
+        assert_eq!(empty_with(&v, &conn, waived).deleted, 1);
+        let v = setup("Dropbox/a.jpg");
+        let conn = scanned(&v);
+        kept(&v, &empty_with(&v, &conn, Synced::default()));
+        // A vouched removal has no full hash to check a copy against.
+        let v = volume();
+        v.write("todo/a.jpg", "same");
+        v.write("Photos/a.jpg", "same");
+        v.run(
+            Op::Apply,
+            &[vouched(v.item(0, "todo/a.jpg", "Photos/a.jpg"))],
+        );
+        fs::rename(v.root.join("Photos/a.jpg"), v.root.join("a.jpg")).unwrap();
+        let conn = scanned(&v);
+        kept(&v, &empty_with(&v, &conn, Synced::default()));
     }
 
     #[test]

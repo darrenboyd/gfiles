@@ -29,7 +29,9 @@ review checks the diff against it. Commands, setup and anything `cargo clippy` o
   creates each folder level only after checking the one above isn't a symlink. Emptying keeps
   any file that changed since the move, whose kept copy (or a move's copy, by full hash) is
   gone or changed, or that the journal doesn't vouch for, and never deletes anything it
-  didn't list and check. Undo never deletes a copy that changed after the move: it removes a
+  didn't list and check. The one way past a removed file's missing kept copy is another file
+  on that machine, outside synced folders as plan building defines them, that reads back with
+  the journal's full hash; vouched removals and move originals never get that search. Undo never deletes a copy that changed after the move: it removes a
   copy only when it still has the full hash the move recorded. Undo and
   empty don't count a plan done while one of its volumes is missing. Each of these
   guarantees has a test that fails if it is removed, so a refactor can't drop one quietly.

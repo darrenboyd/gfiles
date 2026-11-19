@@ -768,7 +768,7 @@ fn run_plan(
     id: &str,
 ) -> Result<()> {
     let config = Config::load(config_path)?;
-    let mut conn = db::open(db_path)?;
+    let conn = db::open(db_path)?;
     let s = plan::summary(&conn, id)?;
     let what = match op {
         Op::Apply if s.moves.files > 0 => format!(
@@ -826,7 +826,17 @@ fn run_plan(
         return Ok(());
     }
     let started = Instant::now();
-    let done = apply::execute(&mut conn, &route, op, id)?;
+    // Only empty looks for other copies, and the suggestions behind this read the whole catalog.
+    let synced = if op == apply::Op::Empty {
+        let (synced, warnings) = plan::synced_folders(&conn, &config, &s.machine)?;
+        for w in warnings {
+            eprintln!("warning: {w}");
+        }
+        synced
+    } else {
+        apply::Synced::default()
+    };
+    let done = apply::execute(&conn, &route, op, id, &synced)?;
     let after = plan::summary(&conn, id)?;
     match op {
         Op::Apply => {

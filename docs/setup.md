@@ -183,7 +183,9 @@ gfiles plan empty <id>                                       # free the space fo
 
 `apply` moves each file to `.gfiles-trash/<id>/files/` at the top of its volume, after checking
 its full content against the copy that stays. The space comes back only with `empty`, which
-keeps any file that changed in the trash or whose kept copy has since gone or changed. A
+keeps any file that changed in the trash or whose kept copy has since gone or changed, unless
+another file on that machine (outside synced folders) reads back with the same full hash, as
+when a later plan renamed the kept copy. A
 volume that isn't mounted is left alone: apply skips its files, and undo and empty leave the
 plan as it was until the disk is back. Plans refuse mirrors, and folders
 that look synced (ones `gfiles mirrors` suggests, or inside `Dropbox`, `OneDrive` or

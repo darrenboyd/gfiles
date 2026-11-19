@@ -155,6 +155,12 @@ CREATE TABLE carried (
     PRIMARY KEY (volume_id, path)
 );
 "#,
+    r#"
+-- What a plan's trash folders held when its last undo or empty finished (NULL until one has
+-- measured them), and whether some couldn't be measured (a volume not mounted, say).
+ALTER TABLE plans ADD COLUMN trash_bytes INTEGER;
+ALTER TABLE plans ADD COLUMN trash_partial INTEGER NOT NULL DEFAULT 0;
+"#,
 ];
 
 pub fn open(path: &Path) -> Result<Connection> {

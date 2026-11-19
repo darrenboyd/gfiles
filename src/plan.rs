@@ -515,15 +515,7 @@ fn target_entries(conn: &Connection, t: &Resolved) -> Result<Vec<TargetEntry>> {
 /// a file there would make the tool remove its other copies too. `not_synced` lists folders
 /// Darren has said no tool syncs.
 pub fn check_not_synced(conn: &Connection, built: &Built, not_synced: &[FolderRef]) -> Result<()> {
-    let suggested: Vec<(FolderRef, String)> = mirror::suggestions(conn)?
-        .into_iter()
-        .flat_map(|s| {
-            let [a, b] = s.folders;
-            [(a.clone(), b.clone()), (b, a)]
-        })
-        .filter_map(|(f, other)| Some((mirror::parse_folder(&f).ok()?, other)))
-        .filter(|(f, _)| f.machine == built.machine)
-        .collect();
+    let suggested = suggested_folders(conn, &built.machine)?;
     let roots: HashMap<String, String> = conn
         .prepare("SELECT name, root FROM volumes WHERE machine = ?1")?
         .query_map([&built.machine], |r| Ok((r.get(0)?, r.get(1)?)))?
@@ -551,12 +543,7 @@ pub fn check_not_synced(conn: &Connection, built: &Built, not_synced: &[FolderRe
             Some(format!("{f} (gfiles mirrors suggests it mirrors {other})"))
         } else {
             let root = roots.get(&p.volume).map_or("", String::as_str);
-            let mut parts = std::path::Path::new(root)
-                .components()
-                .filter_map(|c| c.as_os_str().to_str())
-                .chain(p.path.split('/'));
-            parts
-                .find(|c| SYNC_TOOL_FOLDERS.contains(c))
+            sync_tool_folder(std::path::Path::new(root), &p.path)
                 .map(|name| format!("{p} (inside a {name} folder)"))
         };
         if let Some(problem) = problem
@@ -580,6 +567,72 @@ pub fn check_not_synced(conn: &Connection, built: &Built, not_synced: &[FolderRe
             String::new()
         }
     )
+}
+
+/// Folders on `machine` that `gfiles mirrors` suggests, each with the folder it seems to
+/// mirror.
+fn suggested_folders(conn: &Connection, machine: &str) -> Result<Vec<(FolderRef, String)>> {
+    Ok(mirror::suggestions(conn)?
+        .into_iter()
+        .flat_map(|s| {
+            let [a, b] = s.folders;
+            [(a.clone(), b.clone()), (b, a)]
+        })
+        .filter_map(|(f, other)| Some((mirror::parse_folder(&f).ok()?, other)))
+        .filter(|(f, _)| f.machine == machine)
+        .collect())
+}
+
+/// The sync tool's folder name a path passes through (in its volume root or below it), if any.
+pub fn sync_tool_folder(root: &std::path::Path, path: &str) -> Option<&'static str> {
+    root.components()
+        .filter_map(|c| c.as_os_str().to_str())
+        .chain(path.split('/'))
+        .find_map(|c| SYNC_TOOL_FOLDERS.iter().find(|&&n| n == c).copied())
+}
+
+/// The folders on `machine` a sync tool may manage, as plan building treats them, for empty to
+/// leave out when it looks for another copy: `[[mirror]]` folders and suggested ones, by volume
+/// name (the machine maps names to its own volumes), plus `not_synced` exceptions. Folders
+/// named like a sync tool's count too; the machine checks those itself. Loads the config's
+/// mirrors into `conn` first, as plan building does, so a mirror isn't suggested in place of a
+/// real candidate; returns their warnings too.
+pub fn synced_folders(
+    conn: &Connection,
+    config: &crate::config::Config,
+    machine: &str,
+) -> Result<(crate::apply::Synced, Vec<String>)> {
+    let warnings = mirror::load(conn, config)?;
+    let on_machine = |f: FolderRef| (f.machine == machine).then_some((f.volume, f.path));
+    let sorted = |mut v: Vec<(String, String)>| {
+        v.sort();
+        v.dedup();
+        v
+    };
+    let mirrors = config
+        .mirrors
+        .iter()
+        .flat_map(|m| &m.folders)
+        .filter_map(|f| mirror::parse_folder(f).ok())
+        .filter_map(on_machine)
+        .collect();
+    let suggested = suggested_folders(conn, machine)?
+        .into_iter()
+        .filter_map(|(f, _)| on_machine(f))
+        .collect();
+    let not_synced = config
+        .not_synced_folders()?
+        .into_iter()
+        .filter_map(on_machine)
+        .collect();
+    Ok((
+        crate::apply::Synced {
+            mirrors: sorted(mirrors),
+            suggested: sorted(suggested),
+            not_synced: sorted(not_synced),
+        },
+        warnings,
+    ))
 }
 
 /// Saves a built plan as a draft. Returns its id.
@@ -721,10 +774,13 @@ pub struct Summary {
     pub left: Tally,
     pub moved: Tally,
     pub skipped: Tally,
-    /// Bytes of the files it removed that are in the trash (reclaimable by emptying it).
-    /// Originals of moves that had to copy across filesystems are in the trash too, but the hub
-    /// doesn't know which moves those were.
+    /// Bytes in the plan's trash (reclaimable by emptying it). Until an undo or empty has
+    /// measured the trash, the bytes of the files apply removed: originals of moves that had to
+    /// copy across filesystems are in the trash too, but the hub doesn't know which those were.
     pub in_trash: i64,
+    /// Whether part of the trash couldn't be measured (a volume not mounted, say), so
+    /// `in_trash` counts only the rest.
+    pub in_trash_partial: bool,
 }
 
 const SUMMARY_SQL: &str = concat!(
@@ -752,13 +808,15 @@ const SUMMARY_SQL: &str = concat!(
         (SELECT coalesce(sum(size), 0) FROM plan_items WHERE plan_id = p.id AND action = 'move'),
         (SELECT count(*) FROM plan_rejected WHERE plan_id = p.id),
         (SELECT coalesce(sum(size), 0) FROM plan_items
-         WHERE plan_id = p.id AND action = 'remove' AND outcome = 'moved')
+         WHERE plan_id = p.id AND action = 'remove' AND outcome = 'moved'),
+        p.trash_bytes, p.trash_partial
     FROM plans p"
 );
 
 fn read_summary(r: &rusqlite::Row) -> rusqlite::Result<Summary> {
     let folders: String = r.get(3)?;
     let state: String = r.get(4)?;
+    let in_trash_plan = matches!(state.as_str(), "applying" | "applied");
     let moved = Tally {
         files: r.get(11)?,
         bytes: r.get(12)?,
@@ -769,11 +827,12 @@ fn read_summary(r: &rusqlite::Row) -> rusqlite::Result<Summary> {
         kind: r.get(2)?,
         folders: serde_json::from_str(&folders).unwrap_or_default(),
         except: serde_json::from_str(&r.get::<_, String>(15)?).unwrap_or_default(),
-        in_trash: if matches!(state.as_str(), "applying" | "applied") {
-            r.get(23)?
+        in_trash: if in_trash_plan {
+            r.get::<_, Option<i64>>(24)?.map_or_else(|| r.get(23), Ok)?
         } else {
             0
         },
+        in_trash_partial: in_trash_plan && r.get(25)?,
         state,
         created_at: r.get(5)?,
         updated_at: r.get(6)?,
@@ -1134,6 +1193,16 @@ pub fn drop(conn: &Connection, id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Stores what an undo or empty measured in the plan's trash (`None` forgets it, so the
+/// summary falls back to the bytes apply removed).
+pub fn set_trash(conn: &Connection, id: &str, bytes: Option<i64>, partial: bool) -> Result<()> {
+    conn.execute(
+        "UPDATE plans SET trash_bytes = ?2, trash_partial = ?3 WHERE id = ?1",
+        params![id, bytes, partial],
+    )?;
+    Ok(())
+}
+
 pub fn set_state(conn: &Connection, id: &str, state: &str, now: i64) -> Result<()> {
     conn.execute(
         "UPDATE plans SET state = ?2, updated_at = ?3 WHERE id = ?1",
@@ -1201,8 +1270,8 @@ pub fn trash_volumes(conn: &Connection, id: &str) -> Result<Vec<String>> {
 }
 
 /// Records what happened to items, in one transaction.
-pub fn record(conn: &mut Connection, id: &str, outcomes: &[crate::apply::Outcome]) -> Result<()> {
-    let tx = conn.transaction()?;
+pub fn record(conn: &Connection, id: &str, outcomes: &[crate::apply::Outcome]) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
     {
         let mut stmt = tx.prepare(
             "UPDATE plan_items SET outcome = ?3, reason = ?4 WHERE plan_id = ?1 AND seq = ?2",
@@ -1225,6 +1294,80 @@ pub(crate) mod tests {
     use super::*;
     use crate::config::Config;
     use crate::store::{Entry, Volume, VolumeWriter};
+
+    #[test]
+    fn synced_folders_are_named_by_volume_for_the_plans_machine() {
+        let conn = crate::db::open_in_memory().unwrap();
+        let config: Config = toml::from_str(
+            r#"
+machine = "gaffer"
+not_synced = ["elrond:darren/Photos/local", "gaffer:home/x"]
+[[remote]]
+name = "elrond"
+[[mirror]]
+name = "drive"
+folders = ["elrond:darren/Drive", "gaffer:home/Drive"]
+"#,
+        )
+        .unwrap();
+        let (s, _) = synced_folders(&conn, &config, "elrond").unwrap();
+        assert_eq!(s.mirrors, vec![("darren".into(), "Drive".into())]);
+        assert_eq!(s.not_synced, vec![("darren".into(), "Photos/local".into())]);
+    }
+
+    #[test]
+    fn synced_folders_suggest_only_what_isnt_a_mirror_already() {
+        let conn = crate::db::open_in_memory().unwrap();
+        let config: Config = toml::from_str(
+            r#"
+machine = "gaffer"
+[[remote]]
+name = "elrond"
+[[mirror]]
+name = "drive"
+folders = ["elrond:darren/Drive", "gaffer:home/Drive"]
+"#,
+        )
+        .unwrap();
+        // Two folder pairs each holding the same 60 files: one a configured mirror, one not.
+        let files = |dir: &str, base: i64| -> Vec<(String, i64, String)> {
+            (0..60)
+                .map(|i| {
+                    let n = base + i;
+                    (format!("{dir}/{n}.jpg"), 1000 + n, format!("p1:{n:064x}"))
+                })
+                .collect()
+        };
+        let put_all = |machine: &str, volume: &str, rows: Vec<(String, i64, String)>| {
+            let rows: Vec<(&str, i64, Option<&str>)> = rows
+                .iter()
+                .map(|(p, s, f)| (p.as_str(), *s, Some(f.as_str())))
+                .collect();
+            put(&conn, machine, volume, &rows);
+        };
+        put_all(
+            "elrond",
+            "darren",
+            [files("Drive", 0), files("Photos", 100)].concat(),
+        );
+        put_all(
+            "gaffer",
+            "home",
+            [files("Drive", 0), files("Pics", 100)].concat(),
+        );
+        let (s, _) = synced_folders(&conn, &config, "elrond").unwrap();
+        assert_eq!(s.mirrors, vec![("darren".into(), "Drive".into())]);
+        assert_eq!(s.suggested, vec![("darren".into(), "Photos".into())]);
+    }
+
+    #[test]
+    fn sync_tool_folders_count_in_the_root_or_the_path() {
+        let root = std::path::Path::new("/volume1/Dropbox");
+        assert_eq!(sync_tool_folder(root, "a/b.jpg"), Some("Dropbox"));
+        let root = std::path::Path::new("/volume1/darren");
+        assert_eq!(sync_tool_folder(root, "OneDrive/b.jpg"), Some("OneDrive"));
+        assert_eq!(sync_tool_folder(root, "photo/OneDriveish/b.jpg"), None);
+    }
 
     pub(crate) const A: &str =
         "p1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -1829,7 +1972,7 @@ pub(crate) mod tests {
 
     #[test]
     fn files_an_applied_plan_moved_are_left_out() {
-        let mut conn = crate::db::open_in_memory().unwrap();
+        let conn = crate::db::open_in_memory().unwrap();
         put(
             &conn,
             "elrond",
@@ -1839,7 +1982,7 @@ pub(crate) mod tests {
         let built = drain(&conn, &["elrond:darren/todo"]).unwrap();
         let id = save(&conn, &built, 0).unwrap();
         record(
-            &mut conn,
+            &conn,
             &id,
             &[crate::apply::Outcome {
                 seq: 0,
@@ -1858,6 +2001,13 @@ pub(crate) mod tests {
             vec![pair("todo/a.jpg", &format!("already moved by plan {id}"))]
         );
         assert_eq!(summary(&conn, &id).unwrap().in_trash, 10);
+        // An undo or empty measures the trash; until then, the removals apply moved count.
+        set_trash(&conn, &id, Some(3), true).unwrap();
+        let s = summary(&conn, &id).unwrap();
+        assert_eq!((s.in_trash, s.in_trash_partial), (3, true));
+        set_trash(&conn, &id, None, false).unwrap();
+        let s = summary(&conn, &id).unwrap();
+        assert_eq!((s.in_trash, s.in_trash_partial), (10, false));
         // A different file that later lands at the moved path is a file like any other.
         put(
             &conn,

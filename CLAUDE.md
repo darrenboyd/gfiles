@@ -82,7 +82,7 @@ Windows is out of scope for now, but don't make it impossible:
 6. **Classify and tag:** metadata extraction (EXIF, ID3, EPUB title and author) and Darren's own
    tags.
 7. **More actions:** moves and vouched removals from a supplied list (`plan import`,
-   `draft_plan_from_list`): code done; deploy both machines together (`apply::PROTOCOL` 2).
+   `draft_plan_from_list`): code done; deploy both machines together (`apply::PROTOCOL` 3).
    Rename and copy through plan, apply and undo are still to come.
 
 ## Commands
@@ -246,8 +246,16 @@ scratch directory, when trying the binary out, so experiments never touch the re
   counts). A re-run apply resumes. The executor never creates a volume root: a file on an
   unmounted volume is skipped, and undo and empty leave the plan where it was while one of its
   volumes is missing. Undo leaves a file in the trash when its path is taken again. Empty
-  keeps files that changed after the move, whose kept copy is gone or changed, or that the
-  journal doesn't list, and removes the plan's trash folder only once nothing is left in it.
+  keeps files that changed after the move, or that the journal doesn't list. A removed file
+  whose kept copy is gone or changed stays too, unless another file on that machine holds its
+  content: one the catalog says may match (same size and fingerprint, no differing full
+  hash), outside synced folders as plan building defines them (the hub loads its mirrors and sends
+  its mirror and suggested folders by volume name, and `not_synced`, which waives suggested
+  folders but never a mirror; a name the machine doesn't have stops the search), that reads
+  back with the journal's full hash. Empty removes the plan's trash folder only once nothing is left in it. Undo and
+  empty measure what's left in the plan's trash; the hub stores it as the plan's `in_trash`
+  (`in_trash_partial` when a volume couldn't be measured), which until then is the bytes of
+  the removals apply moved.
 - **Plans from a list:** another tool decides what should change (gfiles can't tell that a
   photo whose metadata a photo manager rewrote is the same shot, or where a new photo
   belongs) and hands `plan import` (or the MCP tool) JSON lines:

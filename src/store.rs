@@ -234,7 +234,7 @@ pub struct Finished {
 
 /// Whether `path` is `dir` or inside it (both relative, `/`-separated). The empty `dir` is
 /// the volume root, which holds everything.
-fn is_within(path: &str, dir: &str) -> bool {
+pub(crate) fn is_within(path: &str, dir: &str) -> bool {
     dir.is_empty()
         || path
             .strip_prefix(dir)
@@ -440,6 +440,43 @@ pub fn record_carried(conn: &Connection, moves: &[Carried]) -> Result<usize> {
     }
     tx.commit()?;
     Ok(recorded)
+}
+
+/// A cataloged file that may hold the same content as another: its volume id, path, and the
+/// size and mtime the catalog saw.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Candidate {
+    pub volume_id: String,
+    pub path: String,
+    pub size: i64,
+    pub mtime: i64,
+}
+
+/// Files the catalog says may have this content: the same size and sampled fingerprint, and no
+/// full hash that differs from `hash`. Repos are never candidates. Reading one is the only way
+/// to confirm it.
+pub fn same_content_candidates(
+    conn: &Connection,
+    size: i64,
+    fingerprint: &str,
+    hash: &str,
+) -> Result<Vec<Candidate>> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT volume_id, path, size, mtime FROM entries
+             WHERE size = ?1 AND fingerprint = ?2 AND kind != 'repo'
+               AND (content_hash IS NULL OR content_hash = ?3)
+             ORDER BY content_hash IS NULL, volume_id, path",
+        )?
+        .query_map(params![size, fingerprint, hash], |r| {
+            Ok(Candidate {
+                volume_id: r.get(0)?,
+                path: r.get(1)?,
+                size: r.get(2)?,
+                mtime: r.get(3)?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?)
 }
 
 /// Gives a volume's carried records to the entries a scan just wrote at their paths (where
@@ -685,6 +722,33 @@ mod tests {
         assert_eq!(take_carried(&conn, "v", &[String::new()]).unwrap(), 0);
         assert_eq!(stored(&conn, "a.png"), (Some(FP.into()), Some(HASH.into())));
         assert_eq!(carried(&conn).len(), 1);
+    }
+
+    #[test]
+    fn candidates_share_size_and_fingerprint_and_no_differing_hash() {
+        let conn = crate::db::open_in_memory().unwrap();
+        let mut other_size = file("d.png", 100, Some(FP), None);
+        other_size.size = 11;
+        let mut repo = file("e", 100, Some(FP), None);
+        repo.kind = "repo".into();
+        write(
+            &conn,
+            &[
+                file("a.png", 100, Some(FP), Some(HASH)),
+                file("b.png", 100, Some(FP), None),
+                file("c.png", 100, Some(FP), Some(HASH2)),
+                other_size,
+                repo,
+                file("f.png", 100, None, None),
+            ],
+        );
+        let found: Vec<String> = same_content_candidates(&conn, 10, FP, HASH)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.path)
+            .collect();
+        // Hashed matches first: they're the likeliest to read back the same.
+        assert_eq!(found, vec!["a.png", "b.png"]);
     }
 
     #[test]
