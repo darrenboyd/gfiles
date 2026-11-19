@@ -186,13 +186,12 @@ pub fn scan_volume(conn: &mut Connection, vol: &VolumeConfig, machine: &str) -> 
     }
 
     let scanned_at = unix_secs(Some(SystemTime::now()));
-    let finished = match &unreadable {
-        Some(list) => writer.finish(scanned_at, list)?,
-        // An error with no path: keep everything not seen rather than guess.
-        None => writer.finish(scanned_at, &[String::new()])?,
-    };
+    // An error with no path: keep everything not seen rather than guess.
+    let keep = unreadable.unwrap_or_else(|| vec![String::new()]);
+    let finished = writer.finish(scanned_at, &keep)?;
     stats.removed = finished.removed;
     stats.kept = finished.kept;
+    crate::store::take_carried(&tx, &vol.id, &keep)?;
     tx.commit()?;
 
     fingerprint_pass(conn, vol, &mut stats)?;
@@ -626,6 +625,85 @@ mod tests {
         let stats = scan_volume(&mut conn, &vol, "gaffer").unwrap();
         assert_eq!(stats.fingerprinted, 0);
         assert_eq!(fingerprints(&conn), fps);
+    }
+
+    fn set_mtime(path: &Path, secs: u64) {
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+            .unwrap();
+    }
+
+    #[test]
+    fn a_moved_file_gets_what_its_move_carried() {
+        const HASH: &str = "b3:ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100";
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for name in ["a.png", "b.png"] {
+            touch(root, &format!("todo/{name}"));
+            set_mtime(&root.join("todo").join(name), 1_000);
+        }
+        let mut conn = db::open_in_memory().unwrap();
+        let vol = volume(root, vec![]);
+        scan_volume(&mut conn, &vol, "gaffer").unwrap();
+        let before = fingerprints(&conn);
+        crate::store::record_hashes(
+            &conn,
+            &[crate::store::Hashed {
+                volume_id: vol.id.clone(),
+                path: "todo/a.png".into(),
+                size: 10,
+                mtime: 1_000,
+                hash: HASH.into(),
+            }],
+        )
+        .unwrap();
+
+        // Both move (a rename keeps the mtime); b is then edited before the next scan.
+        fs::create_dir(root.join("docs")).unwrap();
+        let moves: Vec<crate::store::Carried> = ["a.png", "b.png"]
+            .iter()
+            .map(|name| crate::store::Carried {
+                from_volume_id: vol.id.clone(),
+                from_path: format!("todo/{name}"),
+                to_volume_id: vol.id.clone(),
+                to_path: format!("docs/{name}"),
+                size: 10,
+                mtime: 1_000,
+                fingerprint: None,
+                hash: None,
+            })
+            .collect();
+        for name in ["a.png", "b.png"] {
+            fs::rename(root.join("todo").join(name), root.join("docs").join(name)).unwrap();
+        }
+        crate::store::record_carried(&conn, &moves).unwrap();
+        set_mtime(&root.join("docs/b.png"), 2_000);
+
+        let stats = scan_volume(&mut conn, &vol, "gaffer").unwrap();
+        assert_eq!(stats.fingerprinted, 1);
+        let (fp, hash): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT fingerprint, content_hash FROM entries WHERE path = 'docs/a.png'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((fp, hash), (before[0].1.clone(), Some(HASH.into())));
+        let hash_b: Option<String> = conn
+            .query_row(
+                "SELECT content_hash FROM entries WHERE path = 'docs/b.png'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(hash_b, None);
+        let records: i64 = conn
+            .query_row("SELECT count(*) FROM carried", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(records, 0, "the scan forgets every record it was given");
     }
 
     #[test]

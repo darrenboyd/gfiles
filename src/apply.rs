@@ -17,8 +17,12 @@
 //! and mtime) and aren't the same file, then compares their full content, unless the list
 //! that made the plan vouched for the pair (their bytes may differ). Any doubt skips the file.
 //! The full hashes it reads of files that stay (kept copies, and files whose content differs)
-//! go into this machine's catalog afterwards (`record_hashes`), so the catalog stops matching
-//! files apply found different.
+//! go into this machine's catalog afterwards (`record_learned`), so the catalog stops matching
+//! files apply found different. So does each file it moves (and each file undo puts back):
+//! the catalog records the fingerprint and full hash the file had, and the next scan of its
+//! new path gives them to the new entry, so a move doesn't cost a file its hashes. All of this
+//! stays on the machine that ran the plan, even when a run stops early; the hub's next pull
+//! brings it.
 //!
 //! A move checks the file is unchanged and nothing is at its destination, then renames it.
 //! Across filesystems a rename fails, so it copies instead: to a temporary name next to the
@@ -147,11 +151,46 @@ pub struct Done {
     /// Files (or whole volumes' trash folders) left in the trash by undo or empty, each with
     /// why.
     pub left_in_trash: Vec<String>,
-    /// Full hashes apply read of files that stay (kept copies, and files it skipped), for this
-    /// machine's catalog (see `store::record_hashes`). Not sent to the hub: its next pull
-    /// brings them.
-    #[serde(skip)]
+}
+
+/// What a plan run learned for this machine's catalog (see `record_learned`). It stays on
+/// the machine that ran the plan, never sent to the hub: the hub's next pull brings it.
+#[derive(Debug, Default, Clone)]
+pub struct Learned {
+    /// Full hashes apply read of files that stay (kept copies, and files it skipped).
     pub hashes: Vec<store::Hashed>,
+    /// Files moved to a new path (by apply's moves, and back by undo), so the next scan
+    /// gives them the fingerprint and hash they had (`store::record_carried`).
+    pub carried: Vec<store::Carried>,
+}
+
+impl Learned {
+    pub fn is_empty(&self) -> bool {
+        self.hashes.is_empty() && self.carried.is_empty()
+    }
+}
+
+/// What the catalog knew of each file an apply moves, by (volume id, path): its fingerprint
+/// and full hash.
+pub type Known = HashMap<(String, String), (Option<String>, Option<String>)>;
+
+/// Reads what the catalog knows of the files `items` move, before any of them moves, so a scan
+/// that runs alongside the apply (and forgets their old entries) can't take it away. A catalog
+/// that can't be read only means less is carried.
+pub fn known_before(conn: &Connection, items: &[Item]) -> Known {
+    let mut known = Known::new();
+    for i in items.iter().filter(|i| i.action == Action::Move) {
+        match store::known_content(conn, &i.volume_id, &i.path, i.size, i.mtime) {
+            Ok(content) => {
+                known.insert((i.volume_id.clone(), i.path.clone()), content);
+            }
+            Err(e) => {
+                eprintln!("warning: couldn't read the catalog before moving files: {e:#}");
+                break;
+            }
+        }
+    }
+    known
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -202,13 +241,18 @@ impl Lock {
 
 /// Runs `op` for plan `id` on this machine. `items` are the files to move (apply only);
 /// `volumes` are the plan's volumes that may hold its files in the trash (undo and empty);
-/// `report` receives each item's outcome as it's decided. The caller holds the lock.
+/// `known` is what the catalog knew of the files apply moves (`known_before`); `report`
+/// receives each item's outcome as it's decided. What the run learned for this machine's
+/// catalog goes into `learned`, also when the run stops early. The caller holds the lock.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     config: &Config,
     op: Op,
     id: &str,
     items: &[Item],
     volumes: &[String],
+    known: &Known,
+    learned: &mut Learned,
     mut report: impl FnMut(&Outcome) -> Result<()>,
 ) -> Result<Done> {
     if !plan::valid_id(id) {
@@ -225,10 +269,12 @@ pub fn run(
             let mut ex = Executor {
                 roots: &roots,
                 id,
+                known,
                 hashes: HashMap::new(),
-                learned: Vec::new(),
+                learned: Learned::default(),
                 journals: HashMap::new(),
             };
+            let mut stopped = None;
             for item in items {
                 let outcome = match ex.apply(item) {
                     Ok(()) => Outcome {
@@ -247,17 +293,25 @@ pub fn run(
                 } else {
                     done.skipped += 1;
                 }
-                report(&outcome)?;
+                if let Err(e) = report(&outcome) {
+                    stopped = Some(e);
+                    break;
+                }
             }
             for (path, f) in &ex.journals {
                 if let Err(e) = f.sync_data() {
                     eprintln!("warning: saving {}: {e}", path.display());
                 }
             }
-            done.hashes = ex.learned;
-            Ok(done)
+            // Handed back even when the run stops early: a resumed apply never sends the
+            // files whose outcomes were already recorded, so this is their only chance.
+            *learned = ex.learned;
+            match stopped {
+                Some(e) => Err(e),
+                None => Ok(done),
+            }
         }
-        Op::Undo => Ok(undo(&roots, volumes, id)),
+        Op::Undo => Ok(undo(&roots, volumes, id, learned)),
         Op::Empty => Ok(empty(&roots, volumes, id)),
     }
 }
@@ -265,10 +319,11 @@ pub fn run(
 struct Executor<'a> {
     roots: &'a HashMap<&'a str, &'a Path>,
     id: &'a str,
+    known: &'a Known,
     /// Full hashes of kept copies, by (volume id, path): many removed files can share one.
     hashes: HashMap<(String, String), String>,
-    /// Full hashes read of files that stay where they are, for the catalog.
-    learned: Vec<store::Hashed>,
+    /// Full hashes read of files that stay where they are, and files moved, for the catalog.
+    learned: Learned,
     /// Each trash folder's open journal. A move's line is synced before the file moves, since
     /// undo finds moves only through it; removals are synced once at the end, since a removal's
     /// line lost to a crash only makes emptying keep that file (undo finds it in the trash).
@@ -282,7 +337,25 @@ impl<'a> Executor<'a> {
     fn apply(&mut self, item: &Item) -> std::result::Result<(), Skip> {
         match (item.action, &item.keep, &item.dest) {
             (Action::Remove, Some(keep), None) => self.remove(item, keep),
-            (Action::Move, None, Some(dest)) => self.relocate(item, dest),
+            (Action::Move, None, Some(dest)) => {
+                let read = self.relocate(item, dest)?;
+                let (fingerprint, hash) = self
+                    .known
+                    .get(&(item.volume_id.clone(), item.path.clone()))
+                    .cloned()
+                    .unwrap_or_default();
+                self.learned.carried.push(store::Carried {
+                    from_volume_id: item.volume_id.clone(),
+                    from_path: item.path.clone(),
+                    to_volume_id: dest.volume_id.clone(),
+                    to_path: dest.path.clone(),
+                    size: item.size,
+                    mtime: item.mtime,
+                    fingerprint,
+                    hash: read.or(hash),
+                });
+                Ok(())
+            }
             _ => Err("the hub sent an entry whose fields don't match its action".into()),
         }
     }
@@ -334,7 +407,7 @@ impl<'a> Executor<'a> {
                         .map_err(|e| format!("the kept copy: {e}"))?;
                     self.hashes
                         .insert((kept.volume_id.clone(), kept.path.clone()), h.clone());
-                    self.learned.push(store::Hashed {
+                    self.learned.hashes.push(store::Hashed {
                         volume_id: kept.volume_id.clone(),
                         path: kept.path.clone(),
                         size: kept.size,
@@ -347,7 +420,7 @@ impl<'a> Executor<'a> {
             let hash = full_hash(&src, item.size, item.mtime)?;
             if hash != keep_hash {
                 // Remembered, so the catalog stops calling the two duplicates.
-                self.learned.push(store::Hashed {
+                self.learned.hashes.push(store::Hashed {
                     volume_id: item.volume_id.clone(),
                     path: item.path.clone(),
                     size: item.size,
@@ -385,8 +458,9 @@ impl<'a> Executor<'a> {
     }
 
     /// Moves a file to its destination on this machine: a rename that never replaces anything,
-    /// or, across filesystems, a verified copy and the original to the trash.
-    fn relocate(&mut self, item: &Item, dest: &Dest) -> std::result::Result<(), Skip> {
+    /// or, across filesystems, a verified copy and the original to the trash. Returns the full
+    /// hash it read when it copied.
+    fn relocate(&mut self, item: &Item, dest: &Dest) -> std::result::Result<Option<String>, Skip> {
         let root = self.root(&item.volume_id)?;
         let dest_root = self.root(&dest.volume_id)?;
         let src = checked_path(root, &item.path)?;
@@ -405,7 +479,7 @@ impl<'a> Executor<'a> {
                 return match fs::symlink_metadata(&to) {
                     Ok(m) if unchanged(&m, item.size, item.mtime) => {
                         self.journal_once(&trash, item, in_trash.exists());
-                        Ok(())
+                        Ok(None)
                     }
                     _ => Err("gone since the scan".into()),
                 };
@@ -440,13 +514,13 @@ impl<'a> Executor<'a> {
             platform::rename_no_replace(&src, &to)
         };
         match renamed {
-            Ok(()) => Ok(()),
+            Ok(()) => Ok(None),
             Err(e) if e.kind() == io::ErrorKind::CrossesDevices => {
                 let hash = copy_verified(&src, &to, item, self.id).map_err(&undo_folders)?;
                 after_copy(&src);
                 // Record the copy and its hash before the original goes to the trash.
                 let entry = JournalEntry {
-                    hash,
+                    hash: hash.clone(),
                     copied: true,
                     ..entry
                 };
@@ -470,7 +544,7 @@ impl<'a> Executor<'a> {
                     }
                     return Err(undo_folders(format!("after copying it: {why}")));
                 }
-                Ok(())
+                Ok(Some(hash))
             }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(undo_folders(
                 "something is already at its destination".into(),
@@ -895,15 +969,16 @@ fn trashed_files(files: &Path) -> (Vec<(PathBuf, String)>, usize) {
     (found, unlisted)
 }
 
-/// The `files` folder of a plan's trash on each of `volumes` that has one. A volume that isn't
-/// configured here or isn't mounted is reported in `left`, so the plan doesn't count as undone
-/// or emptied while its files may still be in that volume's trash.
+/// The trash folder of a plan on each of `volumes` that has one, with the volume's id and
+/// root. A volume that isn't configured here or isn't mounted is reported in `left`, so the
+/// plan doesn't count as undone or emptied while its files may still be in that volume's
+/// trash.
 fn trash_folders<'a>(
     roots: &HashMap<&str, &'a Path>,
     volumes: &[String],
     id: &str,
     left: &mut Vec<String>,
-) -> Vec<(&'a Path, PathBuf)> {
+) -> Vec<(String, &'a Path, PathBuf)> {
     let mut found = Vec::new();
     for volume_id in volumes {
         let root = match volume_root(roots, volume_id) {
@@ -918,7 +993,7 @@ fn trash_folders<'a>(
         };
         let dir = root.join(TRASH).join(id);
         if fs::symlink_metadata(dir.join("files")).is_ok_and(|m| m.is_dir()) {
-            found.push((root, dir));
+            found.push((volume_id.clone(), root, dir));
         }
     }
     found
@@ -936,15 +1011,36 @@ fn report_unlisted(files: &Path, unlisted: usize, left: &mut Vec<String>) {
 /// Puts a plan's files back where they were: files in the trash, and moved files from their
 /// destination. A file whose original path is taken again stays where it is. Folders a move
 /// created are removed afterwards, once every move is undone, if they're empty.
-fn undo(roots: &HashMap<&str, &Path>, volumes: &[String], id: &str) -> Done {
+fn undo(roots: &HashMap<&str, &Path>, volumes: &[String], id: &str, learned: &mut Learned) -> Done {
     let mut done = Done::default();
     let mut created: Vec<(&Path, String)> = Vec::new();
-    for (root, dir) in trash_folders(roots, volumes, id, &mut done.left_in_trash) {
+    let carry = |from_volume_id: &str, from_path: &str, volume_id: &str, entry: &JournalEntry| {
+        store::Carried {
+            from_volume_id: from_volume_id.to_string(),
+            from_path: from_path.to_string(),
+            to_volume_id: volume_id.to_string(),
+            to_path: entry.path.clone(),
+            size: entry.size,
+            mtime: entry.mtime,
+            fingerprint: None,
+            hash: Some(entry.hash.clone()).filter(|h| !h.is_empty()),
+        }
+    };
+    for (volume_id, root, dir) in trash_folders(roots, volumes, id, &mut done.left_in_trash) {
         let files = dir.join("files");
         let journal = read_journal(&dir);
         for entry in journal.values().filter(|e| e.action == Action::Move) {
+            let restored = done.restored;
             if let Some(dest_root) = undo_move(roots, root, &files, entry, &mut done) {
                 created.extend(entry.created.iter().map(|c| (dest_root, c.clone())));
+            }
+            if done.restored > restored
+                && let (Some(dest_volume), Some(dest_path)) =
+                    (&entry.dest_volume_id, &entry.dest_path)
+            {
+                learned
+                    .carried
+                    .push(carry(dest_volume, dest_path, &volume_id, entry));
             }
         }
         let (found, unlisted) = trashed_files(&files);
@@ -956,7 +1052,14 @@ fn undo(roots: &HashMap<&str, &Path>, volumes: &[String], id: &str) -> Done {
             }
             let original = root.join(&rel);
             match restore(root, &rel, &in_trash) {
-                Ok(()) => done.restored += 1,
+                Ok(()) => {
+                    done.restored += 1;
+                    if let Some(entry) = journal.get(&rel) {
+                        learned
+                            .carried
+                            .push(carry(&volume_id, &rel, &volume_id, entry));
+                    }
+                }
                 Err(why) => done
                     .left_in_trash
                     .push(format!("{}: {why}", original.display())),
@@ -1098,7 +1201,7 @@ fn undo_move<'a>(
 /// the original's full hash.
 fn empty(roots: &HashMap<&str, &Path>, volumes: &[String], id: &str) -> Done {
     let mut done = Done::default();
-    for (_, dir) in trash_folders(roots, volumes, id, &mut done.left_in_trash) {
+    for (_, _, dir) in trash_folders(roots, volumes, id, &mut done.left_in_trash) {
         let files = dir.join("files");
         let journal = read_journal(&dir);
         let (found, unlisted) = trashed_files(&files);
@@ -1209,15 +1312,18 @@ fn remove_emptied(dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// `gfiles plan exec`: the machine side of the exchange, on stdin/stdout. Returns the full
-/// hashes apply read, for the caller to store in this machine's catalog (see
-/// `record_hashes`).
+/// `gfiles plan exec`: the machine side of the exchange, on stdin/stdout. `catalog` is this
+/// machine's, read before files move (`known_before`). What the run learned goes into
+/// `learned`, also when it stopped early (the hub gone), for the caller to store in this
+/// machine's catalog (see `record_learned`).
 pub fn serve(
     config: &Config,
     lock_path: &Path,
+    catalog: Option<&Connection>,
     input: impl BufRead,
     output: impl Write,
-) -> Result<Vec<store::Hashed>> {
+    learned: &mut Learned,
+) -> Result<()> {
     let mut out = BufWriter::new(output);
     let hello = Hello {
         gfiles_actions: PROTOCOL,
@@ -1225,10 +1331,10 @@ pub fn serve(
     };
     writeln!(out, "{}", serde_json::to_string(&hello)?)?;
     out.flush()?;
-    let refuse = |out: &mut BufWriter<_>, msg: String| -> Result<Vec<store::Hashed>> {
+    let refuse = |out: &mut BufWriter<_>, msg: String| -> Result<()> {
         writeln!(out, "{}", serde_json::to_string(&Reply::Error(msg))?)?;
         out.flush()?;
-        Ok(Vec::new())
+        Ok(())
     };
     // Read everything before working, so the hub can finish sending first.
     let lines: Vec<String> = input.lines().collect::<io::Result<_>>()?;
@@ -1270,52 +1376,66 @@ pub fn serve(
         Ok(l) => l,
         Err(e) => return refuse(&mut out, e.to_string()),
     };
+    let known = match catalog {
+        Some(conn) if req.op == Op::Apply => known_before(conn, &items),
+        _ => Known::new(),
+    };
     let total = items.len();
     let mut n = 0;
-    let result = run(config, req.op, &req.plan, &items, &req.volumes, |o| {
-        n += 1;
-        if n % 1000 == 0 {
-            eprintln!("{n} of {total} files checked");
-        }
-        writeln!(out, "{}", serde_json::to_string(&Reply::Item(o.clone()))?)?;
-        // Sent now, so a hub that has gone away stops the run at the next file.
-        out.flush()?;
-        Ok(())
-    });
-    let hashes = match result {
-        Ok(mut done) => {
-            let hashes = std::mem::take(&mut done.hashes);
-            writeln!(out, "{}", serde_json::to_string(&Reply::Done(done))?)?;
-            hashes
-        }
-        Err(e) => {
-            writeln!(
-                out,
-                "{}",
-                serde_json::to_string(&Reply::Error(format!("{e:#}")))?
-            )?;
-            Vec::new()
-        }
-    };
+    let result = run(
+        config,
+        req.op,
+        &req.plan,
+        &items,
+        &req.volumes,
+        &known,
+        learned,
+        |o| {
+            n += 1;
+            if n % 1000 == 0 {
+                eprintln!("{n} of {total} files checked");
+            }
+            writeln!(out, "{}", serde_json::to_string(&Reply::Item(o.clone()))?)?;
+            // Sent now, so a hub that has gone away stops the run at the next file.
+            out.flush()?;
+            Ok(())
+        },
+    );
+    match result {
+        Ok(done) => writeln!(out, "{}", serde_json::to_string(&Reply::Done(done))?)?,
+        Err(e) => writeln!(
+            out,
+            "{}",
+            serde_json::to_string(&Reply::Error(format!("{e:#}")))?
+        )?,
+    }
     out.flush()?;
-    Ok(hashes)
+    Ok(())
 }
 
-/// Stores the full hashes a plan run read in this machine's catalog, so the files apply found
-/// different stop matching as duplicates (and kept copies count as confirmed) from the next
-/// pull on. Never fails the run: a busy or missing catalog only means `gfiles hash` would
-/// have to read them again.
-pub fn record_hashes(conn: &Connection, hashes: &[store::Hashed]) {
-    if hashes.is_empty() {
+/// Stores what a plan run learned in this machine's catalog: the full hashes it read, so the
+/// files apply found different stop matching as duplicates (and kept copies count as
+/// confirmed), and what moved files carry to their new paths, so the next scan doesn't lose
+/// their fingerprints and hashes. The hub gets both at its next pull. Never fails the run: a
+/// busy or missing catalog only means `gfiles hash` would have to read them again.
+pub fn record_learned(conn: &Connection, learned: &Learned) {
+    if learned.is_empty() {
         return;
     }
     // A scan holds the catalog for its whole walk; don't keep the hub waiting that long.
     let _ = conn.busy_timeout(std::time::Duration::from_secs(30));
-    if let Err(e) = store::record_hashes(conn, hashes) {
+    if let Err(e) = store::record_hashes(conn, &learned.hashes) {
         eprintln!(
             "warning: couldn't store {} full hashes in the catalog ({e:#}); the files are \
              fine, `gfiles hash` can compute them again",
-            hashes.len()
+            learned.hashes.len()
+        );
+    }
+    if let Err(e) = store::record_carried(conn, &learned.carried) {
+        eprintln!(
+            "warning: couldn't record {} moved files in the catalog ({e:#}); the files are \
+             fine, but their next scan reads them as new",
+            learned.carried.len()
         );
     }
 }
@@ -1391,9 +1511,26 @@ pub fn execute(conn: &mut Connection, route: &Route, op: Op, id: &str) -> Result
             Ok(())
         };
         match route {
-            Route::Local { config, lock_path } => Lock::take(lock_path)
-                .and_then(|_lock| run(config, op, id, &items, &volumes, |o| record(o, conn)))
-                .inspect(|done| record_hashes(conn, &done.hashes)),
+            Route::Local { config, lock_path } => Lock::take(lock_path).and_then(|_lock| {
+                let known = if op == Op::Apply {
+                    known_before(conn, &items)
+                } else {
+                    Known::new()
+                };
+                let mut learned = Learned::default();
+                let done = run(
+                    config,
+                    op,
+                    id,
+                    &items,
+                    &volumes,
+                    &known,
+                    &mut learned,
+                    |o| record(o, conn),
+                );
+                record_learned(conn, &learned);
+                done
+            }),
             Route::Ssh { host, gfiles } => over_ssh(
                 host,
                 gfiles,
@@ -1678,13 +1815,29 @@ mod tests {
         }
 
         fn run(&self, op: Op, items: &[Item]) -> (Done, Vec<Outcome>) {
-            let mut outcomes = Vec::new();
-            let done = run(&self.config, op, ID, items, &["v1".into()], |o| {
-                outcomes.push(o.clone());
-                Ok(())
-            })
-            .unwrap();
+            let (done, _, outcomes) = self.run_learning(op, items);
             (done, outcomes)
+        }
+
+        /// Runs `op`, also returning what it learned for the catalog.
+        fn run_learning(&self, op: Op, items: &[Item]) -> (Done, Learned, Vec<Outcome>) {
+            let mut outcomes = Vec::new();
+            let mut learned = Learned::default();
+            let done = run(
+                &self.config,
+                op,
+                ID,
+                items,
+                &["v1".into()],
+                &Known::new(),
+                &mut learned,
+                |o| {
+                    outcomes.push(o.clone());
+                    Ok(())
+                },
+            )
+            .unwrap();
+            (done, learned, outcomes)
         }
 
         fn exists(&self, rel: &str) -> bool {
@@ -1738,21 +1891,21 @@ mod tests {
             v.item(1, "t/a copy.bmp", "k/a.bmp"),
             v.item(2, "t/b.bmp", "k/a.bmp"),
         ];
-        let (done, outcomes) = v.run(Op::Apply, &items);
+        let (_, learned, outcomes) = v.run_learning(Op::Apply, &items);
         assert_eq!(
             reasons(&outcomes),
             vec!["moved", "moved", "its content differs from the kept copy"]
         );
         // The kept copy once, and the file that differs; not the files moved away.
-        let hashed: Vec<(&str, bool)> = done
+        let hashed: Vec<(&str, bool)> = learned
             .hashes
             .iter()
             .map(|h| (h.path.as_str(), h.hash.starts_with("b3:")))
             .collect();
         assert_eq!(hashed, vec![("k/a.bmp", true), ("t/b.bmp", true)]);
-        assert_ne!(done.hashes[0].hash, done.hashes[1].hash);
+        assert_ne!(learned.hashes[0].hash, learned.hashes[1].hash);
         assert_eq!(
-            (done.hashes[1].size, done.hashes[1].mtime),
+            (learned.hashes[1].size, learned.hashes[1].mtime),
             v.stat("t/b.bmp")
         );
     }
@@ -1971,7 +2124,17 @@ mod tests {
             assert!(!v.root.exists());
         }
         // A volume this machine doesn't have holds the plan back too.
-        let done = run(&v.config, Op::Undo, ID, &[], &["gone".into()], |_| Ok(())).unwrap();
+        let done = run(
+            &v.config,
+            Op::Undo,
+            ID,
+            &[],
+            &["gone".into()],
+            &Known::new(),
+            &mut Learned::default(),
+            |_| Ok(()),
+        )
+        .unwrap();
         assert!(
             done.left_in_trash[0].contains("isn't configured"),
             "{done:?}"
@@ -2083,7 +2246,15 @@ mod tests {
     fn round_trip(v: &Vol, request: &str, items: &[Item]) -> Result<(Done, Vec<Outcome>)> {
         let lock = v._tmp.path().join("actions.lock");
         let mut answer = Vec::new();
-        serve(&v.config, &lock, request.as_bytes(), &mut answer).unwrap();
+        serve(
+            &v.config,
+            &lock,
+            None,
+            request.as_bytes(),
+            &mut answer,
+            &mut Learned::default(),
+        )
+        .unwrap();
         let mut outcomes = Vec::new();
         let mut sent = Vec::new();
         let done = exchange(
@@ -2183,10 +2354,20 @@ mod tests {
             v.item(1, "todo/b.jpg", "Photos/b.jpg"),
         ];
         let lock = v._tmp.path().join("actions.lock");
-        let result = serve(&v.config, &lock, request(&items).as_bytes(), Closed(false));
+        let mut learned = Learned::default();
+        let result = serve(
+            &v.config,
+            &lock,
+            None,
+            request(&items).as_bytes(),
+            Closed(false),
+            &mut learned,
+        );
         assert!(result.is_err());
         assert!(!v.exists("todo/a.jpg"), "the first file moves");
         assert!(v.exists("todo/b.jpg"), "but the run stops there");
+        // What it learned before stopping is still handed back for this machine's catalog.
+        assert_eq!(learned.hashes.len(), 1, "{learned:?}");
     }
 
     #[test]
@@ -2243,13 +2424,13 @@ mod tests {
         let v = volume();
         v.write("todo/a.NEF", "original");
         v.write("photo/a.NEF", "original + xmp tags");
-        let (done, outcomes) = v.run(
+        let (_, learned, outcomes) = v.run_learning(
             Op::Apply,
             &[vouched(v.item(0, "todo/a.NEF", "photo/a.NEF"))],
         );
         assert_eq!(reasons(&outcomes), vec!["moved"]);
         assert!(v.exists(&v.trashed("todo/a.NEF")));
-        assert!(done.hashes.is_empty(), "{:?}", done.hashes);
+        assert!(learned.hashes.is_empty(), "{:?}", learned.hashes);
         assert!(v.journal().contains("\"keep_path\":\"photo/a.NEF\""));
         // Unvouched, the same pair is skipped.
         v.write("todo/b.NEF", "original");
@@ -2426,6 +2607,170 @@ mod tests {
         assert!(!v.exists("photo/2013"));
         // A folder that existed before stays, and so does one that holds something else now.
         assert!(v.exists("photo/2014/other.txt"));
+    }
+
+    fn carried(learned: &Learned) -> Vec<(String, String, bool)> {
+        learned
+            .carried
+            .iter()
+            .map(|c| (c.from_path.clone(), c.to_path.clone(), c.hash.is_some()))
+            .collect()
+    }
+
+    #[test]
+    fn moves_report_what_they_carry_to_the_new_path() {
+        let v = volume();
+        v.write("todo/a.jpg", "a");
+        v.write("todo/b.jpg", "b");
+        v.write("todo/c.jpg", "c");
+        v.write("photo/taken.jpg", "already here");
+        let renamed = v.mv(0, "todo/a.jpg", "photo/a.jpg");
+        let changed = v.mv(1, "todo/b.jpg", "photo/b.jpg");
+        v.write("todo/b.jpg", "b, edited");
+        let taken = v.mv(2, "todo/c.jpg", "photo/taken.jpg");
+        let (_, learned, _) = v.run_learning(Op::Apply, &[renamed.clone(), changed, taken]);
+        // Only the move that happened; a rename reads no hash.
+        assert_eq!(
+            carried(&learned),
+            vec![("todo/a.jpg".into(), "photo/a.jpg".into(), false)]
+        );
+        let c = &learned.carried[0];
+        assert_eq!((c.size, c.mtime), (renamed.size, renamed.mtime));
+        let (_, learned, _) = v.run_learning(Op::Apply, &[renamed]);
+        assert_eq!(learned.carried.len(), 1);
+
+        // A copy across filesystems carries the hash it checked the copy with.
+        v.write("todo/d.jpg", "d");
+        let (_, learned, _) = copying(false, || {
+            v.run_learning(Op::Apply, &[v.mv(3, "todo/d.jpg", "photo/d.jpg")])
+        });
+        assert_eq!(
+            carried(&learned),
+            vec![("todo/d.jpg".into(), "photo/d.jpg".into(), true)]
+        );
+        assert!(
+            v.journal()
+                .contains(learned.carried[0].hash.as_deref().unwrap())
+        );
+    }
+
+    #[test]
+    fn moves_carry_what_the_catalog_knew_before_the_run() {
+        let v = volume();
+        v.write("todo/a.jpg", "a");
+        let item = v.mv(0, "todo/a.jpg", "photo/a.jpg");
+        let fp = "p1:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let known = Known::from([(
+            ("v1".to_string(), "todo/a.jpg".to_string()),
+            (Some(fp.to_string()), Some("b3:known".to_string())),
+        )]);
+        let mut learned = Learned::default();
+        run(
+            &v.config,
+            Op::Apply,
+            ID,
+            &[item],
+            &["v1".into()],
+            &known,
+            &mut learned,
+            |_| Ok(()),
+        )
+        .unwrap();
+        let c = &learned.carried[0];
+        assert_eq!(c.fingerprint.as_deref(), Some(fp));
+        assert_eq!(c.hash.as_deref(), Some("b3:known"));
+    }
+
+    #[test]
+    fn undo_reports_the_files_it_puts_back() {
+        let v = volume();
+        v.write("todo/a.jpg", "a");
+        v.write("todo/b.jpg", "b");
+        v.write("todo/c.jpg", "same");
+        v.write("Photos/c.jpg", "same");
+        v.run(Op::Apply, &[v.mv(0, "todo/a.jpg", "photo/a.jpg")]);
+        copying(false, || {
+            v.run(Op::Apply, &[v.mv(1, "todo/b.jpg", "photo/b.jpg")])
+        });
+        v.run(Op::Apply, &[v.item(2, "todo/c.jpg", "Photos/c.jpg")]);
+        let (done, learned, _) = v.run_learning(Op::Undo, &[]);
+        assert_eq!(done.restored, 3, "{:?}", done.left_in_trash);
+        let mut got = carried(&learned);
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                ("photo/a.jpg".into(), "todo/a.jpg".into(), false),
+                ("photo/b.jpg".into(), "todo/b.jpg".into(), true),
+                // A restored removal stays at its own path, with the hash apply compared.
+                ("todo/c.jpg".into(), "todo/c.jpg".into(), true),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_run_that_stops_early_still_hands_back_its_moves() {
+        let v = volume();
+        v.write("todo/a.jpg", "a");
+        v.write("todo/b.jpg", "b");
+        let items = [
+            v.mv(0, "todo/a.jpg", "photo/a.jpg"),
+            v.mv(1, "todo/b.jpg", "photo/b.jpg"),
+        ];
+        let mut learned = Learned::default();
+        let result = run(
+            &v.config,
+            Op::Apply,
+            ID,
+            &items,
+            &["v1".into()],
+            &Known::new(),
+            &mut learned,
+            |_| bail!("the hub went away"),
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            carried(&learned),
+            vec![("todo/a.jpg".into(), "photo/a.jpg".into(), false)]
+        );
+    }
+
+    #[test]
+    fn moved_files_keep_their_hashes_through_the_next_scan() {
+        const HASH: &str = "b3:ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100";
+        let v = volume();
+        v.write("todo/a.png", "shot");
+        let mut conn = crate::db::open_in_memory().unwrap();
+        let vol = &v.config.volumes[0];
+        crate::scan::scan_volume(&mut conn, vol, "elrond").unwrap();
+        conn.execute("UPDATE entries SET content_hash = ?1", [HASH])
+            .unwrap();
+        let known = |conn: &Connection, path: &str| -> (Option<String>, Option<String>) {
+            conn.query_row(
+                "SELECT fingerprint, content_hash FROM entries WHERE path = ?1",
+                [path],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        let before = known(&conn, "todo/a.png");
+        assert!(before.0.is_some());
+
+        let list = r#"{"move": "elrond:darren/todo/a.png", "to": "elrond:darren/Documents/a.png"}"#;
+        let built = crate::listplan::build(&conn, list).unwrap();
+        let id = plan::save(&conn, &built, 0).unwrap();
+        let lock = v._tmp.path().join("actions.lock");
+        let route = Route::Local {
+            config: &v.config,
+            lock_path: &lock,
+        };
+        execute(&mut conn, &route, Op::Apply, &id).unwrap();
+        crate::scan::scan_volume(&mut conn, vol, "elrond").unwrap();
+        assert_eq!(known(&conn, "Documents/a.png"), before);
+
+        execute(&mut conn, &route, Op::Undo, &id).unwrap();
+        crate::scan::scan_volume(&mut conn, vol, "elrond").unwrap();
+        assert_eq!(known(&conn, "todo/a.png"), before);
     }
 
     #[test]

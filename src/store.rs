@@ -10,7 +10,7 @@
 //! first: a stored path must stay inside its volume, whoever wrote it.
 
 use anyhow::{Result, bail};
-use rusqlite::{Connection, Statement, params};
+use rusqlite::{Connection, OptionalExtension, Statement, params};
 use serde::{Deserialize, Serialize};
 
 use crate::classify;
@@ -232,10 +232,13 @@ pub struct Finished {
     pub kept: u64,
 }
 
-/// Whether `path` is `dir` or inside it (both relative, `/`-separated).
+/// Whether `path` is `dir` or inside it (both relative, `/`-separated). The empty `dir` is
+/// the volume root, which holds everything.
 fn is_within(path: &str, dir: &str) -> bool {
-    path.strip_prefix(dir)
-        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+    dir.is_empty()
+        || path
+            .strip_prefix(dir)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
 /// An absolute path on any platform a volume can live on: `/...` on Unix, `C:\...` or
@@ -349,6 +352,136 @@ pub fn record_hashes(conn: &Connection, hashes: &[Hashed]) -> Result<usize> {
     Ok(stored)
 }
 
+/// A file a plan run moved on this machine, from one path to another (the same path for a
+/// file undo restored from the trash), with the size and mtime it kept. `fingerprint` and
+/// `hash` are what the run already knew: what the catalog held before the file moved
+/// (`known_content`), or a full hash the run read itself (checking a copy, or the trash
+/// journal's on undo).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Carried {
+    pub from_volume_id: String,
+    pub from_path: String,
+    pub to_volume_id: String,
+    pub to_path: String,
+    pub size: i64,
+    pub mtime: i64,
+    pub fingerprint: Option<String>,
+    pub hash: Option<String>,
+}
+
+const KNOWN_CONTENT: &str = "SELECT fingerprint, content_hash FROM entries
+     WHERE volume_id = ?1 AND path = ?2 AND size = ?3 AND mtime = ?4
+     UNION ALL
+     SELECT fingerprint, content_hash FROM carried
+     WHERE volume_id = ?1 AND path = ?2 AND size = ?3 AND mtime = ?4
+     LIMIT 1";
+
+/// The fingerprint and full hash the catalog has for the file at a path while its size and
+/// mtime match: its entry's, else what a move carried there and no scan has taken yet.
+pub fn known_content(
+    conn: &Connection,
+    volume_id: &str,
+    path: &str,
+    size: i64,
+    mtime: i64,
+) -> Result<(Option<String>, Option<String>)> {
+    Ok(conn
+        .prepare_cached(KNOWN_CONTENT)?
+        .query_row(params![volume_id, path, size, mtime], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .optional()?
+        .unwrap_or_default())
+}
+
+/// Records what each moved file carries to its new path: what the run already knew, else the
+/// fingerprint and full hash its old entry has (or a record carried there by an earlier move,
+/// when no scan came between), guarded by size and mtime. The next scan
+/// of the destination volume gives them to the new entry (`take_carried`); an entry already
+/// there with the same size and mtime gets them now. Returns how many were recorded.
+pub fn record_carried(conn: &Connection, moves: &[Carried]) -> Result<usize> {
+    // Immediate: a deferred transaction that reads first can't wait out a scan's commit.
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let mut recorded = 0;
+    {
+        let mut drop = tx.prepare("DELETE FROM carried WHERE volume_id = ?1 AND path = ?2")?;
+        let mut put = tx.prepare(
+            "INSERT OR REPLACE INTO carried (volume_id, path, size, mtime, fingerprint, content_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )?;
+        let mut fill = tx.prepare(
+            "UPDATE entries SET fingerprint = coalesce(fingerprint, ?5),
+                                content_hash = coalesce(content_hash, ?6)
+             WHERE volume_id = ?1 AND path = ?2 AND size = ?3 AND mtime = ?4",
+        )?;
+        for m in moves {
+            let (fingerprint, hash) =
+                known_content(&tx, &m.from_volume_id, &m.from_path, m.size, m.mtime)?;
+            let fingerprint = m.fingerprint.clone().or(fingerprint);
+            let hash = m.hash.clone().or(hash);
+            // The file left its old path; for a restored file, from and to are the same, so
+            // this goes before the new record.
+            drop.execute(params![m.from_volume_id, m.from_path])?;
+            if fingerprint.is_none() && hash.is_none() {
+                continue;
+            }
+            let to = params![
+                m.to_volume_id,
+                m.to_path,
+                m.size,
+                m.mtime,
+                fingerprint,
+                hash
+            ];
+            put.execute(to)?;
+            fill.execute(to)?;
+            recorded += 1;
+        }
+    }
+    tx.commit()?;
+    Ok(recorded)
+}
+
+/// Gives a volume's carried records to the entries a scan just wrote at their paths (where
+/// size and mtime match, filling only what an entry lacks), then forgets the volume's
+/// records, except those under `keep` (folders the scan couldn't read). Returns how many
+/// entries got values.
+pub fn take_carried(conn: &Connection, volume_id: &str, keep: &[String]) -> Result<usize> {
+    // Almost every scan has none: skip the join over the whole volume.
+    let any: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM carried WHERE volume_id = ?1)",
+        [volume_id],
+        |r| r.get(0),
+    )?;
+    if !any {
+        return Ok(0);
+    }
+    let given = conn.execute(
+        "UPDATE entries SET
+           fingerprint = coalesce(entries.fingerprint, c.fingerprint),
+           content_hash = coalesce(entries.content_hash, c.content_hash)
+         FROM carried c
+         WHERE entries.volume_id = ?1 AND c.volume_id = ?1 AND c.path = entries.path
+           AND c.size = entries.size AND c.mtime = entries.mtime",
+        [volume_id],
+    )?;
+    if keep.is_empty() {
+        conn.execute("DELETE FROM carried WHERE volume_id = ?1", [volume_id])?;
+    } else {
+        let paths: Vec<String> = conn
+            .prepare("SELECT path FROM carried WHERE volume_id = ?1")?
+            .query_map([volume_id], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut delete = conn.prepare("DELETE FROM carried WHERE volume_id = ?1 AND path = ?2")?;
+        for path in paths {
+            if !keep.iter().any(|k| is_within(&path, k)) {
+                delete.execute(params![volume_id, path])?;
+            }
+        }
+    }
+    Ok(given)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -456,6 +589,196 @@ mod tests {
         assert_eq!(stored(&conn, "a.txt"), (Some(FP.into()), None));
     }
 
+    const HASH2: &str = "b3:0000000000000000000000000000000000000000000000000000000000000002";
+
+    fn file(path: &str, mtime: i64, fp: Option<&str>, hash: Option<&str>) -> Entry {
+        Entry {
+            size: 10,
+            mtime,
+            fingerprint: fp.map(Into::into),
+            content_hash: hash.map(Into::into),
+            ..entry(path, path.rsplit('/').next().unwrap())
+        }
+    }
+
+    fn moved(from: &str, to: &str, mtime: i64, hash: Option<&str>) -> Carried {
+        Carried {
+            from_volume_id: "v".into(),
+            from_path: from.into(),
+            to_volume_id: "v".into(),
+            to_path: to.into(),
+            size: 10,
+            mtime,
+            fingerprint: None,
+            hash: hash.map(Into::into),
+        }
+    }
+
+    fn carried(conn: &Connection) -> Vec<(String, Option<String>, Option<String>)> {
+        conn.prepare("SELECT path, fingerprint, content_hash FROM carried ORDER BY path")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    #[test]
+    fn a_move_carries_what_the_catalog_knew() {
+        let conn = crate::db::open_in_memory().unwrap();
+        write(
+            &conn,
+            &[
+                file("a/x.png", 100, Some(FP), Some(HASH)),
+                file("a/y.png", 100, Some(FP), None),
+                file("a/z.png", 100, None, None),
+            ],
+        );
+        let n = record_carried(
+            &conn,
+            &[
+                moved("a/x.png", "b/x.png", 100, None),
+                // The move read a different hash itself: it wins.
+                moved("a/y.png", "b/y.png", 100, Some(HASH2)),
+                // Changed since the catalog saw it: nothing to carry.
+                moved("a/x.png", "b/old.png", 101, None),
+                // Nothing known at all.
+                moved("a/z.png", "b/z.png", 100, None),
+            ],
+        )
+        .unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(
+            carried(&conn),
+            vec![
+                ("b/x.png".into(), Some(FP.into()), Some(HASH.into())),
+                ("b/y.png".into(), Some(FP.into()), Some(HASH2.into())),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_move_keeps_what_was_known_before_a_scan_forgot_its_old_entry() {
+        // A scan during the run saw the file gone from its old path and dropped that entry.
+        let conn = crate::db::open_in_memory().unwrap();
+        write(&conn, &[]);
+        let mut m = moved("a.png", "b.png", 100, None);
+        m.fingerprint = Some(FP.into());
+        record_carried(&conn, &[m]).unwrap();
+        assert_eq!(
+            carried(&conn),
+            vec![("b.png".into(), Some(FP.into()), None)]
+        );
+    }
+
+    #[test]
+    fn a_scan_that_read_nothing_keeps_everything() {
+        // A walk error with no path: every entry and record stays, as if under `keep`.
+        let conn = crate::db::open_in_memory().unwrap();
+        write(&conn, &[file("a.png", 100, Some(FP), Some(HASH))]);
+        record_carried(&conn, &[moved("a.png", "b.png", 100, None)]).unwrap();
+        let finished = VolumeWriter::begin(&conn, &vol())
+            .unwrap()
+            .finish(0, &[String::new()])
+            .unwrap();
+        assert_eq!((finished.removed, finished.kept), (0, 1));
+        assert_eq!(take_carried(&conn, "v", &[String::new()]).unwrap(), 0);
+        assert_eq!(stored(&conn, "a.png"), (Some(FP.into()), Some(HASH.into())));
+        assert_eq!(carried(&conn).len(), 1);
+    }
+
+    #[test]
+    fn a_file_moved_twice_before_a_scan_carries_through() {
+        let conn = crate::db::open_in_memory().unwrap();
+        write(&conn, &[file("a.png", 100, Some(FP), Some(HASH))]);
+        record_carried(&conn, &[moved("a.png", "b.png", 100, None)]).unwrap();
+        record_carried(&conn, &[moved("b.png", "c.png", 100, None)]).unwrap();
+        assert_eq!(
+            carried(&conn),
+            vec![("c.png".into(), Some(FP.into()), Some(HASH.into()))]
+        );
+    }
+
+    #[test]
+    fn a_restored_file_keeps_its_journal_hash() {
+        // Undo restores a removed file to its own path, whose entry a scan already forgot.
+        let conn = crate::db::open_in_memory().unwrap();
+        write(&conn, &[]);
+        record_carried(&conn, &[moved("a.png", "a.png", 100, Some(HASH))]).unwrap();
+        assert_eq!(
+            carried(&conn),
+            vec![("a.png".into(), None, Some(HASH.into()))]
+        );
+    }
+
+    #[test]
+    fn recording_fills_an_entry_a_scan_already_wrote() {
+        let conn = crate::db::open_in_memory().unwrap();
+        write(
+            &conn,
+            &[
+                file("a.png", 100, Some(FP), Some(HASH)),
+                file("b.png", 100, None, None),
+                file("c.png", 100, Some(FP), Some(HASH)),
+                file("d.png", 200, None, None),
+            ],
+        );
+        record_carried(
+            &conn,
+            &[
+                moved("a.png", "b.png", 100, None),
+                // Different mtime at the destination: left alone.
+                moved("c.png", "d.png", 100, None),
+            ],
+        )
+        .unwrap();
+        assert_eq!(stored(&conn, "b.png"), (Some(FP.into()), Some(HASH.into())));
+        assert_eq!(stored(&conn, "d.png"), (None, None));
+    }
+
+    #[test]
+    fn a_scan_takes_matching_records_and_forgets_the_rest() {
+        let conn = crate::db::open_in_memory().unwrap();
+        write(
+            &conn,
+            &[
+                file("a.png", 100, Some(FP), Some(HASH)),
+                file("c.png", 100, Some(FP), Some(HASH)),
+                file("e.png", 100, Some(FP), Some(HASH)),
+            ],
+        );
+        record_carried(
+            &conn,
+            &[
+                moved("a.png", "new/b.png", 100, None),
+                moved("c.png", "new/d.png", 100, None),
+                moved("e.png", "locked/f.png", 100, None),
+            ],
+        )
+        .unwrap();
+        // The scan finds b unchanged, d edited since the move, and can't read `locked`.
+        write(
+            &conn,
+            &[
+                file("new/b.png", 100, None, None),
+                file("new/d.png", 150, None, None),
+            ],
+        );
+        let given = take_carried(&conn, "v", &["locked".into()]).unwrap();
+        assert_eq!(given, 1);
+        assert_eq!(
+            stored(&conn, "new/b.png"),
+            (Some(FP.into()), Some(HASH.into()))
+        );
+        assert_eq!(stored(&conn, "new/d.png"), (None, None));
+        assert_eq!(
+            carried(&conn),
+            vec![("locked/f.png".into(), Some(FP.into()), Some(HASH.into()))]
+        );
+        forget_volume(&conn, "v").unwrap();
+        assert!(carried(&conn).is_empty());
+    }
+
     #[test]
     fn validate_checks_fingerprints() {
         let ok = |fp: &str| {
@@ -504,6 +827,7 @@ mod tests {
         assert!(is_within("a", "a"));
         assert!(!is_within("ab/c", "a"));
         assert!(!is_within("b", "a"));
+        assert!(is_within("a/b", ""), "the root holds everything");
     }
 
     #[test]

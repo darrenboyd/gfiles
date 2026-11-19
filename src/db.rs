@@ -141,6 +141,20 @@ CREATE TABLE plan_rejected (
 );
 CREATE INDEX plan_rejected_plan ON plan_rejected (plan_id);
 "#,
+    r#"
+-- What a plan's move carries to the file's new path: the fingerprint and full hash the
+-- catalog had, kept until the next scan of that volume gives them to the new entry (when
+-- its size and mtime still match), so moved files aren't read again and keep their hashes.
+CREATE TABLE carried (
+    volume_id    TEXT NOT NULL REFERENCES volumes(id) ON DELETE CASCADE,
+    path         TEXT NOT NULL,
+    size         INTEGER NOT NULL,
+    mtime        INTEGER NOT NULL,
+    fingerprint  TEXT,
+    content_hash TEXT,
+    PRIMARY KEY (volume_id, path)
+);
+"#,
 ];
 
 pub fn open(path: &Path) -> Result<Connection> {

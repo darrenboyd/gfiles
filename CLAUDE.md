@@ -260,7 +260,12 @@ scratch directory, when trying the binary out, so experiments never touch the re
   then trash the original; undo and empty treat a copied move's original like a removal's
   file, guarded by the copy's journaled hash. A move's journal line is synced before the file
   moves, and destinations a scan would skip (hidden, `#recycle`, `@eaDir`, ...) are refused on
-  the hub and again by the executor.
+  the hub and again by the executor. A moved file (and one undo puts back) keeps its
+  fingerprint and full hash: the executor reads them from its machine's catalog before files
+  move (so a scan running alongside can't lose them), records them there afterwards
+  (`carried`), and the next scan of that volume gives them to the entry at the new path while
+  its size and mtime match, then drops the volume's records (except under folders it couldn't
+  read).
 - **Agents never run `gfiles plan apply`, `undo`, `empty` or `exec`**, by any means (including
   tmux, a pseudo-terminal, or setting `SSH_CONNECTION`). `plan exec` refuses outside SSH, but
   anyone with an SSH login to a remote can still call it there without the confirmation. They may build and show plans; Darren applies them. To try the executor,

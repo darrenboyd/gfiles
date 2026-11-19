@@ -692,21 +692,29 @@ fn plan_command(
                 );
             }
             let config = Config::load(config_path)?;
-            let hashes = apply::serve(
+            // Opened first, so the run can read what the catalog knows before files move.
+            let catalog = db::open(db_path)
+                .inspect_err(|e| {
+                    eprintln!(
+                        "warning: couldn't open the catalog, so moved files won't keep their \
+                         hashes: {e:#}"
+                    )
+                })
+                .ok();
+            let mut learned = apply::Learned::default();
+            let served = apply::serve(
                 &config,
                 &lock_path,
+                catalog.as_ref(),
                 std::io::stdin().lock(),
                 std::io::stdout().lock(),
-            )?;
-            if !hashes.is_empty() {
-                match db::open(db_path) {
-                    Ok(conn) => apply::record_hashes(&conn, &hashes),
-                    Err(e) => {
-                        eprintln!("warning: couldn't open the catalog to store hashes: {e:#}")
-                    }
-                }
+                &mut learned,
+            );
+            // Recorded even when the hub went away mid-run: those files already moved.
+            if let Some(conn) = &catalog {
+                apply::record_learned(conn, &learned);
             }
-            Ok(())
+            served
         }
     }
 }
