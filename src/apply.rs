@@ -1554,8 +1554,7 @@ pub fn serve(
         catalog,
         synced: req.synced,
     };
-    let total = items.len();
-    let mut n = 0;
+    // The hub shows progress as the outcomes arrive.
     let result = run(
         config,
         req.op,
@@ -1565,10 +1564,6 @@ pub fn serve(
         &context,
         learned,
         |o| {
-            n += 1;
-            if n % 1000 == 0 {
-                eprintln!("{n} of {total} files checked");
-            }
             writeln!(out, "{}", serde_json::to_string(&Reply::Item(o.clone()))?)?;
             // Sent now, so a hub that has gone away stops the run at the next file.
             out.flush()?;
@@ -1684,8 +1679,10 @@ pub fn execute(
         plan::set_trash(conn, id, None, false)?;
     }
     let mut pending: Vec<Outcome> = Vec::new();
+    let mut progress = Progress::new(&items, io::stderr());
     let done = {
         let mut record = |o: &Outcome, conn: &Connection| -> Result<()> {
+            progress.file(o);
             pending.push(o.clone());
             if pending.len() >= 500 {
                 plan::record(conn, id, &pending)?;
@@ -1731,6 +1728,7 @@ pub fn execute(
             ),
         }
     };
+    progress.finish();
     plan::record(conn, id, &pending)?;
     if done.is_err() && op == Op::Apply && summary.state == "draft" {
         // Nothing was decided (the other machine wasn't reached, or the lock was held): the
@@ -1769,6 +1767,69 @@ pub fn execute(
     Ok(done)
 }
 
+/// Apply's progress on the terminal: a mark per file as its outcome arrives (`.` moved, `x`
+/// skipped), and every `PER_LINE` files the count and bytes so far. Apply reads every file
+/// in full, so a large one can take a while; the marks show it's still going.
+struct Progress<W: Write> {
+    out: W,
+    sizes: HashMap<i64, i64>,
+    total: usize,
+    total_bytes: i64,
+    files: usize,
+    bytes: i64,
+    /// Marks on the line being written.
+    marks: usize,
+}
+
+const PER_LINE: usize = 50;
+
+impl<W: Write> Progress<W> {
+    fn new(items: &[Item], out: W) -> Self {
+        Progress {
+            out,
+            sizes: items.iter().map(|i| (i.seq, i.size)).collect(),
+            total: items.len(),
+            total_bytes: items.iter().map(|i| i.size).sum(),
+            files: 0,
+            bytes: 0,
+            marks: 0,
+        }
+    }
+
+    fn file(&mut self, o: &Outcome) {
+        self.files += 1;
+        self.bytes += self.sizes.get(&o.seq).copied().unwrap_or(0);
+        self.marks += 1;
+        // Progress is a courtesy: a terminal that's gone away mustn't stop the run.
+        let _ = write!(self.out, "{}", if o.moved { "." } else { "x" });
+        if self.marks == PER_LINE {
+            self.end_line();
+        }
+        let _ = self.out.flush();
+    }
+
+    /// Ends a line left part-way, so what's printed next starts on its own.
+    fn finish(&mut self) {
+        if self.marks > 0 {
+            self.end_line();
+        }
+        let _ = self.out.flush();
+    }
+
+    fn end_line(&mut self) {
+        let _ = writeln!(
+            self.out,
+            "{}  {} of {} files, {} of {}",
+            " ".repeat(PER_LINE - self.marks),
+            self.files,
+            self.total,
+            crate::fmt::size(self.bytes),
+            crate::fmt::size(self.total_bytes)
+        );
+        self.marks = 0;
+    }
+}
+
 pub fn op_name(op: Op) -> &'static str {
     match op {
         Op::Apply => "apply",
@@ -1790,8 +1851,8 @@ fn over_ssh(
     synced: &Synced,
     mut report: impl FnMut(&Outcome) -> Result<()>,
 ) -> Result<Done> {
-    // No BatchMode: Darren is at the terminal and may need to unlock a key. Progress from the
-    // other machine comes through on stderr.
+    // No BatchMode: Darren is at the terminal and may need to unlock a key. Warnings from the
+    // other machine come through on stderr.
     let mut child = Command::new("ssh")
         .args([
             "-o",
@@ -3108,6 +3169,49 @@ mod tests {
         crate::scan::scan_volume(&mut conn, &v.config.volumes[0], "elrond").unwrap();
         execute(&conn, &route, Op::Empty, &id, &Synced::default()).unwrap();
         assert_eq!(trash(&conn), ("emptied".into(), 0, false));
+    }
+
+    #[test]
+    fn progress_marks_each_file_and_counts_every_line() {
+        let items: Vec<Item> = (1..=PER_LINE as i64 + 3)
+            .map(|seq| Item {
+                seq,
+                action: Action::Remove,
+                volume_id: "v".into(),
+                path: format!("f{seq}"),
+                size: 1000,
+                mtime: 0,
+                vouched: false,
+                keep: None,
+                dest: None,
+            })
+            .collect();
+        let mut out = Vec::new();
+        let mut p = Progress::new(&items, &mut out);
+        for i in &items {
+            p.file(&Outcome {
+                seq: i.seq,
+                moved: i.seq != 2,
+                reason: None,
+            });
+        }
+        p.finish();
+        p.finish();
+        let text = String::from_utf8(out).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        let first = format!(".x{}", ".".repeat(PER_LINE - 2));
+        assert_eq!(
+            lines[0],
+            format!("{first}  50 of 53 files, 50.0 KB of 53.0 KB")
+        );
+        assert_eq!(
+            lines[1],
+            format!(
+                "...{}  53 of 53 files, 53.0 KB of 53.0 KB",
+                " ".repeat(PER_LINE - 3)
+            )
+        );
+        assert_eq!(lines.len(), 2, "finishing twice adds nothing: {text}");
     }
 
     #[test]
