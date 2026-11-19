@@ -238,7 +238,7 @@ enum PlanCommand {
         #[arg(long)]
         under: Option<String>,
         /// Show the folders the plan changes, as a tree: what leaves each, what arrives, and
-        /// what stays (or that it empties)
+        /// what stays (or that it empties of cataloged files; the folder itself stays)
         #[arg(long, conflicts_with = "limit")]
         folders: bool,
         /// Levels of the --folders tree below each top folder (default 3; --all for every level)
@@ -1046,6 +1046,16 @@ fn print_folder_tree(t: &plantree::FolderTree) {
     if t.cut_at_depth {
         println!("\nDeeper folders are counted in the folder above them (use --depth N or --all).");
     }
+    if any_empties(&t.folders) {
+        println!(
+            "\n\"empties\" counts cataloged files only: files a scan ignores (.DS_Store, hidden \
+             files, ...) stay, and so does the folder."
+        );
+    }
+}
+
+fn any_empties(nodes: &[plantree::FolderNode]) -> bool {
+    nodes.iter().any(|n| n.empties || any_empties(&n.children))
 }
 
 fn print_plan(v: &plan::View) {

@@ -402,6 +402,7 @@ fn a_plan_from_a_list_moves_and_removes_then_undoes() {
     assert!(line("elrond:darren ").contains("-2 files"), "{text}");
     assert!(line("todo").contains("-2 files"), "{text}");
     assert!(line("todo").contains("empties"), "{text}");
+    assert!(text.contains("counts cataloged files only"), "{text}");
     let dest = line("2013/08");
     assert!(dest.contains("+1 files") && !dest.contains("-1"), "{text}");
     let out = gfiles()

@@ -117,7 +117,9 @@ pub fn build(conn: &Connection, list: &str) -> Result<Built> {
         let key = (vol.to_string(), path.to_string());
         let why = if let Some(k) = kept.get(&key) {
             Some(format!(
-                "line {k} keeps this file as the copy that stays, so it can't be removed or moved"
+                "line {k} keeps this file as the copy that stays, so it can't be removed or moved \
+                 in the same plan (to rename it, import the move as a second plan once this one \
+                 is applied and emptied: emptying keeps a file whose kept copy has moved)"
             ))
         } else if !listed.insert(key.clone()) {
             Some(format!("line {} already lists this file", sources[&key]))
@@ -628,6 +630,7 @@ mod tests {
         // Removing or moving the file line 1 keeps.
         rejected_with(&b, 2, "line 1 keeps this file");
         rejected_with(&b, 3, "line 1 keeps this file");
+        rejected_with(&b, 3, "once this one is applied and emptied");
         rejected_with(&b, 5, "line 4 moves a file to the same destination");
         // A destination that is another entry's file (and is cataloged anyway).
         rejected_with(&b, 6, "already a cataloged file");

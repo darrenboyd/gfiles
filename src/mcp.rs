@@ -432,7 +432,8 @@ fn tool_definitions() -> Value {
                 files. Pass `under` to drill into one folder. Pass `folders: true` instead for \
                 a tree of the folders the plan changes: for each, the files leaving (`out`), \
                 arriving (`in`) and staying (`stays`), each as {files, bytes}, and whether it \
-                `empties`. Numbers include everything below it. `folder` is the folder itself; \
+                `empties` (of cataloged files: files scans ignore, like .DS_Store, stay, and \
+                so does the folder). Numbers include everything below it. `folder` is the folder itself; \
                 `name` is its label below its parent, several levels when a folder holding only \
                 one changed subfolder shares its node. `has_left_out` means it holds a folder \
                 the plan leaves out, whose files `stays` doesn't count. `cut_at_depth` says \

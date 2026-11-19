@@ -54,7 +54,8 @@ pub struct FolderNode {
     pub into: Tally,
     /// Files left in it after the plan.
     pub stays: Tally,
-    /// Nothing is left in it and nothing arrives.
+    /// No cataloged file is left in it and nothing arrives. Files scans ignore (`.DS_Store`,
+    /// hidden files) aren't cataloged, so they may still be there; the folder itself stays.
     pub empties: bool,
     /// It holds a folder the plan left out, whose files aren't counted in `stays`.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
