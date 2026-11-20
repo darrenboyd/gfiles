@@ -55,6 +55,8 @@ struct Found {
     content: Option<String>,
     mirror: Option<String>,
     moved_by: Option<String>,
+    /// An applied plan whose trash relies on this file being where it is.
+    relied_on_by: Option<String>,
 }
 
 /// An entry that passed the checks on its own.
@@ -228,11 +230,12 @@ impl<'c> Checker<'c> {
     fn new(conn: &'c Connection) -> Result<Checker<'c>> {
         let find = conn.prepare(&format!(
             "SELECT e.volume_id, v.name, e.path, e.size, e.mtime, e.kind, e.fingerprint,
-                    {content}, mf.mirror, (SELECT p.id {moved_by} LIMIT 1)
+                    {content}, mf.mirror, (SELECT p.id {moved_by} LIMIT 1), {relied}
              FROM entries e JOIN volumes v ON v.id = e.volume_id{JOIN}
              WHERE v.machine = ?1 AND v.name = ?2 AND e.path = ?3",
             content = crate::dupes::content("e"),
             moved_by = crate::plan::moved_by_sql(),
+            relied = crate::plan::relied_on_by("e.volume_id", "e.path", "''"),
         ))?;
         Ok(Checker {
             conn,
@@ -416,6 +419,9 @@ impl<'c> Checker<'c> {
         if let Some(p) = &f.moved_by {
             return Err(format!("already moved by plan {p}"));
         }
+        if let Some(p) = &f.relied_on_by {
+            return Err(crate::plan::relied_on_reason(p));
+        }
         Ok(f)
     }
 
@@ -434,6 +440,7 @@ impl<'c> Checker<'c> {
                     content: r.get(7)?,
                     mirror: r.get(8)?,
                     moved_by: r.get(9)?,
+                    relied_on_by: r.get(10)?,
                 })
             })
             .optional()
@@ -790,6 +797,57 @@ not json
         )
         .unwrap_err();
         assert!(err.to_string().contains("already moved by plan"), "{err}");
+    }
+
+    #[test]
+    fn a_file_an_applied_plans_trash_relies_on_is_rejected() {
+        let conn = catalog();
+        // A vouched removal keeps photo's b.NEF, and a move puts new.JPG in photo/2013.
+        let b = build(
+            &conn,
+            r#"{"remove": "elrond:darren/todo/b.NEF", "keep": "elrond:photo/2007/12/31/b.NEF", "vouched": true, "reason": "same shot"}
+{"move": "elrond:darren/todo/new.JPG", "to": "elrond:photo/2013/new.JPG"}"#,
+        )
+        .unwrap();
+        let id = crate::plan::save(&conn, &b, 0).unwrap();
+        // Drafted, nothing relies on them yet.
+        let renames = r#"{"move": "elrond:photo/2007/12/31/b.NEF", "to": "elrond:photo/2007/b.NEF"}
+{"move": "elrond:photo/2013/new.JPG", "to": "elrond:photo/2013/08/new.JPG"}"#;
+        // As if the move had happened and a scan had seen it.
+        put(
+            &conn,
+            "elrond",
+            "photo",
+            &[
+                ("2007/12/31/a.NEF", 10, Some(A)),
+                ("2007/12/31/b.NEF", 11, Some(B)),
+                ("2008/x.JPG", 5, None),
+                ("2013/new.JPG", 5, Some(B)),
+            ],
+        );
+        assert!(build(&conn, renames).unwrap().rejected.is_empty());
+
+        conn.execute(
+            "UPDATE plan_items SET outcome = 'moved' WHERE plan_id = ?1",
+            [&id],
+        )
+        .unwrap();
+        crate::plan::set_state(&conn, &id, "applied", 1).unwrap();
+        let why = crate::plan::relied_on_reason(&id);
+        let err = build(&conn, renames).unwrap_err().to_string();
+        assert!(err.contains(&why), "{err}");
+        // A removal of the kept copy is refused the same way.
+        let err = build(
+            &conn,
+            r#"{"remove": "elrond:photo/2007/12/31/b.NEF", "keep": "elrond:darren/todo/b.NEF", "vouched": true, "reason": "x"}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains(&why), "{err}");
+
+        // Once that plan is emptied (or undone), its trash relies on nothing.
+        crate::plan::set_state(&conn, &id, "emptied", 2).unwrap();
+        assert!(build(&conn, renames).unwrap().rejected.is_empty());
     }
 
     #[test]

@@ -1665,11 +1665,19 @@ pub fn execute(
             allowed.join(" or ")
         );
     }
-    // Resuming an apply sends only what has no outcome yet.
-    let items: Vec<Item> = if op == Op::Apply {
-        plan::exec_items(conn, id)?
+    // Resuming an apply sends only what has no outcome yet, leaving out files another
+    // applied plan's trash relies on. Those are decided afresh at each apply (the other plan
+    // may be emptied in between), and recorded as skipped only once the run succeeds.
+    let (items, relied): (Vec<Item>, Vec<Outcome>) = if op == Op::Apply {
+        let relied = plan::relied_on_items(conn, id)?;
+        let skip: std::collections::HashSet<i64> = relied.iter().map(|o| o.seq).collect();
+        let items = plan::exec_items(conn, id)?
+            .into_iter()
+            .filter(|i| !skip.contains(&i.seq))
+            .collect();
+        (items, relied)
     } else {
-        Vec::new()
+        (Vec::new(), Vec::new())
     };
     let volumes = plan::trash_volumes(conn, id)?;
     let now = || crate::scan::unix_secs(Some(std::time::SystemTime::now()));
@@ -1742,7 +1750,9 @@ pub fn execute(
             plan::set_state(conn, id, "draft", summary.updated_at)?;
         }
     }
-    let done = done?;
+    let mut done = done?;
+    plan::record(conn, id, &relied)?;
+    done.skipped += relied.len() as u64;
     if op != Op::Apply {
         plan::set_trash(conn, id, Some(done.trash_bytes as i64), done.trash_partial)?;
     }
@@ -3169,6 +3179,49 @@ mod tests {
         crate::scan::scan_volume(&mut conn, &v.config.volumes[0], "elrond").unwrap();
         execute(&conn, &route, Op::Empty, &id, &Synced::default()).unwrap();
         assert_eq!(trash(&conn), ("emptied".into(), 0, false));
+    }
+
+    #[test]
+    fn apply_leaves_alone_a_file_another_applied_plans_trash_relies_on() {
+        let v = volume();
+        v.write("todo/a.jpg", "same");
+        v.write("Photos/a.jpg", "same");
+        v.write("Old/a.jpg", "same");
+        let conn = scanned(&v);
+        let draft = |list: &str| {
+            let built = crate::listplan::build(&conn, list).unwrap();
+            plan::save(&conn, &built, 0).unwrap()
+        };
+        let first = draft(
+            r#"{"remove": "elrond:darren/todo/a.jpg", "keep": "elrond:darren/Photos/a.jpg"}"#,
+        );
+        // Drafted while the first is still a draft, so nothing stopped it then.
+        let second =
+            draft(r#"{"remove": "elrond:darren/Photos/a.jpg", "keep": "elrond:darren/Old/a.jpg"}"#);
+        let lock = v._tmp.path().join("actions.lock");
+        let route = Route::Local {
+            config: &v.config,
+            lock_path: &lock,
+        };
+        execute(&conn, &route, Op::Apply, &first, &Synced::default()).unwrap();
+
+        let done = execute(&conn, &route, Op::Apply, &second, &Synced::default()).unwrap();
+        assert_eq!((done.moved, done.skipped), (0, 1));
+        assert!(v.root.join("Photos/a.jpg").exists());
+        let (outcome, reason): (String, String) = conn
+            .query_row(
+                "SELECT outcome, reason FROM plan_items WHERE plan_id = ?1",
+                [&second],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(outcome, "skipped");
+        assert_eq!(reason, plan::relied_on_reason(&first));
+        assert_eq!(plan::summary(&conn, &second).unwrap().state, "applied");
+
+        // So the first plan's empty still finds its kept copy.
+        let done = execute(&conn, &route, Op::Empty, &first, &Synced::default()).unwrap();
+        assert_eq!(done.deleted, 1);
     }
 
     #[test]

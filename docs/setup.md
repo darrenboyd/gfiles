@@ -185,7 +185,9 @@ gfiles plan empty <id>                                       # free the space fo
 its full content against the copy that stays. The space comes back only with `empty`, which
 keeps any file that changed in the trash or whose kept copy has since gone or changed, unless
 another file on that machine (outside synced folders) reads back with the same full hash, as
-when a later plan renamed the kept copy. A
+when a later plan renamed the kept copy. So until a plan is emptied (or undone), later plans
+leave alone the copies it kept: a new plan won't move or remove them, and says which plan to
+empty first. A
 volume that isn't mounted is left alone: apply skips its files, and undo and empty leave the
 plan as it was until the disk is back. Plans refuse mirrors, and folders
 that look synced (ones `gfiles mirrors` suggests, or inside `Dropbox`, `OneDrive` or

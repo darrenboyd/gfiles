@@ -62,6 +62,34 @@ pub fn moved_by_sql() -> &'static str {
     moved_by!()
 }
 
+/// SQL expression for an applied plan (not yet emptied or undone) whose trash relies on the
+/// file at `volume`/`path`: a removal it moved keeps that file, or a move it made put a copy
+/// there. Empty deletes a trashed file only while that copy is where the plan left it, so
+/// moving or removing it would strand the file in the trash. `NULL` when none does. A move
+/// that renamed (rather than copied) left nothing in the trash, but the hub can't tell the two
+/// apart, so every move counts. `except` is SQL for a plan id to leave out (`''` for none).
+pub fn relied_on_by(volume: &str, path: &str, except: &str) -> String {
+    let by = |volume_col: &str, path_col: &str, action: &str| {
+        format!(
+            "(SELECT rp.id FROM plan_items ri JOIN plans rp ON rp.id = ri.plan_id
+              WHERE ri.{volume_col} = {volume} AND ri.{path_col} = {path}
+                AND ri.action = '{action}' AND ri.outcome = 'moved'
+                AND rp.state IN ('applying', 'applied') AND rp.id != {except}
+              ORDER BY rp.id LIMIT 1)"
+        )
+    };
+    format!(
+        "coalesce({}, {})",
+        by("keep_volume_id", "keep_path", "remove"),
+        by("dest_volume_id", "dest_path", "move")
+    )
+}
+
+/// Why a plan leaves alone a file that plan `other`'s trash relies on.
+pub fn relied_on_reason(other: &str) -> String {
+    format!("plan {other}'s trash relies on it: empty (or undo) {other} first")
+}
+
 /// Folder names that sync tools own: a file removed there is removed from every other copy the
 /// tool keeps, so plans refuse them unless they're configured as mirrors or listed as not
 /// synced.
@@ -192,6 +220,7 @@ struct TargetEntry {
     content: Option<String>,
     mirror: Option<String>,
     moved_by: Option<String>,
+    relied_on_by: Option<String>,
 }
 
 /// One same-machine copy of a content.
@@ -284,6 +313,8 @@ pub fn build(conn: &Connection, spec: Spec, except: &[FolderRef]) -> Result<Buil
                 Some(format!("in mirror {m}"))
             } else if let Some(p) = &e.moved_by {
                 Some(format!("already moved by plan {p}"))
+            } else if let Some(p) = &e.relied_on_by {
+                Some(relied_on_reason(p))
             } else if e.size == 0 {
                 Some("empty file".to_string())
             } else if e.fingerprint.is_none() {
@@ -485,12 +516,13 @@ fn resolve(conn: &Connection, f: &FolderRef) -> Result<Resolved> {
 fn target_entries(conn: &Connection, t: &Resolved) -> Result<Vec<TargetEntry>> {
     let sql = format!(
         "SELECT e.volume_id, v.name, e.path, e.size, e.kind, e.fingerprint, mf.mirror,
-                (SELECT p.id {moved_by} LIMIT 1), {content}
+                (SELECT p.id {moved_by} LIMIT 1), {content}, {relied}
          FROM entries e JOIN volumes v ON v.id = e.volume_id{JOIN}
          WHERE e.volume_id = ?1
            AND (?2 = '' OR e.path = ?2 OR substr(e.path, 1, length(?2) + 1) = ?2 || '/')",
         moved_by = moved_by!(),
-        content = crate::dupes::content("e")
+        content = crate::dupes::content("e"),
+        relied = relied_on_by("e.volume_id", "e.path", "''"),
     );
     Ok(conn
         .prepare(&sql)?
@@ -505,6 +537,7 @@ fn target_entries(conn: &Connection, t: &Resolved) -> Result<Vec<TargetEntry>> {
                 mirror: r.get(6)?,
                 moved_by: r.get(7)?,
                 content: r.get(8)?,
+                relied_on_by: r.get(9)?,
             })
         })?
         .collect::<rusqlite::Result<_>>()?)
@@ -1270,6 +1303,31 @@ pub fn trash_volumes(conn: &Connection, id: &str) -> Result<Vec<String>> {
 }
 
 /// Records what happened to items, in one transaction.
+/// Plan `id`'s files still to apply that another applied plan's trash relies on (see
+/// `relied_on_by`), as skipped outcomes. Apply leaves them alone: moving or removing one
+/// would strand the other plan's trashed file, which empty would then keep for good.
+pub fn relied_on_items(conn: &Connection, id: &str) -> Result<Vec<crate::apply::Outcome>> {
+    // The plan's own items never count: resuming it, it's 'applying' too.
+    let relied = relied_on_by("i.volume_id", "i.path", "?1");
+    let sql = format!(
+        "SELECT seq, other FROM (
+             SELECT i.seq, {relied} AS other FROM plan_items i
+             WHERE i.plan_id = ?1 AND i.outcome IS NULL)
+         WHERE other IS NOT NULL ORDER BY seq"
+    );
+    Ok(conn
+        .prepare(&sql)?
+        .query_map([id], |r| {
+            let other: String = r.get(1)?;
+            Ok(crate::apply::Outcome {
+                seq: r.get(0)?,
+                moved: false,
+                reason: Some(relied_on_reason(&other)),
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
 pub fn record(conn: &Connection, id: &str, outcomes: &[crate::apply::Outcome]) -> Result<()> {
     let tx = conn.unchecked_transaction()?;
     {
@@ -1420,6 +1478,17 @@ folders = ["elrond:darren/Drive", "gaffer:home/Drive"]
         build(
             conn,
             Spec::Drain(folders.iter().map(|f| folder(f)).collect()),
+            &[],
+        )
+    }
+
+    fn keep(conn: &Connection, keeper: &str, over: &str) -> Result<Built> {
+        build(
+            conn,
+            Spec::Keep {
+                keeper: folder(keeper),
+                over: folder(over),
+            },
             &[],
         )
     }
@@ -2017,6 +2086,56 @@ folders = ["elrond:darren/Drive", "gaffer:home/Drive"]
         );
         let b = drain(&conn, &["elrond:darren/todo"]).unwrap();
         assert_eq!(removed(&b), vec![pair("todo/a.jpg", "Photos/b.jpg")]);
+    }
+
+    #[test]
+    fn files_an_applied_plans_trash_relies_on_are_left_out() {
+        let conn = crate::db::open_in_memory().unwrap();
+        put(
+            &conn,
+            "elrond",
+            "darren",
+            &[
+                ("todo/a.jpg", 10, Some(A)),
+                ("Photos/a.jpg", 10, Some(A)),
+                ("Old/a.jpg", 10, Some(A)),
+            ],
+        );
+        // Removes todo's copy, keeping Photos'.
+        let built = keep(&conn, "elrond:darren/Photos", "elrond:darren/todo").unwrap();
+        let first = save(&conn, &built, 0).unwrap();
+        // Drafted before the first plan is applied: removes Photos' copy, keeping Old's.
+        let built = keep(&conn, "elrond:darren/Old", "elrond:darren/Photos").unwrap();
+        assert_eq!(removed(&built), vec![pair("Photos/a.jpg", "Old/a.jpg")]);
+        let second = save(&conn, &built, 0).unwrap();
+
+        record(
+            &conn,
+            &first,
+            &[crate::apply::Outcome {
+                seq: 0,
+                moved: true,
+                reason: None,
+            }],
+        )
+        .unwrap();
+        set_state(&conn, &first, "applied", 1).unwrap();
+        let why = relied_on_reason(&first);
+        let b = drain(&conn, &["elrond:darren/Photos"]).unwrap();
+        assert!(b.items.is_empty());
+        assert_eq!(left(&b), vec![pair("Photos/a.jpg", &why)]);
+
+        // The plan drafted earlier skips the file at apply instead.
+        let relied = relied_on_items(&conn, &second).unwrap();
+        assert_eq!(relied.len(), 1);
+        assert_eq!(relied[0].reason.as_deref(), Some(why.as_str()));
+        // Never its own trash: resuming, a plan doesn't rely on itself.
+        set_state(&conn, &first, "applying", 1).unwrap();
+        assert!(relied_on_items(&conn, &first).unwrap().is_empty());
+        set_state(&conn, &first, "emptied", 2).unwrap();
+        assert!(relied_on_items(&conn, &second).unwrap().is_empty());
+        let b = drain(&conn, &["elrond:darren/Photos"]).unwrap();
+        assert_eq!(removed(&b), vec![pair("Photos/a.jpg", "Old/a.jpg")]);
     }
 
     #[test]

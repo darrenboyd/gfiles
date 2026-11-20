@@ -161,6 +161,12 @@ CREATE TABLE carried (
 ALTER TABLE plans ADD COLUMN trash_bytes INTEGER;
 ALTER TABLE plans ADD COLUMN trash_partial INTEGER NOT NULL DEFAULT 0;
 "#,
+    r#"
+-- For finding the files an applied plan's trash relies on: removals' kept copies and moves'
+-- destinations.
+CREATE INDEX plan_items_keep ON plan_items (keep_volume_id, keep_path);
+CREATE INDEX plan_items_dest ON plan_items (dest_volume_id, dest_path);
+"#,
 ];
 
 pub fn open(path: &Path) -> Result<Connection> {

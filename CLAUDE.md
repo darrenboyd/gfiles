@@ -243,7 +243,9 @@ scratch directory, when trying the binary out, so experiments never touch the re
   by `apply::PROTOCOL`). Files go to `<volume root>/.gfiles-trash/<plan id>/files/`, which scans
   always skip; the catalog forgets them at the next scan, and until then overlaps and new plans
   leave out files an applied plan moved (as they were when moved; a new file at the same path
-  counts). A re-run apply resumes. The executor never creates a volume root: a file on an
+  counts). Nor may a plan move or remove a file an applied plan's trash relies on (a removal's
+  kept copy, a move's destination) until that plan is emptied or undone: drafts leave such files
+  out (a list rejects them), and apply skips them, deciding afresh each time. A re-run apply resumes. The executor never creates a volume root: a file on an
   unmounted volume is skipped, and undo and empty leave the plan where it was while one of its
   volumes is missing. Undo leaves a file in the trash when its path is taken again. Empty
   keeps files that changed after the move, or that the journal doesn't list. A removed file
