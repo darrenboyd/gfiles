@@ -179,6 +179,8 @@ gfiles plan show <id> --folders                              # each folder it ch
 gfiles plan apply <id>                                       # asks you to type the id
 gfiles plan undo <id>                                        # put everything back
 gfiles plan empty <id>                                       # free the space for good
+gfiles plan empty <id> --force                               # and delete whatever empty kept
+gfiles plan list                                             # plans in play (--all: finished ones too)
 ```
 
 `apply` moves each file to `.gfiles-trash/<id>/files/` at the top of its volume, after checking
@@ -193,6 +195,15 @@ plan as it was until the disk is back. Plans refuse mirrors, and folders
 that look synced (ones `gfiles mirrors` suggests, or inside `Dropbox`, `OneDrive` or
 `SynologyDrive`): add the folder to `[[mirror]]` if a tool syncs it, or list it in
 `not_synced = ["machine:volume/dir"]` at the top of the hub's config if none does.
+
+When empty keeps files you've decided can go, `gfiles plan empty <id> --force` finishes the
+plan: after the usual empty it lists what's still in the plan's trash, grouped by why (not in
+the plan's journal, kept copy gone, changed after the move, ...), with counts and sizes, and
+once you type the id a second time it deletes all of it, last copies included. Use it for
+thumbnails Synology Photos wrote into the trash (`@eaDir`, which it rebuilds), and for files
+whose kept copies you deleted on purpose. A volume that isn't mounted can't be forced: the plan
+stays applied until a later empty reaches it. `gfiles plan list` shows drafts and plans still
+applying or applied; `--all` adds undone and emptied ones, and `plan show` finds any plan.
 
 **Before the first plan on the NAS:**
 

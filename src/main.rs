@@ -220,8 +220,11 @@ enum PlanCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Every plan, newest first
+    /// Plans still in play (drafts, applying, applied), newest first
     List {
+        /// Also list finished plans (emptied or undone)
+        #[arg(long)]
+        all: bool,
         #[arg(long)]
         json: bool,
     },
@@ -252,7 +255,13 @@ enum PlanCommand {
     /// Put a plan's files back (asks you to type the plan id)
     Undo { id: String },
     /// Delete a plan's files from the trash for good (asks you to type the plan id)
-    Empty { id: String },
+    Empty {
+        id: String,
+        /// Then, if empty kept files, list them by why and, once you type the id again, delete
+        /// everything left in the plan's trash, last copies included
+        #[arg(long)]
+        force: bool,
+    },
     /// Delete a draft plan
     Drop { id: String },
     /// Run a plan step for the hub, on stdin/stdout (run by `plan apply` over SSH)
@@ -618,12 +627,17 @@ fn plan_command(
             plan::check_not_synced(&conn, &built, &config.not_synced_folders()?)?;
             save_and_print(&conn, &built, json)
         }
-        PlanCommand::List { json } => {
+        PlanCommand::List { all, json } => {
             let conn = db::open(db_path)?;
-            let plans = plan::list(&conn)?;
+            let plans = plan::list(&conn, all)?;
+            let hidden = if all || json {
+                0
+            } else {
+                plan::finished_count(&conn)?
+            };
             if json {
                 println!("{}", serde_json::to_string_pretty(&plans)?);
-            } else if plans.is_empty() {
+            } else if plans.is_empty() && hidden == 0 {
                 println!("No plans yet. Find folders to clean up with `gfiles overlaps`.");
             } else {
                 for p in &plans {
@@ -635,6 +649,17 @@ fn plan_command(
                         p.remove.files + p.moves.files,
                         fmt::size(p.remove.bytes + p.moves.bytes),
                         plan_scope(p)
+                    );
+                }
+                if hidden > 0 {
+                    println!(
+                        "{} {hidden} finished plans (emptied or undone); `gfiles plan list --all` \
+                         shows them.",
+                        if plans.is_empty() {
+                            "No plans in play;"
+                        } else {
+                            "Not shown:"
+                        }
                     );
                 }
             }
@@ -679,9 +704,15 @@ fn plan_command(
             println!("Dropped plan {id}.");
             Ok(())
         }
-        PlanCommand::Apply { id } => run_plan(config_path, db_path, &lock_path, Op::Apply, &id),
-        PlanCommand::Undo { id } => run_plan(config_path, db_path, &lock_path, Op::Undo, &id),
-        PlanCommand::Empty { id } => run_plan(config_path, db_path, &lock_path, Op::Empty, &id),
+        PlanCommand::Apply { id } => {
+            run_plan(config_path, db_path, &lock_path, Op::Apply, &id, false)
+        }
+        PlanCommand::Undo { id } => {
+            run_plan(config_path, db_path, &lock_path, Op::Undo, &id, false)
+        }
+        PlanCommand::Empty { id, force } => {
+            run_plan(config_path, db_path, &lock_path, Op::Empty, &id, force)
+        }
         PlanCommand::Exec => {
             // Only the hub runs this, over SSH, after Darren confirmed the plan there. Run
             // locally it would skip that confirmation, so it refuses.
@@ -759,13 +790,15 @@ fn scan_now() -> i64 {
         .map_or(0, |d| d.as_secs() as i64)
 }
 
-/// Applies, undoes or empties a plan after Darren types its id on the terminal.
+/// Applies, undoes or empties a plan after Darren types its id on the terminal. A forced empty
+/// then lists what empty kept and, once he types the id again, deletes all of it.
 fn run_plan(
     config_path: &std::path::Path,
     db_path: &std::path::Path,
     lock_path: &std::path::Path,
     op: Op,
     id: &str,
+    force: bool,
 ) -> Result<()> {
     let config = Config::load(config_path)?;
     let conn = db::open(db_path)?;
@@ -789,7 +822,7 @@ fn run_plan(
             fmt::size(s.moved.bytes),
             s.machine
         ),
-        Op::Empty => format!(
+        Op::Empty | Op::Purge => format!(
             "permanently delete the {} files ({}) plan {id} moved to the trash on {}",
             s.moved.files,
             fmt::size(s.moved.bytes),
@@ -859,20 +892,73 @@ fn run_plan(
             "Put back {} files. Plan {id} is {}.",
             done.restored, after.state
         ),
-        Op::Empty => println!(
-            "Deleted {} files ({}). Plan {id} is {}.",
-            done.deleted,
-            fmt::size(done.deleted_bytes as i64),
-            after.state
-        ),
+        Op::Empty | Op::Purge => print_deleted(&done, id, &after.state),
     }
+    print_left(&done);
+    if !force || op != Op::Empty || after.state != "applied" {
+        return Ok(());
+    }
+    if !done.forceable() {
+        println!(
+            "Only volumes that aren't reachable are left; forcing can't reach them either. \
+             Mount them, then empty plan {id} again."
+        );
+        return Ok(());
+    }
+    println!();
+    for line in forced_listing(&done) {
+        println!("{line}");
+    }
+    let typed = gfiles::platform::ask_terminal("Type the plan id to delete all of it for good: ")
+        .map_err(|e| {
+        anyhow::anyhow!("no terminal to confirm the forced empty ({e}); nothing more was deleted")
+    })?;
+    if typed != id {
+        println!("That isn't the plan id; nothing more was deleted. Plan {id} is still applied.");
+        return Ok(());
+    }
+    let done = apply::force(&conn, &route, id, &done)?;
+    let after = plan::summary(&conn, id)?;
+    print_deleted(&done, id, &after.state);
+    print_left(&done);
+    Ok(())
+}
+
+fn print_deleted(done: &apply::Done, id: &str, state: &str) {
+    println!(
+        "Deleted {} files ({}). Plan {id} is {state}.",
+        done.deleted,
+        fmt::size(done.deleted_bytes as i64)
+    );
+}
+
+fn print_left(done: &apply::Done) {
     if !done.left_in_trash.is_empty() {
         println!("Left in the trash ({}):", done.left_in_trash.len());
         for l in done.left_in_trash.iter().take(20) {
             println!("  {l}");
         }
     }
-    Ok(())
+}
+
+/// What a forced empty would delete: what empty kept, by why, with a total and a warning.
+fn forced_listing(done: &apply::Done) -> Vec<String> {
+    let mut lines = vec!["Still in the plan's trash, by why empty kept it:".to_string()];
+    let mut total = 0;
+    for g in &done.left {
+        let size = g.bytes.map(|b| fmt::size(b as i64)).unwrap_or_default();
+        lines.push(format!("{:>9}  {size:>10}  {}", g.count, g.why.describe()));
+        if g.why.forceable() {
+            total += g.bytes.unwrap_or(0);
+        }
+    }
+    lines.push(format!(
+        "Forcing deletes everything left in the plan's trash on the reachable volumes ({} that \
+         could be sized), for good. Some of these files may be the last copies; undo can't \
+         bring them back.",
+        fmt::size(total as i64)
+    ));
+    lines
 }
 
 fn tally(t: &plan::Tally) -> String {
@@ -1488,4 +1574,47 @@ fn pull(config: &Config, conn: &mut rusqlite::Connection) -> Result<bool> {
         println!("{machine}:{name}: {machine} is no longer a remote, so removed");
     }
     Ok(ok)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gfiles::apply::{Done, Left, Why};
+
+    #[test]
+    fn a_forced_listing_shows_each_group_a_total_and_the_risk() {
+        let done = Done {
+            left: vec![
+                Left {
+                    why: Why::NotInJournal,
+                    count: 644,
+                    bytes: Some(75_000_000),
+                },
+                Left {
+                    why: Why::KeptCopyGone,
+                    count: 3,
+                    bytes: Some(3_000),
+                },
+                Left {
+                    why: Why::Unlisted,
+                    count: 2,
+                    bytes: None,
+                },
+            ],
+            ..Done::default()
+        };
+        let lines = forced_listing(&done);
+        assert_eq!(lines.len(), 5, "{lines:#?}");
+        assert!(lines[1].contains("644") && lines[1].contains("not in the plan's journal"));
+        assert!(lines[1].contains(&fmt::size(75_000_000)), "{}", lines[1]);
+        assert!(lines[2].contains(&fmt::size(3_000)), "{}", lines[2]);
+        // Entries that couldn't be listed have a count but no size.
+        assert!(
+            lines[3].trim_start().starts_with("2 ") && lines[3].contains("couldn't list"),
+            "{}",
+            lines[3]
+        );
+        assert!(lines[4].contains(&fmt::size(75_003_000)), "{}", lines[4]);
+        assert!(lines[4].contains("last copies"), "{}", lines[4]);
+    }
 }

@@ -83,6 +83,8 @@ Windows is out of scope for now, but don't make it impossible:
    tags.
 7. **More actions:** moves and vouched removals from a supplied list (`plan import`,
    `draft_plan_from_list`): code done; deploy both machines together (`apply::PROTOCOL` 3).
+   Forced empty (`plan empty --force`) and a plan list of plans still in play: code done;
+   deploy both machines together (`apply::PROTOCOL` 4).
    Rename and copy through plan, apply and undo are still to come.
 
 ## Commands
@@ -107,9 +109,11 @@ gfiles drain <machine:volume/dir> [--except <dir>]... [--json]              # wh
 gfiles plan drain <folder>... [--except <dir>]... [--json]  # draft plan: remove files with a copy elsewhere
 gfiles plan keep <keeper> --over <folder> [--except <dir>]... [--json]      # draft plan: remove what keeper holds
 gfiles plan import <list.jsonl | -> [--json]  # draft plan from another tool's list of moves and removals
-gfiles plan list | show <id> [--under <folder>] [-n | --all] [--json]
+gfiles plan list [--all] [--json]       # plans in play; --all adds undone and emptied ones
+gfiles plan show <id> [--under <folder>] [-n | --all] [--json]
 gfiles plan show <id> --folders [--depth N | --all] [--under <folder>]  # tree: what leaves, arrives, stays per folder
 gfiles plan apply | undo | empty <id>   # Darren only: asks for the id on the terminal
+gfiles plan empty <id> --force          # Darren only: then lists what empty kept, and deletes it on a second typed id
 gfiles plan drop <id>                   # delete a draft
 gfiles hash <volume> [folder]           # full BLAKE3 hashes, to confirm duplicates (slow)
 gfiles mcp                              # MCP server on stdin/stdout
@@ -254,7 +258,15 @@ scratch directory, when trying the binary out, so experiments never touch the re
   hash), outside synced folders as plan building defines them (the hub loads its mirrors and sends
   its mirror and suggested folders by volume name, and `not_synced`, which waives suggested
   folders but never a mirror; a name the machine doesn't have stops the search), that reads
-  back with the journal's full hash. Empty removes the plan's trash folder only once nothing is left in it. Undo and
+  back with the journal's full hash. Empty removes the plan's trash folder only once nothing is left in it,
+  and reports what it kept grouped by why (`Done.left`). `plan empty --force` then lists those
+  groups and, once Darren types the id again, sends a purge: it deletes everything in the
+  plan's `.gfiles-trash/<plan id>/` on each volume the empty reached (journal last, never
+  following a link, refusing a trash folder that is a link, and checking before each delete
+  that the entry is still inside that folder), and the plan becomes emptied once nothing is
+  left. A volume the empty couldn't reach is left alone even if it comes back before the id
+  is typed, and while any volume is left out every journal stays, so undo still works. `plan list` hides undone and emptied plans
+  unless given `--all` (the MCP tool takes `all`); `plan show` finds any plan. Undo and
   empty measure what's left in the plan's trash; the hub stores it as the plan's `in_trash`
   (`in_trash_partial` when a volume couldn't be measured), which until then is the bytes of
   the removals apply moved.
@@ -278,5 +290,6 @@ scratch directory, when trying the binary out, so experiments never touch the re
   read).
 - **Agents never run `gfiles plan apply`, `undo`, `empty` or `exec`**, by any means (including
   tmux, a pseudo-terminal, or setting `SSH_CONNECTION`). `plan exec` refuses outside SSH, but
-  anyone with an SSH login to a remote can still call it there without the confirmation. They may build and show plans; Darren applies them. To try the executor,
+  anyone with an SSH login to a remote can still call it there without the confirmation,
+  including a purge, which deletes last copies. They may build and show plans; Darren applies them. To try the executor,
   use the tests or a scratch `--config`/`--db` over a scratch folder.

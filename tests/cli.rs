@@ -324,8 +324,110 @@ fn plan_apply_undo_and_empty_on_this_machine() {
     let out = under_pty(&envs, &format!("plan empty {id}"), &id);
     assert!(out.contains("Deleted 1 files"), "{out}");
     assert!(!root.join(".gfiles-trash").join(&id).exists());
+    // Finished plans leave the list, which says so; --all brings them back.
     let out = gfiles().args(["plan", "list", "--json"]).output().unwrap();
+    assert!(!String::from_utf8_lossy(&out.stdout).contains(&id));
+    let out = gfiles().args(["plan", "list"]).output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("2 finished plans"), "{text}");
+    let out = gfiles()
+        .args(["plan", "list", "--all", "--json"])
+        .output()
+        .unwrap();
     assert!(String::from_utf8_lossy(&out.stdout).contains("\"state\": \"emptied\""));
+    gfiles().args(["plan", "show", &id]).assert().success();
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn a_forced_empty_lists_what_is_left_and_asks_again() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("darren");
+    fs::create_dir_all(root.join("todo")).unwrap();
+    fs::create_dir_all(root.join("Photos")).unwrap();
+    fs::write(root.join("todo/a.jpg"), "photo a").unwrap();
+    fs::write(root.join("Photos/a.jpg"), "photo a").unwrap();
+    let envs = [
+        (
+            "GFILES_CONFIG",
+            tmp.path().join("config.toml").display().to_string(),
+        ),
+        (
+            "GFILES_DB",
+            tmp.path().join("catalog.db").display().to_string(),
+        ),
+    ];
+    let gfiles = || {
+        let mut cmd = Command::cargo_bin("gfiles").unwrap();
+        cmd.envs(envs.iter().map(|(k, v)| (*k, v.clone())));
+        cmd
+    };
+    fs::write(tmp.path().join("config.toml"), "machine = \"elrond\"\n").unwrap();
+    gfiles()
+        .args(["volume", "add"])
+        .arg(&root)
+        .assert()
+        .success();
+    gfiles().arg("scan").assert().success();
+    let out = gfiles()
+        .args([
+            "plan",
+            "keep",
+            "elrond:darren/Photos",
+            "--over",
+            "elrond:darren/todo",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    let id = plan_id(&out.stdout);
+    let out = under_pty(&envs, &format!("plan apply {id}"), &id);
+    assert!(out.contains("Moved 1 files"), "{out}");
+    // Darren deletes the kept copy himself: empty keeps the trashed file, the last copy.
+    fs::remove_file(root.join("Photos/a.jpg")).unwrap();
+    let trashed = root.join(format!(".gfiles-trash/{id}/files/todo/a.jpg"));
+    let state = || {
+        let out = gfiles()
+            .args(["plan", "show", &id, "--json"])
+            .output()
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        v["state"].as_str().unwrap().to_string()
+    };
+
+    // No terminal: refused before anything is deleted.
+    let out = std::process::Command::new("setsid")
+        .args(["-w"])
+        .arg(assert_cmd::cargo::cargo_bin("gfiles"))
+        .args(["plan", "empty", &id, "--force"])
+        .envs(envs.iter().map(|(k, v)| (*k, v.clone())))
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(trashed.exists());
+
+    // Declining the second confirmation deletes nothing more.
+    let out = under_pty(
+        &envs,
+        &format!("plan empty {id} --force"),
+        &format!("{id}\nwrong"),
+    );
+    assert!(out.contains("kept copy gone or changed"), "{out}");
+    assert!(out.contains("may be the last copies"), "{out}");
+    assert!(out.contains("nothing more was deleted"), "{out}");
+    assert!(trashed.exists());
+    assert_eq!(state(), "applied");
+
+    // Typing the id both times deletes it and finishes the plan.
+    let out = under_pty(
+        &envs,
+        &format!("plan empty {id} --force"),
+        &format!("{id}\n{id}"),
+    );
+    assert!(out.contains("Deleted 1 files"), "{out}");
+    assert!(!root.join(".gfiles-trash").exists(), "{out}");
+    assert_eq!(state(), "emptied");
 }
 
 #[test]

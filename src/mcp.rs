@@ -60,7 +60,7 @@ their bytes differ: apply then doesn't compare their content. Tools never move o
 the user applies a plan themselves with `gfiles plan apply <id>` at a terminal. Applying moves \
 files to a trash folder on their volume, where `gfiles plan undo` can put them back until \
 `gfiles plan empty` deletes them for good. Plans go draft, applying, applied, then undone or \
-emptied. Never run plan apply, undo, empty or exec for them, by any means.";
+emptied; list_cleanup_plans leaves out undone and emptied plans unless you pass all. Never run plan apply, undo, empty or exec for them, by any means.";
 
 struct RpcError {
     code: i64,
@@ -199,7 +199,8 @@ fn handle_request(
                 "drain_preview" => drain_preview(conn, &args),
                 "draft_cleanup_plan" => draft_cleanup_plan(conn, config, &args),
                 "draft_plan_from_list" => draft_plan_from_list(conn, config, &args),
-                "list_cleanup_plans" => Ok(json!({"plans": plan::list(conn)?})),
+                "list_cleanup_plans" => bool_arg(&args, "all")
+                    .and_then(|all| Ok(json!({"plans": plan::list(conn, all)?}))),
                 "show_cleanup_plan" => show_cleanup_plan(conn, &args),
                 _ => mirror_health(conn, &args),
             });
@@ -418,9 +419,12 @@ fn tool_definitions() -> Value {
         {
             "name": "list_cleanup_plans",
             "title": "List cleanup plans",
-            "description": "Every cleanup plan, newest first, with its state (draft, \
-                applying, applied, undone, emptied) and totals.",
-            "inputSchema": {"type": "object", "properties": {}},
+            "description": "Cleanup plans still in play (draft, applying or applied), newest \
+                first, with their state and totals. Pass `all: true` to include finished plans \
+                (undone or emptied) too.",
+            "inputSchema": {"type": "object", "properties": {
+                "all": {"type": "boolean", "description": "Also list undone and emptied plans."},
+            }},
             "annotations": {"readOnlyHint": true},
         },
         {
@@ -630,19 +634,21 @@ fn draft_plan_from_list(conn: &Connection, config: Option<&Config>, args: &Value
     Ok(view)
 }
 
+/// An optional true/false argument, false when absent.
+fn bool_arg(args: &Value, key: &str) -> Result<bool> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(b)) => Ok(*b),
+        Some(other) => anyhow::bail!("{key} must be true or false, got {other}"),
+    }
+}
+
 fn show_cleanup_plan(conn: &Connection, args: &Value) -> Result<Value> {
     let id = string_arg(args, "id")?.ok_or_else(|| anyhow::anyhow!("id is required"))?;
     let limit = limit_from(args, SEARCH_DEFAULT_LIMIT)?;
     let under = string_arg(args, "under")?
         .map(|u| mirror::parse_folder(&u))
         .transpose()?;
-    let flag = |key: &str| -> Result<bool> {
-        match args.get(key) {
-            None | Some(Value::Null) => Ok(false),
-            Some(Value::Bool(b)) => Ok(*b),
-            Some(other) => anyhow::bail!("{key} must be true or false, got {other}"),
-        }
-    };
     let depth = match args.get("depth") {
         None | Some(Value::Null) => None,
         Some(v) => Some(
@@ -651,7 +657,7 @@ fn show_cleanup_plan(conn: &Connection, args: &Value) -> Result<Value> {
                 as usize,
         ),
     };
-    let (folders, all) = (flag("folders")?, flag("all")?);
+    let (folders, all) = (bool_arg(args, "folders")?, bool_arg(args, "all")?);
     if !folders && (depth.is_some() || all) {
         anyhow::bail!("depth and all apply to the folder tree: pass folders: true");
     }
@@ -1067,6 +1073,14 @@ mod tests {
         }
         let r = call_tool(&conn, "list_cleanup_plans", json!({}));
         assert_eq!(r["structuredContent"]["plans"][0]["id"], id);
+        // Finished plans are left out unless asked for.
+        plan::set_state(&conn, id, "emptied", 1).unwrap();
+        let r = call_tool(&conn, "list_cleanup_plans", json!({}));
+        assert_eq!(r["structuredContent"]["plans"], json!([]), "{r}");
+        let r = call_tool(&conn, "list_cleanup_plans", json!({"all": true}));
+        assert_eq!(r["structuredContent"]["plans"][0]["id"], id);
+        let r = call_tool(&conn, "list_cleanup_plans", json!({"all": "yes"}));
+        assert_eq!(r["isError"], true, "{r}");
         // Drafting moved nothing: the catalog still sees both copies.
         let r = call_tool(&conn, "folder_overlaps", json!({}));
         assert_eq!(r["structuredContent"]["pairs"].as_array().unwrap().len(), 1);

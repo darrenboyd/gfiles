@@ -898,14 +898,32 @@ fn read_summary(r: &rusqlite::Row) -> rusqlite::Result<Summary> {
     })
 }
 
-/// Every plan, newest first.
-pub fn list(conn: &Connection) -> Result<Vec<Summary>> {
+/// States of plans that are finished with: `list` leaves them out unless asked.
+const FINISHED: &str = "('emptied', 'undone')";
+
+/// Plans still in play (drafts, and plans applying or applied), newest first; with `all`,
+/// finished ones (emptied or undone) too.
+pub fn list(conn: &Connection, all: bool) -> Result<Vec<Summary>> {
+    let filter = if all {
+        String::new()
+    } else {
+        format!("WHERE p.state NOT IN {FINISHED}")
+    };
     Ok(conn
         .prepare(&format!(
-            "{SUMMARY_SQL} ORDER BY p.created_at DESC, p.id DESC"
+            "{SUMMARY_SQL} {filter} ORDER BY p.created_at DESC, p.id DESC"
         ))?
         .query_map([], read_summary)?
         .collect::<rusqlite::Result<_>>()?)
+}
+
+/// How many plans are finished (emptied or undone), which `list` leaves out by default.
+pub fn finished_count(conn: &Connection) -> Result<i64> {
+    Ok(conn.query_row(
+        &format!("SELECT count(*) FROM plans WHERE state IN {FINISHED}"),
+        [],
+        |r| r.get(0),
+    )?)
 }
 
 pub fn summary(conn: &Connection, id: &str) -> Result<Summary> {
@@ -915,7 +933,7 @@ pub fn summary(conn: &Connection, id: &str) -> Result<Summary> {
         read_summary,
     )
     .optional()?
-    .with_context(|| format!("no plan {id:?}; `gfiles plan list` shows them"))
+    .with_context(|| format!("no plan {id:?}; `gfiles plan list --all` shows them"))
 }
 
 /// The plan's stored spec (kind and folders).
@@ -2030,12 +2048,29 @@ folders = ["elrond:darren/Drive", "gaffer:home/Drive"]
         );
         assert_eq!(v.left_by_reason[0].reason, "unique");
         assert_eq!(spec(&conn, &id).unwrap(), b.spec);
-        assert_eq!(list(&conn).unwrap().len(), 1);
+        assert_eq!(list(&conn, false).unwrap().len(), 1);
+        // Finished plans leave the list unless asked for, and can still be shown.
+        for (state, in_play) in [
+            ("applying", true),
+            ("applied", true),
+            ("undone", false),
+            ("emptied", false),
+        ] {
+            set_state(&conn, &id, state, 2).unwrap();
+            assert_eq!(
+                list(&conn, false).unwrap().len(),
+                in_play as usize,
+                "{state}"
+            );
+            assert_eq!(list(&conn, true).unwrap().len(), 1, "{state}");
+            assert_eq!(finished_count(&conn).unwrap(), !in_play as i64, "{state}");
+            assert_eq!(summary(&conn, &id).unwrap().state, state);
+        }
         set_state(&conn, &id, "applied", 2).unwrap();
         assert!(drop(&conn, &id).is_err());
         set_state(&conn, &id, "draft", 3).unwrap();
         drop(&conn, &id).unwrap();
-        assert!(list(&conn).unwrap().is_empty());
+        assert!(list(&conn, false).unwrap().is_empty());
         assert!(!valid_id("../x"));
     }
 

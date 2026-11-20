@@ -7,7 +7,8 @@
 //! - moves a file to its destination (and back on undo), creating the destination's missing
 //!   folders and removing them on undo once empty,
 //! - recreates a restored file's missing parent folders on undo,
-//! - deletes a plan's files from the trash when emptying it.
+//! - deletes a plan's files from the trash when emptying it,
+//! - deletes everything in a plan's trash folder when Darren forces an empty (a purge).
 //!
 //! A plan's trash is `<volume root>/.gfiles-trash/<plan id>/`: `files/` holds each removed
 //! file at its path relative to the volume root, and `journal.jsonl` records each change
@@ -37,7 +38,13 @@
 //! catalog says may match (same size and fingerprint) and that reads back with the journal's
 //! full hash. A file in a synced folder never counts, since its sync tool may delete it (the
 //! hub sends those folders, as plan building treats them). Undo and empty finish by measuring
-//! what's left in the plan's trash, for the hub's `in_trash`.
+//! what's left in the plan's trash, for the hub's `in_trash`, and empty reports what it kept
+//! grouped by why.
+//!
+//! A purge is the one delete that checks nothing: after empty, and only once Darren has seen
+//! what empty kept and typed the plan id a second time, it deletes everything in the plan's
+//! `.gfiles-trash/<plan id>/` folder on each reachable volume, journal last, never following a
+//! link and never touching anything outside that folder.
 //!
 //! Re-running a plan resumes it: a file already in the trash, or already at its destination,
 //! counts as done.
@@ -46,21 +53,23 @@
 //! newline-delimited JSON exchange:
 //!
 //! ```text
-//! machine → hub   {"gfiles_actions":3,"machine":"elrond"}       before reading anything
-//! hub → machine   {"gfiles_actions":3,"op":"apply","plan":"<id>","volumes":[..],"items":N,
+//! machine → hub   {"gfiles_actions":4,"machine":"elrond"}       before reading anything
+//! hub → machine   {"gfiles_actions":4,"op":"apply","plan":"<id>","volumes":[..],"items":N,
 //!                  "synced":{"folders":[[volume name,path],..],"not_synced":[..]}}
 //! hub → machine   {"seq":0,"action":"remove","volume_id":..,"path":..,"keep":{..}}
 //!                 {"seq":1,"action":"move",..,"dest":{"volume_id":..,"path":..}}
 //!                                                                × N (apply only), then EOF
 //! machine → hub   {"item":{"seq":0,"moved":true}}                × N, as each is done
-//! machine → hub   {"done":{...}}                                 the totals
+//! machine → hub   {"done":{...}}                                 the totals, and what
+//!                                                                stayed in the trash, by why
 //! machine → hub   {"error":"..."}                                instead, when it refuses
 //! ```
 //!
 //! The machine reads the whole request before working, and the hub sends it all before
 //! reading results, so a large plan can't deadlock on full pipes. A request with fewer item
-//! lines than `items` (a hub that died while sending) is refused. `volumes` names the plan's
-//! volumes that may hold its files, so undo and empty notice one that isn't there. Each outcome
+//! lines than `items` (a hub that died while sending) is refused. `op` is apply, undo, empty
+//! or purge. `volumes` names the plan's volumes that may hold its files, so undo, empty and
+//! purge notice one that isn't there. Each outcome
 //! is sent as soon as it's decided, so a hub that has gone away stops the run at the next file.
 
 use std::collections::HashMap;
@@ -78,7 +87,7 @@ use crate::{fingerprint, plan, platform, store};
 
 /// Bump when the exchange changes incompatibly; both machines must then be updated together.
 /// Separate from the catalog stream's `sync::PROTOCOL`.
-pub const PROTOCOL: u32 = 3;
+pub const PROTOCOL: u32 = 4;
 
 /// The trash folder at the top of each volume. Scans always skip it.
 pub const TRASH: &str = ".gfiles-trash";
@@ -89,6 +98,9 @@ pub enum Op {
     Apply,
     Undo,
     Empty,
+    /// Deletes everything in the plan's trash folders, whatever empty kept. Only sent after
+    /// Darren confirms it a second time.
+    Purge,
 }
 
 /// What an item does with its file.
@@ -156,13 +168,111 @@ pub struct Done {
     pub restored: u64,
     pub deleted: u64,
     pub deleted_bytes: u64,
-    /// Files (or whole volumes' trash folders) left in the trash by undo or empty, each with
-    /// why.
+    /// Files (or whole volumes' trash folders) left in the trash by undo, empty or a purge,
+    /// each with why.
     pub left_in_trash: Vec<String>,
-    /// Bytes in the plan's trash folders when undo or empty finished.
+    /// Bytes in the plan's trash folders when undo, empty or a purge finished.
     pub trash_bytes: u64,
     /// Whether some of the trash couldn't be measured (a volume missing, entries unlisted).
     pub trash_partial: bool,
+    /// What empty or a purge left in the trash, grouped by why (the lines in `left_in_trash`
+    /// give the details), so the hub can show what forcing would delete.
+    #[serde(default)]
+    pub left: Vec<Left>,
+    /// The plan's volumes this run couldn't reach. A purge after an empty leaves these alone,
+    /// since empty never listed what's in their trash.
+    #[serde(default)]
+    pub unreachable: Vec<String>,
+}
+
+impl Done {
+    /// Records something left in the trash: its line, and one more in its group (with its size
+    /// when it has one).
+    fn leave(&mut self, why: Why, bytes: Option<u64>, line: String) {
+        self.left_in_trash.push(line);
+        self.count(why, 1, bytes);
+    }
+
+    fn count(&mut self, why: Why, count: u64, bytes: Option<u64>) {
+        // Kept sorted by why, so groups print in a stable order.
+        let i = match self.left.binary_search_by_key(&why, |g| g.why) {
+            Ok(i) => i,
+            Err(i) => {
+                self.left.insert(
+                    i,
+                    Left {
+                        why,
+                        count: 0,
+                        bytes: None,
+                    },
+                );
+                i
+            }
+        };
+        let group = &mut self.left[i];
+        group.count += count;
+        if let Some(b) = bytes {
+            group.bytes = Some(group.bytes.unwrap_or(0) + b);
+        }
+    }
+
+    /// Whether a purge could delete anything that was left: anything but unreachable volumes.
+    pub fn forceable(&self) -> bool {
+        self.left.iter().any(|g| g.why.forceable())
+    }
+}
+
+/// Why something stayed in a plan's trash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Why {
+    /// A file the journal doesn't list (put there by something else, like Synology Photos).
+    NotInJournal,
+    /// A file that changed after it was moved to the trash.
+    Changed,
+    /// A removed file whose kept copy is gone or changed, with no other copy found.
+    KeptCopyGone,
+    /// A moved file's original whose copy is missing or doesn't match it.
+    CopyNotMatching,
+    /// A file deleting failed for.
+    NotDeleted,
+    /// Entries the walk couldn't list as files (counted, not sized).
+    Unlisted,
+    /// The plan's trash folder, which couldn't be removed once its files were gone.
+    FolderNotRemoved,
+    /// A volume that isn't configured or mounted here (counted per volume, not sized).
+    VolumeUnreachable,
+}
+
+impl Why {
+    /// Whether a forced empty can delete what this group holds: everything except what's on a
+    /// volume it can't reach.
+    pub fn forceable(self) -> bool {
+        self != Why::VolumeUnreachable
+    }
+
+    pub fn describe(self) -> &'static str {
+        match self {
+            Why::NotInJournal => "not in the plan's journal",
+            Why::Changed => "changed after the move",
+            Why::KeptCopyGone => "kept copy gone or changed",
+            Why::CopyNotMatching => "moved file's copy missing or not matching",
+            Why::NotDeleted => "couldn't be deleted",
+            Why::Unlisted => "entries gfiles couldn't list",
+            Why::FolderNotRemoved => "trash folder couldn't be removed",
+            Why::VolumeUnreachable => "volume not reachable (can't be forced)",
+        }
+    }
+}
+
+/// One reason things stayed in the trash: how many (files, entries or volumes), and their
+/// bytes when they could be sized.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Left {
+    pub why: Why,
+    pub count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<u64>,
 }
 
 /// What a plan run learned for this machine's catalog (see `record_learned`). It stays on
@@ -234,6 +344,9 @@ pub struct RunInputs<'a> {
     pub known: Known,
     pub catalog: Option<&'a Connection>,
     pub synced: Synced,
+    /// For a purge: volumes to leave alone, because the empty before it couldn't reach them
+    /// to list what's in their trash.
+    pub held_back: Vec<String>,
 }
 
 /// What the catalog knew of each file an apply moves, by (volume id, path): its fingerprint
@@ -276,6 +389,9 @@ struct Request {
     items: usize,
     /// For empty: folders a copy of a trashed file must not be in.
     synced: Synced,
+    /// For a purge: volumes to leave alone (see `RunInputs::held_back`).
+    #[serde(default)]
+    held_back: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -394,6 +510,12 @@ pub fn run(
             let done = empty(&roots, &names, volumes, id, inputs);
             Ok(measured(done, &roots, volumes, id))
         }
+        Op::Purge => Ok(measured(
+            purge(&roots, volumes, id, &inputs.held_back),
+            &roots,
+            volumes,
+            id,
+        )),
     }
 }
 
@@ -1064,17 +1186,14 @@ fn trash_folders<'a>(
     roots: &HashMap<&str, &'a Path>,
     volumes: &[String],
     id: &str,
-    left: &mut Vec<String>,
+    unreachable: &mut Vec<(String, Skip)>,
 ) -> Vec<(String, &'a Path, PathBuf)> {
     let mut found = Vec::new();
     for volume_id in volumes {
         let root = match volume_root(roots, volume_id) {
             Ok(r) => r,
             Err(why) => {
-                left.push(format!(
-                    "volume {volume_id}: {}; any of the plan's files there stay in the trash",
-                    why.trim_start_matches("its ")
-                ));
+                unreachable.push((volume_id.clone(), why));
                 continue;
             }
         };
@@ -1086,12 +1205,44 @@ fn trash_folders<'a>(
     found
 }
 
-fn report_unlisted(files: &Path, unlisted: usize, left: &mut Vec<String>) {
+/// `trash_folders`, recording each unreachable volume in `done`.
+fn trash_folders_counted<'a>(
+    roots: &HashMap<&str, &'a Path>,
+    volumes: &[String],
+    id: &str,
+    done: &mut Done,
+) -> Vec<(String, &'a Path, PathBuf)> {
+    let mut unreachable = Vec::new();
+    let found = trash_folders(roots, volumes, id, &mut unreachable);
+    for (volume_id, why) in unreachable {
+        unreachable_volume(&volume_id, &why, done);
+    }
+    found
+}
+
+fn unreachable_line(volume_id: &str, why: &str) -> String {
+    format!(
+        "volume {volume_id}: {}; any of the plan's files there stay in the trash",
+        why.trim_start_matches("its ")
+    )
+}
+
+fn unreachable_volume(volume_id: &str, why: &str, done: &mut Done) {
+    done.leave(
+        Why::VolumeUnreachable,
+        None,
+        unreachable_line(volume_id, why),
+    );
+    done.unreachable.push(volume_id.to_string());
+}
+
+fn report_unlisted(files: &Path, unlisted: usize, done: &mut Done) {
     if unlisted > 0 {
-        left.push(format!(
+        done.left_in_trash.push(format!(
             "{}: {unlisted} entries gfiles couldn't list stay there",
             files.display()
         ));
+        done.count(Why::Unlisted, unlisted as u64, None);
     }
 }
 
@@ -1113,7 +1264,7 @@ fn undo(roots: &HashMap<&str, &Path>, volumes: &[String], id: &str, learned: &mu
             hash: Some(entry.hash.clone()).filter(|h| !h.is_empty()),
         }
     };
-    for (volume_id, root, dir) in trash_folders(roots, volumes, id, &mut done.left_in_trash) {
+    for (volume_id, root, dir) in trash_folders_counted(roots, volumes, id, &mut done) {
         let files = dir.join("files");
         let journal = read_journal(&dir);
         for entry in journal.values().filter(|e| e.action == Action::Move) {
@@ -1131,7 +1282,7 @@ fn undo(roots: &HashMap<&str, &Path>, volumes: &[String], id: &str, learned: &mu
             }
         }
         let (found, unlisted) = trashed_files(&files);
-        report_unlisted(&files, unlisted, &mut done.left_in_trash);
+        report_unlisted(&files, unlisted, &mut done);
         for (in_trash, rel) in found {
             // A copied move's original: undo_move dealt with it.
             if journal.get(&rel).is_some_and(|e| e.action == Action::Move) {
@@ -1316,30 +1467,39 @@ fn empty(
     let mut done = Done::default();
     // Full hashes read of other copies, by (volume id, path): many trashed files can share one.
     let mut read = HashMap::new();
-    for (_, _, dir) in trash_folders(roots, volumes, id, &mut done.left_in_trash) {
+    for (_, _, dir) in trash_folders_counted(roots, volumes, id, &mut done) {
         let files = dir.join("files");
         let journal = read_journal(&dir);
         let (found, unlisted) = trashed_files(&files);
-        report_unlisted(&files, unlisted, &mut done.left_in_trash);
+        report_unlisted(&files, unlisted, &mut done);
         for (in_trash, rel) in found {
             let keep = |why: &str| format!("{}: {why}", in_trash.display());
+            let meta = fs::symlink_metadata(&in_trash).ok();
+            let bytes = meta.as_ref().map(|m| m.len());
             let Some(entry) = journal.get(&rel) else {
-                done.left_in_trash.push(keep(
-                    "not in the plan's journal, so its kept copy is unknown",
-                ));
+                done.leave(
+                    Why::NotInJournal,
+                    bytes,
+                    keep("not in the plan's journal, so its kept copy is unknown"),
+                );
                 continue;
             };
-            if !fs::symlink_metadata(&in_trash)
-                .is_ok_and(|m| unchanged(&m, entry.size, entry.mtime))
-            {
-                done.left_in_trash
-                    .push(keep("it changed after it was moved to the trash"));
+            if !meta.is_some_and(|m| unchanged(&m, entry.size, entry.mtime)) {
+                done.leave(
+                    Why::Changed,
+                    bytes,
+                    keep("it changed after it was moved to the trash"),
+                );
                 continue;
             }
             if let Err(why) = other_copy_holds(roots, entry)
                 && !another_copy(roots, names, inputs, &mut read, &in_trash, entry)
             {
-                done.left_in_trash.push(keep(&why));
+                let group = match entry.action {
+                    Action::Remove => Why::KeptCopyGone,
+                    Action::Move => Why::CopyNotMatching,
+                };
+                done.leave(group, bytes, keep(&why));
                 continue;
             }
             match fs::remove_file(&in_trash) {
@@ -1347,18 +1507,163 @@ fn empty(
                     done.deleted += 1;
                     done.deleted_bytes += entry.size as u64;
                 }
-                Err(e) => done.left_in_trash.push(keep(&format!("deleting it: {e}"))),
+                Err(e) => done.leave(Why::NotDeleted, bytes, keep(&format!("deleting it: {e}"))),
             }
         }
         if done.left_in_trash.is_empty() {
             if let Err(e) = remove_emptied(&dir) {
-                done.left_in_trash.push(format!(
-                    "{}: removing the plan's trash folder: {e}",
-                    dir.display()
-                ));
+                done.leave(
+                    Why::FolderNotRemoved,
+                    None,
+                    format!("{}: removing the plan's trash folder: {e}", dir.display()),
+                );
             } else if let Some(top) = dir.parent() {
                 let _ = fs::remove_dir(top);
             }
+        }
+    }
+    done
+}
+
+/// Deletes everything in a plan's trash folder on each of `volumes`, whether or not the
+/// journal lists it, and removes the folders: what Darren confirmed after empty kept files.
+/// It never follows a link (a link in the trash is removed as a link), refuses a trash folder
+/// that is a link or not a folder, and checks before each delete that the entry is still
+/// inside the plan's trash folder, so a folder swapped for a link part-way can't send deletes
+/// elsewhere. It deletes a journal only once everything else on its volume is gone, and only
+/// when every volume of the plan was purged: while one is unreachable, or `held_back` (empty
+/// couldn't reach it to list what's there, so it's left alone), each journal and `files`
+/// folder stays, so undo and a later empty still work. A volume with no trash folder for the
+/// plan (a normal empty may have removed it) has nothing to purge.
+fn purge(roots: &HashMap<&str, &Path>, volumes: &[String], id: &str, held_back: &[String]) -> Done {
+    let mut done = Done::default();
+    let keep_journals = volumes
+        .iter()
+        .any(|v| held_back.contains(v) || volume_root(roots, v).is_err());
+    'volumes: for volume_id in volumes {
+        if held_back.contains(volume_id) {
+            done.leave(
+                Why::VolumeUnreachable,
+                None,
+                format!(
+                    "volume {volume_id}: wasn't reachable when empty listed what's left, so \
+                     nothing there was deleted"
+                ),
+            );
+            done.unreachable.push(volume_id.clone());
+            continue;
+        }
+        let root = match volume_root(roots, volume_id) {
+            Ok(r) => r,
+            Err(why) => {
+                unreachable_volume(volume_id, &why, &mut done);
+                continue;
+            }
+        };
+        let top = root.join(TRASH);
+        let dir = top.join(id);
+        for d in [&top, &dir] {
+            match fs::symlink_metadata(d) {
+                Ok(m) if m.is_dir() => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue 'volumes,
+                Ok(_) => {
+                    done.leave(
+                        Why::FolderNotRemoved,
+                        None,
+                        format!(
+                            "{}: isn't a real folder, so nothing in it was deleted",
+                            d.display()
+                        ),
+                    );
+                    continue 'volumes;
+                }
+                Err(e) => {
+                    done.leave(Why::FolderNotRemoved, None, format!("{}: {e}", d.display()));
+                    continue 'volumes;
+                }
+            }
+        }
+        let real_dir = match fs::canonicalize(&dir) {
+            Ok(d) => d,
+            Err(e) => {
+                done.leave(
+                    Why::FolderNotRemoved,
+                    None,
+                    format!("{}: {e}", dir.display()),
+                );
+                continue;
+            }
+        };
+        // An entry is deleted only while the folder holding it still resolves to a place
+        // inside the plan's trash folder.
+        let inside = |path: &Path| {
+            path.parent()
+                .and_then(|p| fs::canonicalize(p).ok())
+                .is_some_and(|p| p.starts_with(&real_dir))
+        };
+        let journal = dir.join("journal.jsonl");
+        let files = dir.join("files");
+        let before = done.left_in_trash.len();
+        let walk = walkdir::WalkDir::new(&dir)
+            .follow_links(false)
+            .follow_root_links(false)
+            .contents_first(true)
+            .min_depth(1);
+        for e in walk {
+            let e = match e {
+                Ok(e) => e,
+                Err(err) => {
+                    done.leave(Why::Unlisted, None, format!("{}: {err}", dir.display()));
+                    continue;
+                }
+            };
+            if e.file_type().is_dir() {
+                // A folder that still holds something stays; what's in it was reported.
+                if !(keep_journals && e.path() == files) && inside(e.path()) {
+                    let _ = fs::remove_dir(e.path());
+                }
+                continue;
+            }
+            if e.path() == journal {
+                continue;
+            }
+            let bytes = e.metadata().ok().map(|m| m.len());
+            if !inside(e.path()) {
+                done.leave(
+                    Why::NotDeleted,
+                    bytes,
+                    format!(
+                        "{}: its folder no longer leads into the plan's trash, so it wasn't \
+                         deleted",
+                        e.path().display()
+                    ),
+                );
+                continue;
+            }
+            match fs::remove_file(e.path()) {
+                Ok(()) => {
+                    done.deleted += 1;
+                    done.deleted_bytes += bytes.unwrap_or(0);
+                }
+                Err(err) => done.leave(
+                    Why::NotDeleted,
+                    bytes,
+                    format!("{}: deleting it: {err}", e.path().display()),
+                ),
+            }
+        }
+        if keep_journals || done.left_in_trash.len() > before {
+            continue;
+        }
+        match remove_emptied(&dir) {
+            Ok(()) => {
+                let _ = fs::remove_dir(&top);
+            }
+            Err(e) => done.leave(
+                Why::FolderNotRemoved,
+                None,
+                format!("{}: removing the plan's trash folder: {e}", dir.display()),
+            ),
         }
     }
     done
@@ -1553,6 +1858,7 @@ pub fn serve(
         },
         catalog,
         synced: req.synced,
+        held_back: req.held_back,
     };
     // The hub shows progress as the outcomes arrive.
     let result = run(
@@ -1651,11 +1957,35 @@ pub fn execute(
     id: &str,
     synced: &Synced,
 ) -> Result<Done> {
+    execute_holding_back(conn, route, op, id, synced, &[])
+}
+
+/// A forced empty's purge, after `listed` (the empty that showed Darren what's left): it
+/// leaves alone the volumes that empty couldn't reach, since what's there was never listed.
+pub fn force(conn: &Connection, route: &Route, id: &str, listed: &Done) -> Result<Done> {
+    execute_holding_back(
+        conn,
+        route,
+        Op::Purge,
+        id,
+        &Synced::default(),
+        &listed.unreachable,
+    )
+}
+
+fn execute_holding_back(
+    conn: &Connection,
+    route: &Route,
+    op: Op,
+    id: &str,
+    synced: &Synced,
+    held_back: &[String],
+) -> Result<Done> {
     let summary = plan::summary(conn, id)?;
     let allowed = match op {
         Op::Apply => ["draft", "applying"].as_slice(),
         Op::Undo => ["applying", "applied"].as_slice(),
-        Op::Empty => ["applied"].as_slice(),
+        Op::Empty | Op::Purge => ["applied"].as_slice(),
     };
     if !allowed.contains(&summary.state.as_str()) {
         bail!(
@@ -1708,6 +2038,7 @@ pub fn execute(
                     },
                     catalog: Some(conn),
                     synced: synced.clone(),
+                    held_back: held_back.to_vec(),
                 };
                 let mut learned = Learned::default();
                 let done = run(
@@ -1732,6 +2063,7 @@ pub fn execute(
                 &items,
                 &volumes,
                 synced,
+                held_back,
                 |o| record(o, conn),
             ),
         }
@@ -1770,7 +2102,7 @@ pub fn execute(
             }
         }
         Op::Undo if done.left_in_trash.is_empty() => "undone",
-        Op::Empty if done.left_in_trash.is_empty() => "emptied",
+        Op::Empty | Op::Purge if done.left_in_trash.is_empty() => "emptied",
         _ => summary.state.as_str(),
     };
     plan::set_state(conn, id, new_state, now())?;
@@ -1845,6 +2177,7 @@ pub fn op_name(op: Op) -> &'static str {
         Op::Apply => "apply",
         Op::Undo => "undo",
         Op::Empty => "empty",
+        Op::Purge => "forced empty",
     }
 }
 
@@ -1859,6 +2192,7 @@ fn over_ssh(
     items: &[Item],
     volumes: &[String],
     synced: &Synced,
+    held_back: &[String],
     mut report: impl FnMut(&Outcome) -> Result<()>,
 ) -> Result<Done> {
     // No BatchMode: Darren is at the terminal and may need to unlock a key. Warnings from the
@@ -1888,6 +2222,7 @@ fn over_ssh(
         items,
         volumes,
         synced,
+        held_back,
         stdin,
         BufReader::new(stdout),
         &mut report,
@@ -1914,6 +2249,7 @@ fn exchange(
     items: &[Item],
     volumes: &[String],
     synced: &Synced,
+    held_back: &[String],
     input: impl Write,
     mut output: impl BufRead,
     report: &mut impl FnMut(&Outcome) -> Result<()>,
@@ -1955,6 +2291,7 @@ fn exchange(
             volumes: volumes.to_vec(),
             items: items.len(),
             synced: synced.clone(),
+            held_back: held_back.to_vec(),
         };
         writeln!(input, "{}", serde_json::to_string(&req)?)?;
         for i in items {
@@ -2328,11 +2665,20 @@ mod tests {
         assert!(!v.exists(&v.trashed("todo/a.jpg")));
         assert!(v.exists(&v.trashed("todo/b.jpg")));
         assert!(done.left_in_trash[0].contains("Photos/b.jpg is gone or changed"));
+        assert_eq!(
+            done.left,
+            vec![Left {
+                why: Why::KeptCopyGone,
+                count: 1,
+                bytes: Some(3)
+            }]
+        );
         // Once nothing is held back, the plan's trash folder goes.
         v.write("Photos/b.jpg", "bbb");
         fs::remove_file(v.root.join(v.trashed("todo/b.jpg"))).unwrap();
         let (done, _) = v.run(Op::Empty, &[]);
         assert!(done.left_in_trash.is_empty());
+        assert!(done.left.is_empty());
         assert!(!v.exists(TRASH));
     }
 
@@ -2532,6 +2878,7 @@ mod tests {
             items,
             &[],
             &Synced::default(),
+            &[],
             &mut sent,
             answer.as_slice(),
             &mut |o| {
@@ -2553,6 +2900,7 @@ mod tests {
                 volumes: vec!["v1".into()],
                 items: items.len(),
                 synced: Synced::default(),
+                held_back: Vec::new(),
             })
             .unwrap()
         );
@@ -2651,6 +2999,7 @@ mod tests {
                 &[],
                 &[],
                 &Synced::default(),
+                &[],
                 &mut sent,
                 answer.as_bytes(),
                 &mut |_| Ok(()),
@@ -3451,18 +3800,14 @@ mod tests {
         let v = volume();
         let mut done = Done::default();
         let roots: HashMap<&str, &Path> = [("v1", v.root.as_path())].into();
-        let found = trash_folders(
-            &roots,
-            &["v1".into(), "v2".into()],
-            ID,
-            &mut done.left_in_trash,
-        );
+        let found = trash_folders_counted(&roots, &["v1".into(), "v2".into()], ID, &mut done);
         assert!(found.is_empty());
         assert!(
             done.left_in_trash[0].contains("volume v2"),
             "{:?}",
             done.left_in_trash
         );
+        assert_eq!(done.unreachable, ["v2"]);
     }
 
     fn trash_journal(v: &Vol) -> PathBuf {
@@ -3646,5 +3991,380 @@ mod tests {
         let (done, _) = v.run(Op::Undo, &[]);
         assert_eq!(done.restored, 1, "{:?}", done.left_in_trash);
         assert_eq!(v.read("todo/a.jpg"), "a");
+    }
+
+    impl Vol {
+        /// Runs `op` for the plan's trash on `volumes` (which may include ones not configured).
+        fn run_on(&self, op: Op, volumes: &[&str]) -> Done {
+            let volumes: Vec<String> = volumes.iter().map(|v| v.to_string()).collect();
+            run(
+                &self.config,
+                op,
+                ID,
+                &[],
+                &volumes,
+                &RunInputs::default(),
+                &mut Learned::default(),
+                |_| Ok(()),
+            )
+            .unwrap()
+        }
+
+        fn trash(&self) -> PathBuf {
+            self.root.join(TRASH).join(ID)
+        }
+    }
+
+    fn left(why: Why, count: u64, bytes: Option<u64>) -> Left {
+        Left { why, count, bytes }
+    }
+
+    #[test]
+    fn empty_groups_what_it_keeps_by_why() {
+        let v = volume();
+        for (name, content) in [("a", "aa"), ("b", "bbb"), ("c", "cccc")] {
+            v.write(&format!("todo/{name}.jpg"), content);
+            v.write(&format!("Photos/{name}.jpg"), content);
+        }
+        v.run(
+            Op::Apply,
+            &[
+                v.item(0, "todo/a.jpg", "Photos/a.jpg"),
+                v.item(1, "todo/b.jpg", "Photos/b.jpg"),
+                v.item(2, "todo/c.jpg", "Photos/c.jpg"),
+            ],
+        );
+        fs::remove_file(v.root.join("Photos/a.jpg")).unwrap();
+        v.write(&v.trashed("todo/c.jpg"), "changed!");
+        v.write(
+            &v.trashed("todo/@eaDir/b.jpg/SYNOPHOTO_THUMB_M.jpg"),
+            "thumbnail",
+        );
+        let (done, _) = v.run(Op::Empty, &[]);
+        assert_eq!(done.deleted, 1, "{:?}", done.left_in_trash);
+        assert_eq!(
+            done.left,
+            vec![
+                left(Why::NotInJournal, 1, Some(9)),
+                left(Why::Changed, 1, Some(8)),
+                left(Why::KeptCopyGone, 1, Some(2)),
+            ]
+        );
+        assert_eq!(done.left_in_trash.len(), 3);
+        assert!(done.forceable());
+    }
+
+    #[test]
+    fn a_trash_folder_empty_cant_remove_is_a_group_a_purge_clears() {
+        let v = volume();
+        v.write("todo/a.jpg", "same");
+        v.write("Photos/a.jpg", "same");
+        v.run(Op::Apply, &[v.item(0, "todo/a.jpg", "Photos/a.jpg")]);
+        v.write(&format!("{TRASH}/{ID}/stray.txt"), "x");
+        let (done, _) = v.run(Op::Empty, &[]);
+        assert_eq!(done.deleted, 1);
+        assert_eq!(done.left, vec![left(Why::FolderNotRemoved, 1, None)]);
+        assert!(done.forceable());
+        let done = v.run_on(Op::Purge, &["v1"]);
+        assert!(done.left_in_trash.is_empty(), "{:?}", done.left_in_trash);
+        assert!(!v.exists(TRASH));
+    }
+
+    #[test]
+    fn a_purge_deletes_what_empty_keeps_and_nothing_else() {
+        let v = volume();
+        v.write("todo/a.jpg", "same");
+        v.write("todo/b.jpg", "bbb");
+        v.write("Photos/a.jpg", "same");
+        v.write("Photos/b.jpg", "bbb");
+        v.run(
+            Op::Apply,
+            &[
+                v.item(0, "todo/a.jpg", "Photos/a.jpg"),
+                v.item(1, "todo/b.jpg", "Photos/b.jpg"),
+            ],
+        );
+        fs::remove_file(v.root.join("Photos/a.jpg")).unwrap();
+        fs::remove_file(v.root.join("Photos/b.jpg")).unwrap();
+        let (done, _) = v.run(Op::Empty, &[]);
+        assert_eq!(done.left, vec![left(Why::KeptCopyGone, 2, Some(7))]);
+        v.write("todo/other.jpg", "stays");
+        let done = v.run_on(Op::Purge, &["v1"]);
+        assert_eq!((done.deleted, done.deleted_bytes), (2, 7));
+        assert!(
+            done.left.is_empty() && done.left_in_trash.is_empty(),
+            "{done:?}"
+        );
+        assert_eq!((done.trash_bytes, done.trash_partial), (0, false));
+        assert!(!v.exists(TRASH));
+        assert_eq!(v.read("todo/other.jpg"), "stays");
+    }
+
+    #[test]
+    fn a_purge_leaves_an_unreachable_volume_and_says_so() {
+        let v = volume();
+        v.write("todo/a.jpg", "same");
+        v.write("Photos/a.jpg", "same");
+        v.run(Op::Apply, &[v.item(0, "todo/a.jpg", "Photos/a.jpg")]);
+        v.write(&v.trashed("todo/@eaDir/a.jpg/SYNOPHOTO_THUMB_S.jpg"), "t");
+        let done = v.run_on(Op::Purge, &["v1", "gone"]);
+        assert_eq!(done.deleted, 2, "the reachable volume's trash is cleared");
+        // Its journal stays while the plan stays applied, for undo and a later empty.
+        assert!(v.trash().join("journal.jsonl").exists());
+        assert_eq!(done.left, vec![left(Why::VolumeUnreachable, 1, None)]);
+        assert_eq!(done.unreachable, ["gone"]);
+        assert!(
+            done.left_in_trash[0].contains("isn't configured"),
+            "{done:?}"
+        );
+        assert!(done.trash_partial);
+        assert!(!done.forceable());
+        // Empty counts it the same way, and can't force it either.
+        let done = v.run_on(Op::Empty, &["gone"]);
+        assert_eq!(done.left, vec![left(Why::VolumeUnreachable, 1, None)]);
+        assert!(!done.forceable());
+    }
+
+    #[test]
+    fn a_purge_removes_links_without_following_them() {
+        let v = volume();
+        v.write("todo/a.jpg", "same");
+        v.write("Photos/a.jpg", "same");
+        v.run(Op::Apply, &[v.item(0, "todo/a.jpg", "Photos/a.jpg")]);
+        v.write("outside.txt", "keep me");
+        v.write("outside/dir/x.txt", "keep me too");
+        let files = v.trash().join("files");
+        std::os::unix::fs::symlink(v.root.join("outside.txt"), files.join("link")).unwrap();
+        std::os::unix::fs::symlink(v.root.join("outside"), files.join("dirlink")).unwrap();
+        let done = v.run_on(Op::Purge, &["v1"]);
+        assert!(done.left_in_trash.is_empty(), "{:?}", done.left_in_trash);
+        assert!(!v.exists(TRASH));
+        assert_eq!(v.read("outside.txt"), "keep me");
+        assert_eq!(v.read("outside/dir/x.txt"), "keep me too");
+    }
+
+    #[test]
+    fn a_purge_refuses_a_trash_folder_that_is_a_link() {
+        // Either level of the trash path: `.gfiles-trash` itself, or the plan's folder in it.
+        for link in [TRASH.to_string(), format!("{TRASH}/{ID}")] {
+            let v = volume();
+            v.write(&format!("elsewhere/{ID}/files/x.txt"), "keep me");
+            v.write("elsewhere/files/x.txt", "keep me");
+            if link != TRASH {
+                fs::create_dir(v.root.join(TRASH)).unwrap();
+            }
+            std::os::unix::fs::symlink(v.root.join("elsewhere"), v.root.join(&link)).unwrap();
+            let done = v.run_on(Op::Purge, &["v1"]);
+            assert_eq!(
+                done.left,
+                vec![left(Why::FolderNotRemoved, 1, None)],
+                "{link}"
+            );
+            assert!(
+                done.left_in_trash[0].contains("isn't a real folder"),
+                "{done:?}"
+            );
+            assert_eq!(v.read(&format!("elsewhere/{ID}/files/x.txt")), "keep me");
+            assert_eq!(v.read("elsewhere/files/x.txt"), "keep me");
+            assert_eq!(done.deleted, 0);
+        }
+    }
+
+    #[test]
+    fn a_purge_leaves_alone_a_volume_empty_couldnt_reach() {
+        let v = volume();
+        v.write("todo/a.jpg", "same");
+        v.write("Photos/a.jpg", "same");
+        v.run(Op::Apply, &[v.item(0, "todo/a.jpg", "Photos/a.jpg")]);
+        v.write(&v.trashed("todo/@eaDir/a.jpg/SYNOPHOTO_THUMB_S.jpg"), "t");
+        // The volume is back now, but the empty that listed what's left couldn't reach it.
+        let done = run(
+            &v.config,
+            Op::Purge,
+            ID,
+            &[],
+            &["v1".into()],
+            &RunInputs {
+                held_back: vec!["v1".into()],
+                ..RunInputs::default()
+            },
+            &mut Learned::default(),
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(done.deleted, 0);
+        assert_eq!(done.left, vec![left(Why::VolumeUnreachable, 1, None)]);
+        assert!(
+            done.left_in_trash[0].contains("wasn't reachable"),
+            "{done:?}"
+        );
+        assert_eq!(done.unreachable, ["v1"]);
+        assert!(v.exists(&v.trashed("todo/a.jpg")));
+        assert!(v.exists(&v.trashed("todo/@eaDir/a.jpg/SYNOPHOTO_THUMB_S.jpg")));
+    }
+
+    #[test]
+    fn a_purge_keeps_journals_while_a_volume_is_unreachable_so_undo_still_works() {
+        let v = volume();
+        v.write("todo/a.jpg", "a");
+        v.run(Op::Apply, &[v.mv(0, "todo/a.jpg", "Photos/a.jpg")]);
+        v.write(&v.trashed("todo/@eaDir/a.jpg/SYNOPHOTO_THUMB_S.jpg"), "t");
+        let done = v.run_on(Op::Purge, &["v1", "gone"]);
+        assert_eq!(done.deleted, 1, "the thumbnail goes");
+        assert!(!v.exists(&v.trashed("todo/@eaDir/a.jpg/SYNOPHOTO_THUMB_S.jpg")));
+        assert!(v.trash().join("journal.jsonl").exists());
+        assert!(v.trash().join("files").is_dir());
+        let (done, _) = v.run(Op::Undo, &[]);
+        assert_eq!(done.restored, 1, "{done:?}");
+        assert_eq!(v.read("todo/a.jpg"), "a");
+        assert!(!v.exists("Photos/a.jpg"));
+    }
+
+    #[test]
+    fn a_purge_skips_a_volume_whose_trash_is_already_gone() {
+        let v = volume();
+        let other = v._tmp.path().join("other");
+        fs::create_dir_all(other.join(TRASH).join(ID).join("files/a")).unwrap();
+        fs::write(other.join(TRASH).join(ID).join("files/a/b.jpg"), "b").unwrap();
+        let config: Config = toml::from_str(&format!(
+            "machine = \"elrond\"\n[[volume]]\nid = \"v1\"\nname = \"darren\"\npath = {:?}\n\
+             [[volume]]\nid = \"v2\"\nname = \"other\"\npath = {:?}\n",
+            v.root.display().to_string(),
+            other.display().to_string()
+        ))
+        .unwrap();
+        let done = run(
+            &config,
+            Op::Purge,
+            ID,
+            &[],
+            &["v1".into(), "v2".into()],
+            &RunInputs::default(),
+            &mut Learned::default(),
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert!(done.left_in_trash.is_empty(), "{:?}", done.left_in_trash);
+        assert_eq!(done.deleted, 1);
+        assert!(!other.join(TRASH).exists());
+    }
+
+    #[test]
+    fn a_purge_that_stops_part_way_keeps_the_journal_undo_needs() {
+        use std::os::unix::fs::PermissionsExt;
+        let v = volume();
+        v.write("todo/stuck/a.jpg", "same");
+        v.write("Photos/a.jpg", "same");
+        v.write("todo/m.jpg", "moved");
+        fs::create_dir(v.root.join("photo")).unwrap();
+        v.run(
+            Op::Apply,
+            &[
+                v.item(0, "todo/stuck/a.jpg", "Photos/a.jpg"),
+                v.mv(1, "todo/m.jpg", "photo/m.jpg"),
+            ],
+        );
+        let stuck = v.trash().join("files/todo/stuck");
+        fs::set_permissions(&stuck, fs::Permissions::from_mode(0o555)).unwrap();
+        if fs::write(stuck.join("probe"), "").is_ok() {
+            // Running as root: permissions don't stop anything, so there's nothing to test.
+            fs::set_permissions(&stuck, fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+        let done = v.run_on(Op::Purge, &["v1"]);
+        fs::set_permissions(&stuck, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            done.left,
+            vec![left(Why::NotDeleted, 1, Some(4))],
+            "{done:?}"
+        );
+        assert!(
+            trash_journal(&v).exists(),
+            "the journal stays while files do"
+        );
+        let (done, _) = v.run(Op::Undo, &[]);
+        assert_eq!(v.read("todo/m.jpg"), "moved", "{:?}", done.left_in_trash);
+    }
+
+    #[test]
+    fn the_exchange_carries_a_purge() {
+        let v = volume();
+        v.write("todo/a.jpg", "same");
+        v.write("Photos/a.jpg", "same");
+        v.run(Op::Apply, &[v.item(0, "todo/a.jpg", "Photos/a.jpg")]);
+        v.write(&v.trashed("todo/@eaDir/a.jpg/SYNOPHOTO_THUMB_S.jpg"), "t");
+        let purge = request(&[]).replacen("\"op\":\"apply\"", "\"op\":\"purge\"", 1);
+        let (done, _) = round_trip(&v, &purge, &[]).unwrap();
+        assert_eq!(done.deleted, 2);
+        assert!(!v.exists(TRASH));
+
+        // A machine still on the previous protocol is refused before anything is sent.
+        let mut sent = Vec::new();
+        let err = exchange(
+            "elrond",
+            "elrond",
+            Op::Purge,
+            ID,
+            &[],
+            &[],
+            &Synced::default(),
+            &[],
+            &mut sent,
+            "{\"gfiles_actions\":3,\"machine\":\"elrond\"}\n".as_bytes(),
+            &mut |_| Ok(()),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("speaks plan protocol 3"), "{err}");
+        assert!(sent.is_empty());
+    }
+
+    #[test]
+    fn the_hub_marks_a_purged_plan_emptied_and_refuses_other_states() {
+        let v = volume();
+        v.write("todo/a.jpg", "same");
+        v.write("Photos/a.jpg", "same");
+        let conn = scanned(&v);
+        let list =
+            r#"{"remove": "elrond:darren/todo/a.jpg", "keep": "elrond:darren/Photos/a.jpg"}"#;
+        let built = crate::listplan::build(&conn, list).unwrap();
+        let id = plan::save(&conn, &built, 0).unwrap();
+        let lock = v._tmp.path().join("actions.lock");
+        let route = Route::Local {
+            config: &v.config,
+            lock_path: &lock,
+        };
+        let state = |conn: &Connection| {
+            let s = plan::summary(conn, &id).unwrap();
+            (s.state, s.in_trash)
+        };
+        for s in ["draft", "applying"] {
+            plan::set_state(&conn, &id, s, 0).unwrap();
+            let err = execute(&conn, &route, Op::Purge, &id, &Synced::default())
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(&format!("is {s}")), "{err}");
+        }
+        plan::set_state(&conn, &id, "draft", 0).unwrap();
+        execute(&conn, &route, Op::Apply, &id, &Synced::default()).unwrap();
+        let trash = v.root.join(TRASH).join(&id).join("files/todo");
+        for n in 0..3 {
+            fs::create_dir_all(trash.join("@eaDir/a.jpg")).unwrap();
+            fs::write(trash.join(format!("@eaDir/a.jpg/THUMB_{n}.jpg")), "tt").unwrap();
+        }
+        let done = execute(&conn, &route, Op::Empty, &id, &Synced::default()).unwrap();
+        assert_eq!(done.left, vec![left(Why::NotInJournal, 3, Some(6))]);
+        assert_eq!(state(&conn), ("applied".into(), 6));
+        let done = execute(&conn, &route, Op::Purge, &id, &Synced::default()).unwrap();
+        assert_eq!(done.deleted, 3);
+        assert_eq!(state(&conn), ("emptied".into(), 0));
+        assert!(!v.exists(TRASH));
+        for s in ["emptied", "undone"] {
+            plan::set_state(&conn, &id, s, 0).unwrap();
+            let err = execute(&conn, &route, Op::Purge, &id, &Synced::default())
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(&format!("is {s}")), "{err}");
+        }
     }
 }

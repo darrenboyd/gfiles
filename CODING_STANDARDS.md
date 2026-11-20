@@ -29,7 +29,11 @@ review checks the diff against it. Commands, setup and anything `cargo clippy` o
   creates each folder level only after checking the one above isn't a symlink. Emptying keeps
   any file that changed since the move, whose kept copy (or a move's copy, by full hash) is
   gone or changed, or that the journal doesn't vouch for, and never deletes anything it
-  didn't list and check. The one way past a removed file's missing kept copy is another file
+  didn't list and check, with one exception: a forced empty, which Darren confirms a second
+  time after seeing what empty kept, deletes everything left in the plan's own
+  `.gfiles-trash/<plan id>/` folder (journal last), refuses a trash folder that is a link, and
+  never follows a link or touches anything outside that folder. It purges only volumes that
+  empty reached and listed, and keeps every journal while any volume is left out. The one way past a removed file's missing kept copy is another file
   on that machine, outside synced folders as plan building defines them, that reads back with
   the journal's full hash; vouched removals and move originals never get that search. Undo never deletes a copy that changed after the move: it removes a
   copy only when it still has the full hash the move recorded. Undo and
